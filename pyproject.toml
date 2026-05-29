@@ -1,0 +1,30 @@
+[project]
+name = "worky-regression"
+version = "0.1.0"
+description = "Worky 承攬制審批流回歸測試框架 — 多角色狀態機 + DB 副作用驗證"
+requires-python = ">=3.10"
+dependencies = [
+    "requests>=2.31",
+    "pymysql>=1.1",
+    "cryptography>=42.0",
+    "pyyaml>=6.0",
+    "python-dotenv>=1.0",
+    "pytest>=8.0",
+    "pytest-html>=4.1",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = "-v --tb=short --strict-markers"
+markers = [
+    "smoke: 基礎連通性測試",
+    "path: 完整審批流路徑測試",
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]

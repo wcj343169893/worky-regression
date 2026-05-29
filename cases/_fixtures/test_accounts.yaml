@@ -1,0 +1,32 @@
+# Audit 測試帳號（role_id=10，固定碼 9527）
+# 來源：worky_next_v30x DB
+#
+# **重要**：承攬制下，「發案者」與「接案者」都是 Labor（user_type=2）
+# 而非商家（user_type=1）。所有 /contract/* endpoint 都繼承 LaborApiController。
+#
+# Audit role 必要條件：s_labor_roles.role_id=10 AND published=1
+# 目前合格：id=214 (profile 未填), 236 (complete), 276 (complete)
+
+publisher_primary:
+  id: 236
+  phone: "0923120600"
+  username: "886923120600"
+  user_type: 2
+  is_profile_complete: 1
+
+receiver_primary:
+  id: 276
+  phone: "0923113000"
+  username: "886923113000"
+  user_type: 2
+  is_profile_complete: 1
+
+# 第三個 audit labor，留作未來需要 multi-receiver 場景時用
+receiver_backup:
+  - id: 214
+    phone: "0900000001"
+    is_profile_complete: 0    # profile 未填，部份 endpoint 可能擋
+
+# === 商家（未來 worky 平台 b2c 端點才會用到，目前承攬制流程用不到） ===
+# employer_audit_primary:
+#   id: 196, phone "0910000000", shop 131

@@ -1,0 +1,10 @@
+# 最小可驗證 path：只跑 T1（發案者發任務），用來打通 endpoint 與環境連線。
+id: path-t1-publish-task
+description: "T1 minimal: 發案者發佈一筆 ATM 任務，拿到 task_sn"
+
+path:
+  - transition: T1_publisher_publish_task
+    save:
+      task_sn: task_sn         # response.data.task_sn → state.task_sn
+    expect:
+      http: 200

@@ -1,0 +1,39 @@
+# Path: 完整 happy path（發案者最終通過接案者任務完成請求）
+# 覆蓋 5 個 PusherOfTask 重構的事件：
+#   T2  AfterReceiverApplyTaskEvent   → publisher 收 push (CONTRACT_RECEIVER_APPLY 20038)
+#   T3a AfterAcceptReceiverApplyEvent → receiver  收 push (CONTRACT_RECEIVER_APPLY_ACCEPTED 20051)
+#   T6  AfterReceiverStartTaskEvent   → publisher 收 push (CONTRACT_PUBLISHER_NOTIFY_TASK_START 20048)
+#   T7  AfterReceiverEndTaskEvent     → publisher 收 push (CONTRACT_PUBLISHER_NOTIFY_TASK_END 20049)
+#   T8  AfterPassReceiverTaskEvent    → receiver  收 push (CONTRACT_RECEIVER_TASK_SUCCESS 20057)
+#
+# 注意：使用 FunPoint 信用卡（payment_method_id=1）。publisher 236 已預先綁卡，
+# dev 環境會自動扣款，避免 ATM 那條「等待付款」的卡關。
+id: path-happy-publisher-pass
+description: "承攬制完整 happy path：發 → 申 → 同 → 開始 → 結束 → 通過"
+
+path:
+  - transition: T1_publisher_publish_task
+    save:
+      task_sn: task_sn
+    expect:
+      http: 200
+
+  - transition: T2_receiver_apply
+    expect:
+      http: 200
+
+  - transition: T3a_publisher_accept_apply
+    expect:
+      http: 200
+
+  - transition: T6_receiver_start_task
+    expect:
+      http: 200
+
+  - transition: T7_receiver_end_task
+    expect:
+      http: 200
+
+  - transition: T8_publisher_pass_task
+    expect:
+      http: 200
