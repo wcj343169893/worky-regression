@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 from ...config import Settings
+from ...qa_store import QAStore
 from ...verifier import DBVerifier
 
 
@@ -37,6 +38,8 @@ class ServiceBase:
     def __init__(self, settings: Settings | None = None):
         self.settings = settings or Settings.from_env()
         self.db = DBVerifier(self.settings)
+        # QA 看板庫存取：看板清單 / 統計改以「本框架已執行記錄」為全集（Issue #1）。
+        self.qa = QAStore(self.settings)
 
     # ── labor 名稱解析（display_name 加密，只用 phone / username）─────────────
     def _labor_labels(self, ids: list[int]) -> dict[int, dict]:

@@ -3,8 +3,15 @@
 
 import {
   $, api, esc, money, fmtTs, fmtDate8, laborName, shopName, empName,
-  badge, contractCat, CAT_COLOR, toast, PAGE, state, OPT,
+  badge, resBadge, contractCat, CAT_COLOR, toast, PAGE, state, OPT,
 } from "./util.js";
+
+// 最近執行結果 / 執行次數（Issue #1：把看板綁回測試框架）。沿用用例頁 resBadge 風格。
+function lastRunCell(r) {
+  const lr = r.last_run;
+  if (!lr) return `<span class="sub2">—</span>`;
+  return `${resBadge(lr.status)}<div class="sub2">${fmtTs(lr.started_at)} · ${lr.runs}次</div>`;
+}
 import { filterBar, bindFilters, applyFilterParams, fillRows, openDrawer, f, mini } from "./widgets.js";
 
 export const BOARDS = {
@@ -28,6 +35,7 @@ export const BOARDS = {
       ["招募", (r) => `${r.recruited_count}/${r.recruit_count} <span class="sub2">申 ${r.apply_count}</span>`],
       ["時段", (r) => `${fmtDate8(r.start_date)}<div class="sub2">${esc(r.start_time_period || "")}–${esc(r.end_time_period || "")}</div>`],
       ["商家/店鋪", (r) => `${empName(r.employer)}<div class="sub2">${shopName(r.shop)}</div>`],
+      ["最近執行", lastRunCell],
       ["更新", (r) => `<span class="sub2">${fmtTs(r.updated_at)}</span>`],
     ],
     detail: jobDetailHtml,
@@ -50,6 +58,7 @@ export const BOARDS = {
       ["時段", (r) => `${fmtTs(r.start_at)}<div class="sub2">~ ${fmtTs(r.end_at)}</div>`],
       ["發案者", (r) => laborName(r.publisher)],
       ["接案者", (r) => laborName(r.receiver)],
+      ["最近執行", lastRunCell],
       ["更新", (r) => `<span class="sub2">${fmtTs(r.updated_at)}</span>`],
     ],
     detail: taskDetailHtml,

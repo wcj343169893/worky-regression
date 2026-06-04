@@ -4,7 +4,7 @@ from __future__ import annotations
 import time
 
 from .. import status as st
-from .base import apply_filters, num
+from .base import num
 
 
 class ContractMixin:
@@ -15,19 +15,72 @@ class ContractMixin:
     def list_tasks(self, *, q: str = "", progress: int | None = None,
                    publisher_id: int | None = None, filters: dict | None = None,
                    limit: int = 50, offset: int = 0) -> dict:
-        where = ["t.is_deleted = 0"]
-        params: list = []
-        if q:
-            where.append("(t.task_sn LIKE %s OR t.name LIKE %s)")
-            params += [f"%{q}%", f"%{q}%"]
-        if publisher_id:
-            where.append("t.created_by = %s")
-            params.append(int(publisher_id))
-        apply_filters(where, params, filters, self.TASK_FILTERS)
-        where_sql = " AND ".join(where)
+        # Issue #1：全集 = 本框架已執行過、saved 留有 task_sn 的那批；不再全表掃描主倉。
+        rows = self._executed_task_rows()
 
-        # 取每個任務「最新一筆」接案者任務的 task_status，用來推導進度
-        base = f"""
+        # 文字 / 發案者 / 白名單篩選都在記憶體做（全集已縮小到已執行 SN）。
+        if q:
+            ql = q.lower()
+            rows = [it for it in rows
+                    if ql in (it["task_sn"] or "").lower()
+                    or ql in (it["name"] or "").lower()]
+        if publisher_id:
+            pid = int(publisher_id)
+            rows = [it for it in rows if (it.get("_created_by") or 0) == pid]
+        rows = self._apply_mem_filters(rows, filters, self.TASK_FILTERS)
+
+        # progress 篩選在分頁前套用（Issue #5：與 stats 同源、total/列數/分頁一致）。
+        if progress is not None:
+            rows = [it for it in rows if it["progress"]["code"] == int(progress)]
+
+        total = len(rows)
+        page = rows[int(offset):int(offset) + int(limit)]
+        return {"total": total, "count": len(page), "limit": limit,
+                "offset": offset, "items": page}
+
+    # 記憶體版白名單篩選（對應 base.apply_filters 的 eq/min/max，但作用在已組好的列上）。
+    # allow={param_key:(column, mode)}；列上欄位名取 column 去掉表別名（j.hourly_wage→hourly_wage）。
+    @staticmethod
+    def _apply_mem_filters(rows: list[dict], filters: dict | None, allow: dict) -> list[dict]:
+        if not filters:
+            return rows
+        out = rows
+        for key, (col, mode) in allow.items():
+            v = filters.get(key)
+            if v in (None, ""):
+                continue
+            field = col.split(".")[-1]
+            if mode == "eq":
+                out = [it for it in out if str(it.get(field)) == str(v)]
+            elif mode == "min":
+                out = [it for it in out if it.get(field) is not None and float(it[field]) >= float(v)]
+            elif mode == "max":
+                out = [it for it in out if it.get(field) is not None and float(it[field]) <= float(v)]
+        return out
+
+    def _executed_task_rows(self) -> list[dict]:
+        """建出「已執行 task_sn 全集」對應的列（含主倉現況 + 降級列），供 list/stats 同源。
+
+        排序：有主倉資料者依 task id desc；降級列排在最後（依 last_started_at desc）。
+        每列都掛 last_run（last_run_id/last_status/last_started_at/runs）綁回測試框架。
+        """
+        executed = self.qa.executed_entities("contract")
+        if not executed:
+            return []
+        ex_by_sn = {e["sn"]: e for e in executed}
+        ex_sns = list(ex_by_sn.keys())
+        now = int(time.time())
+
+        # 縮限主倉查詢到已執行 SN（參數化 IN，不字串拼 SN）。
+        ph = ",".join(["%s"] * len(ex_sns))
+        db_rows = self.db.query_all(
+            f"""
+            SELECT t.id, t.task_sn, t.name, t.status, t.pay_status, t.task_amount,
+                   t.estimated_total_amount, t.total_amount, t.start_at, t.end_at,
+                   t.recruit_count, t.recruited_count, t.recruit_deadline,
+                   t.payment_method_id, t.created_at, t.updated_at, t.published_at,
+                   t.created_by, t.city_id, t.district_id,
+                   prt.task_status AS receiver_task_status, prt.receiver_id
             FROM s_contract_tasks t
             LEFT JOIN (
                 SELECT rt.task_id, rt.task_status, rt.status AS rstatus, rt.receiver_id
@@ -36,43 +89,60 @@ class ContractMixin:
                       FROM s_contract_receiver_tasks GROUP BY task_id) m
                   ON rt.id = m.mid
             ) prt ON prt.task_id = t.id
-            WHERE {where_sql}
-        """
-        total = self.db.query_one(f"SELECT COUNT(*) c {base}", tuple(params))["c"]
-
-        rows = self.db.query_all(
-            f"""
-            SELECT t.id, t.task_sn, t.name, t.status, t.pay_status, t.task_amount,
-                   t.estimated_total_amount, t.total_amount, t.start_at, t.end_at,
-                   t.recruit_count, t.recruited_count, t.recruit_deadline,
-                   t.payment_method_id, t.created_at, t.updated_at, t.published_at,
-                   t.created_by, t.city_id, t.district_id,
-                   prt.task_status AS receiver_task_status, prt.receiver_id
-            {base}
+            WHERE t.is_deleted = 0 AND t.task_sn IN ({ph})
             ORDER BY t.id DESC
-            LIMIT %s OFFSET %s
             """,
-            tuple(params) + (int(limit), int(offset)),
+            tuple(ex_sns),
         )
 
-        now = int(time.time())
-        labels = self._labor_labels([r["created_by"] for r in rows]
-                                    + [r["receiver_id"] for r in rows])
-        items = []
-        for r in rows:
+        labels = self._labor_labels([r["created_by"] for r in db_rows]
+                                    + [r["receiver_id"] for r in db_rows])
+        items: list[dict] = []
+        found: set[str] = set()
+        for r in db_rows:
+            found.add(r["task_sn"])
             prog = st.derive_progress(
                 task_status=r["status"], pay_status=r["pay_status"],
                 recruit_deadline=r["recruit_deadline"],
                 receiver_task_status=r["receiver_task_status"], now=now,
             )
-            items.append(self._task_row(r, prog, labels))
+            row = self._task_row(r, prog, labels)
+            row["_created_by"] = r["created_by"]
+            row["last_run"] = self._last_run(ex_by_sn.get(r["task_sn"]))
+            items.append(row)
 
-        # 若有 progress 篩選，於記憶體過濾（進度是衍生值，無法直接 SQL where）
-        if progress is not None:
-            items = [it for it in items if it["progress"]["code"] == int(progress)]
+        # 降級列：已執行但主倉查無此 SN（被刪 / 分庫差異），不可整列消失。
+        degraded = [e for sn, e in ex_by_sn.items() if sn not in found]
+        degraded.sort(key=lambda e: e["last_started_at"], reverse=True)
+        for e in degraded:
+            items.append(self._degraded_task_row(e))
+        return items
 
-        return {"total": total, "count": len(items), "limit": limit,
-                "offset": offset, "items": items}
+    @staticmethod
+    def _last_run(entity: dict | None) -> dict | None:
+        if not entity:
+            return None
+        return {"run_id": entity["last_run_id"], "status": entity["last_status"],
+                "started_at": entity["last_started_at"], "runs": entity["runs"]}
+
+    def _degraded_task_row(self, e: dict) -> dict:
+        """主倉查無此 task_sn 時的降級列：以最後一次 run 狀態 / 時間呈現。"""
+        prog = st.record_only_progress()
+        return {
+            "id": None, "task_sn": e["sn"], "name": "(僅記錄)",
+            "status": None, "status_label": "-",
+            "pay_status": None, "pay_status_label": "-",
+            "task_amount": None, "estimated_total_amount": None, "total_amount": None,
+            "start_at": None, "end_at": None,
+            "recruit_count": None, "recruited_count": None, "recruit_deadline": None,
+            "payment_method_id": None, "payment_method_label": "-",
+            "created_at": None, "updated_at": e["last_started_at"], "published_at": None,
+            "city_id": None, "district_id": None,
+            "publisher": None, "receiver": None,
+            "progress": prog.to_dict(),
+            "_created_by": None,
+            "last_run": self._last_run(e),
+        }
 
     def _task_row(self, r: dict, prog: st.Progress, labels: dict) -> dict:
         return {
@@ -198,31 +268,20 @@ class ContractMixin:
 
     # ── 統計（看板頂部）─────────────────────────────────────────────────────
     def stats(self) -> dict:
-        rows = self.db.query_all(
-            """SELECT t.status, t.pay_status, t.recruit_deadline,
-                      prt.task_status AS receiver_task_status
-               FROM s_contract_tasks t
-               LEFT JOIN (
-                   SELECT rt.task_id, rt.task_status
-                   FROM s_contract_receiver_tasks rt
-                   JOIN (SELECT task_id, MAX(id) mid
-                         FROM s_contract_receiver_tasks GROUP BY task_id) m
-                     ON rt.id = m.mid
-               ) prt ON prt.task_id = t.id
-               WHERE t.is_deleted = 0"""
-        )
-        now = int(time.time())
+        # Issue #1/#5：與 list_tasks 同源——同一批已執行列上算分布，total 必然一致。
+        rows = self._executed_task_rows()
         by_progress: dict[int, int] = {}
-        for r in rows:
-            prog = st.derive_progress(
-                task_status=r["status"], pay_status=r["pay_status"],
-                recruit_deadline=r["recruit_deadline"],
-                receiver_task_status=r["receiver_task_status"], now=now,
-            )
-            by_progress[prog.code] = by_progress.get(prog.code, 0) + 1
+        for it in rows:
+            code = it["progress"]["code"]
+            by_progress[code] = by_progress.get(code, 0) + 1
 
         active_codes = {st.P_MATCHING, st.P_HANDLE, st.P_WAITING_PAY,
                         st.P_WAITING_START, st.P_PROCESSING, st.P_WAITING_CONFIRM}
+        # 分布段：線性 + 分支 + 降級（僅記錄）；只在實際出現的段顯示由前端過濾 count>0。
+        codes = [st.P_MATCHING, st.P_HANDLE, st.P_WAITING_PAY,
+                 st.P_WAITING_START, st.P_PROCESSING, st.P_WAITING_CONFIRM,
+                 st.P_TASK_COMPLETED, st.P_REJECTED, st.P_TASK_FAILED,
+                 st.P_CANCELED, st.P_RECORD_ONLY]
         return {
             "total": len(rows),
             "active": sum(v for k, v in by_progress.items() if k in active_codes),
@@ -232,9 +291,6 @@ class ContractMixin:
             "by_progress": [
                 {"code": code, "title": st.PROGRESS_TITLE.get(code, str(code)),
                  "count": by_progress.get(code, 0)}
-                for code in [st.P_MATCHING, st.P_HANDLE, st.P_WAITING_PAY,
-                             st.P_WAITING_START, st.P_PROCESSING, st.P_WAITING_CONFIRM,
-                             st.P_TASK_COMPLETED, st.P_REJECTED, st.P_TASK_FAILED,
-                             st.P_CANCELED]
+                for code in codes
             ],
         }

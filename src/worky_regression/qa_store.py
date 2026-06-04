@@ -180,6 +180,65 @@ class QAStore:
             return conn.execute(text(
                 "SELECT 1 FROM qa_cases WHERE id=:c LIMIT 1"), {"c": case_id}).first() is not None
 
+    # ── 已執行實體（看板資料來源：只看本框架跑過的 SN）─────────────────────────
+    # system → observations.saved 內的序號 key（白名單對映，不可拼使用者輸入進 SQL）。
+    # 實測整庫 distinct saved keys 只有 task_sn / job_sn。
+    _SN_KEY = {"contract": "task_sn", "job": "job_sn"}
+
+    def executed_entities(self, system: str) -> list[dict]:
+        """回傳本框架已執行過、且 observations.saved 內留有實體序號的清單。
+
+        每個 SN 聚合成一筆：
+          {sn, runs(該 SN 出現過的 run 數), last_run_id, last_status, last_started_at}
+        last_* 取該 SN 最近一次 run（started_at desc, run_id desc）。
+        其餘 system 一律回 []（白名單外不查）。
+        """
+        snkey = self._SN_KEY.get(system)
+        if not snkey:
+            return []
+        # JSON 抽取：每個 (run, sn) 去重一次（同一 run 多步驟存同 SN 只算一次）。
+        # snkey 來自白名單常量，非使用者輸入，可安全內嵌進 JSON path。
+        sql = text(f"""
+            SELECT DISTINCT r.run_id AS run_id, r.started_at AS started_at,
+                   r.status AS status,
+                   s.observations->>'$.saved.{snkey}' AS sn
+            FROM qa_run_steps s
+            JOIN qa_runs r ON r.run_id = s.run_id
+            WHERE r.`system` = :sys
+              AND s.observations->>'$.saved.{snkey}' IS NOT NULL
+              AND s.observations->>'$.saved.{snkey}' <> ''
+        """)
+        with self._engine.connect() as conn:
+            rows = [r._mapping for r in conn.execute(sql, {"sys": system}).all()]
+
+        # Python 端聚合：每 SN 取 runs 計數 + 最近一筆（started_at desc, run_id desc）。
+        agg: dict[str, dict] = {}
+        for r in rows:
+            sn = r["sn"]
+            if sn is None or sn == "":
+                continue
+            sn = str(sn)
+            cur = agg.get(sn)
+            sa = int(r["started_at"] or 0)
+            rid = r["run_id"]
+            if cur is None:
+                agg[sn] = {
+                    "sn": sn, "runs": 1,
+                    "last_run_id": rid, "last_status": r["status"], "last_started_at": sa,
+                }
+            else:
+                cur["runs"] += 1
+                # 比較「最近」：started_at desc，平手再比 run_id desc
+                if (sa, str(rid)) > (cur["last_started_at"], str(cur["last_run_id"])):
+                    cur["last_run_id"] = rid
+                    cur["last_status"] = r["status"]
+                    cur["last_started_at"] = sa
+        return list(agg.values())
+
+    def executed_sns(self, system: str) -> list[str]:
+        """輕量版：只取已執行 SN 清單（給 service 組 IN 子句用）。"""
+        return [e["sn"] for e in self.executed_entities(system)]
+
     # ── 子用例（主任務/子任務下鑽）─────────────────────────────────────────────
     def child_count(self, parent_id: str) -> int:
         """指定父用例的直接子用例數（parent_id 非保留字，不需反引號）。"""

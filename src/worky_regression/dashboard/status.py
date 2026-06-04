@@ -77,12 +77,14 @@ P_TASK_COMPLETED = 7  # 任務完成
 P_REJECTED = 8        # 駁回
 P_TASK_FAILED = 9     # 任務失敗
 P_CANCELED = 10       # 已取消
+P_RECORD_ONLY = 99    # 僅記錄（已執行過，但主倉工作庫已查不到該 SN→降級顯示）
 
 PROGRESS_TITLE = {
     P_UNKNOWN: "未知", P_MATCHING: "媒合中", P_HANDLE: "處理中",
     P_WAITING_PAY: "待付款", P_WAITING_START: "待開始", P_PROCESSING: "執行中",
     P_WAITING_CONFIRM: "待確認", P_TASK_COMPLETED: "任務完成",
     P_REJECTED: "駁回", P_TASK_FAILED: "任務失敗", P_CANCELED: "已取消",
+    P_RECORD_ONLY: "僅記錄",
 }
 
 PROGRESS_HINT = {
@@ -193,6 +195,19 @@ def derive_progress(*, task_status: int, pay_status: int, recruit_deadline: int,
     )
 
 
+def record_only_progress() -> Progress:
+    """降級進度（承攬制）：已執行過但主倉查不到該 SN，仍要列出而不 crash。"""
+    return Progress(
+        code=P_RECORD_ONLY,
+        title=PROGRESS_TITLE[P_RECORD_ONLY],
+        hint="本框架曾執行過此任務，但主倉工作庫目前查無此 SN（可能已刪除或分庫差異）。",
+        transition="",
+        stage_index=-1,
+        is_branch=False,
+        is_terminal=False,
+    )
+
+
 # ══════════════════════════════════════════════════════════════════════════
 # 工作系統（job）enum 對照 + 進度分類
 #   來源：common/base/Enums/JobStatus.php / JobPayStatus.php / LaborJobStatus.php
@@ -239,6 +254,7 @@ JOB_PROGRESS_ORDER = [
     ("draft", "未發佈"), ("matching", "媒合中"), ("recruited", "招募結束"),
     ("running", "工作開始"), ("done", "工作結束"),
     ("failed", "工作失敗"), ("canceled", "取消/刪除"),
+    ("record_only", "僅記錄"),
 ]
 
 # category → 對應的 JobStatus 值（讓看板的進度 chip 能直接走 SQL WHERE 過濾全集）
@@ -251,6 +267,12 @@ def job_progress(status) -> dict:
     cat, title = JOB_PROGRESS.get(int(status or 0), ("draft", label(JOB_STATUS, status)))
     return {"category": cat, "title": title, "status": int(status or 0),
             "status_label": label(JOB_STATUS, status)}
+
+
+def job_record_only_progress() -> dict:
+    """降級進度（工作）：已執行過但主倉查不到該 job_sn。"""
+    return {"category": "record_only", "title": "僅記錄", "status": None,
+            "status_label": "僅記錄"}
 
 
 def meta_payload() -> dict:
