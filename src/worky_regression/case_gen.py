@@ -25,6 +25,13 @@ from .registry import unit_spec
 
 GENERATED = Path(__file__).resolve().parents[2] / "cases" / "generated"
 
+# caps_lacking → 對應的 deficiency actor 名（_actors_for 盡力提供）。
+# 僅列「帳號池可靠提供（只缺該能力）」的；其餘 caps_lacking 分支仍標 skip。
+_DEFICIENCY_ACTOR = {
+    "verified": "labor_lacking_verified",
+    "profile_complete": "labor_lacking_profile_complete",
+}
+
 
 def _guard_db_execs(name: str) -> list[str]:
     out = []
@@ -105,13 +112,21 @@ def _branch_case(target: str, br: dict[str, Any], idx: int) -> dict[str, Any]:
     # db_exec：交易級前置
     if arrange.get("db_exec"):
         steps.append({"db_exec": arrange["db_exec"]})
-    # 不可自動化：標記 skip（覆蓋缺口可見）
-    if arrange.get("caps_lacking"):
-        skip_reasons.append(f"需配缺能力 {arrange['caps_lacking']} 的帳號（待帳號池提供 deficiency actor）")
+    # caps_lacking：綁一個「缺該能力」的 deficiency actor（池可提供者）；否則標 skip
+    action_bind = None
+    for cap in (arrange.get("caps_lacking") or []):
+        actor_name = _DEFICIENCY_ACTOR.get(cap)
+        if actor_name:
+            action_bind = {"labor": actor_name}
+        else:
+            skip_reasons.append(f"需配缺能力 {cap!r} 的帳號（帳號池暫無只缺此能力者）")
     if arrange.get("note"):
         skip_reasons.append(f"需特殊安排：{arrange['note']}")
 
-    steps.append(_negative_action(target, br))
+    action = _negative_action(target, br)
+    if action_bind:
+        action["bind"] = action_bind
+    steps.append(action)
     case: dict[str, Any] = {
         "id": f"gen-{target}-neg{idx}-{_slug(br.get('when', ''))}",
         "description": f"[L1 negative] {unit_spec(target).get('summary', target)}：{br.get('when', '')}",

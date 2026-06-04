@@ -114,6 +114,47 @@ class AccountPool:
             username=r.username, shop_id=r.shop_id, caps=_caps(r), note=r.note,
         ) for r in chosen]
 
+    def acquire_lacking(self, role: str, lacking: str, base_caps: list[str], n: int = 1, *,
+                        owner: str, lease: bool = False) -> list[PooledAccount]:
+        """配「具備 base_caps 但**缺** lacking 能力」的帳號（負向用例用）。
+
+        後端驗證有序：要可靠觸發某個守衛失敗，帳號須只缺該目標能力、其餘前置都滿足，
+        否則會先卡在更前面的檢查。base_caps 即「其餘必須具備」的能力。
+        """
+        now = int(time.time())
+        base = set(base_caps)
+        with self._qa_engine.begin() as conn:
+            rows = conn.execute(text("""
+                SELECT id, account_id, role, user_type, phone, username, shop_id, caps, note
+                FROM qa_accounts
+                WHERE role=:role AND state<>'disabled'
+                  AND (state='available' OR lease_expires_at < :now)
+                ORDER BY account_id ASC
+            """), {"role": role, "now": now}).all()
+
+            def _caps(r):
+                c = r.caps
+                return set(json.loads(c) if isinstance(c, str) else (c or []))
+
+            chosen = [r for r in rows if base <= _caps(r) and lacking not in _caps(r)][:n]
+            if len(chosen) < n:
+                avail = [(r.account_id, sorted(_caps(r))) for r in rows]
+                raise PoolShortage(
+                    f"role={role} 需要 {n} 個『具 {sorted(base)} 但缺 {lacking}』的帳號，僅 {len(chosen)} 個。"
+                    f"\n候選={avail}"
+                )
+            if lease:
+                exp = now + 900
+                for r in chosen:
+                    conn.execute(text(
+                        "UPDATE qa_accounts SET state='leased', lease_owner=:o, lease_expires_at=:e WHERE id=:id"
+                    ), {"o": owner, "e": exp, "id": r.id})
+        return [PooledAccount(
+            account_id=r.account_id, role=r.role, user_type=r.user_type, phone=r.phone,
+            username=r.username, shop_id=r.shop_id,
+            caps=list(json.loads(r.caps) if isinstance(r.caps, str) else (r.caps or [])), note=r.note,
+        ) for r in chosen]
+
     def release(self, owner: str) -> int:
         """歸還某 owner 借走的所有帳號。"""
         with self._qa_engine.begin() as conn:

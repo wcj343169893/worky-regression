@@ -103,6 +103,18 @@ def _actors_for(system: str, s: Settings) -> dict[str, Actor]:
         # 第三個合格夥伴待帳號池補足（目前 clean 的 audit labor 僅 236/365 兩個）。
         if len(labors) >= 3:
             actors["labor3"] = _actor_from_pool(s, labors[2], "labor")
+        # 負向用例用的「缺能力」夥伴（deficiency actor）：盡力配發，池中沒有就略過該名。
+        # 帳號須「只缺目標能力、其餘前置滿足」才能可靠觸發對應守衛失敗（後端驗證有序）。
+        deficiency = {
+            "labor_lacking_verified": ("verified", ["profile_complete", "active", "clean", "audit_role"]),
+            "labor_lacking_profile_complete": ("profile_complete", ["active", "audit_role"]),
+        }
+        for name, (lack, base) in deficiency.items():
+            try:
+                pa = pool.acquire_lacking("labor", lack, base, owner="job-actors", lease=False)[0]
+                actors[name] = _actor_from_pool(s, pa, "labor")
+            except Exception:  # noqa: BLE001 — 池中無此缺能力帳號就不提供，產生器會跳過對應分支
+                pass
         return actors
     publisher = _build_actor(s, accounts, "publisher", "publisher_primary", 2)
     ensure_publisher_invoice(publisher)

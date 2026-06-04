@@ -416,15 +416,15 @@ task_units:
       - need: 夥伴該時段無已確認工作（s_labor_jobs status=1, end_at>now）
         satisfy: {db_exec: "UPDATE s_labor_jobs SET status=8 WHERE labor_id={{labor.user_id}} AND status=1 AND end_at>UNIX_TIMESTAMP()"}
     branches:
-      - when: 夥伴尚未填寫個人資訊
+      - when: 夥伴尚未填寫個人資訊（id_number 空）
         expect_fail: {code: 30211}                  # LABOR_PROFILE_NOT_FILLED
-        arrange: {caps_lacking: [profile_complete]}
+        arrange: {note: "需 id_number 空的帳號；測試池帳號皆已實名，無法重現"}
       - when: 夥伴 profile 未完成
         expect_fail: {code: 30215}                  # LABOR_PROFILE_INCOMPLETE
         arrange: {caps_lacking: [profile_complete]}
       - when: 夥伴身分審核中
         expect_fail: {code: 30216}                  # LABOR_PROFILE_VALIDATING
-        arrange: {note: "配 valid_status=2(待認證) 的帳號，如 276"}
+        arrange: {caps_lacking: [verified]}         # 池中 labor_lacking_verified=276(valid_status=2 待認證)
       - when: 夥伴認證未通過
         expect_fail: {code: 30217}                  # LABOR_PROFILE_VALIDATE_FAIL
         arrange: {note: "配 valid_status=3(認證失敗) 的帳號"}
@@ -459,7 +459,7 @@ task_units:
     summary: 打工夥伴取消申請
     actor: labor
     method: POST
-    endpoint: /labor/job-match/job-apply/cancel
+    endpoint: /labor/job-match/job-cancel-application
     doc_id: 210-2
     event: ""
     request: {job_sn: "{{state.job_sn}}"}
@@ -502,7 +502,7 @@ task_units:
         expect_fail: {code: 20307}                  # ACCEPT_AUDIT_RECRUIT_TIME_EXPIRED
         arrange: {db_exec: "UPDATE s_jobs SET recruit_deadline=UNIX_TIMESTAMP()-1 WHERE job_sn='{{state.job_sn}}'"}
       - when: 該夥伴已取消申請
-        expect_fail: {code: 20309}                  # ACCEPT_AUDIT_STATUS_LABOR_CANCEL
+        expect_fail: {code: 20305}                  # ACCEPT_AUDIT_STATUS_LABOR_CANCEL_APPLICATION
         arrange: {by: [J2b_labor_cancel_apply]}
       - when: 該夥伴已被錄取（重複錄取）
         expect_fail: {code: 20310}                  # ACCEPT_AUDIT_STATUS_EMPLOYER_ACCEPT
