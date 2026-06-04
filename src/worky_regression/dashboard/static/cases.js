@@ -5,10 +5,8 @@ import { $, api, apiPost, esc, fmtTs, resBadge, toast, PAGE, state } from "./uti
 import { setupPager, openDrawer, openModal, closeModal } from "./widgets.js";
 
 export const CASES = {
-  "job-cases": { title: "工作測試用例", system: "job",
+  "cases": { title: "測試用例",
     ph: "例：商家發工作，夥伴申請後商家取消錄取" },
-  "task-cases": { title: "任務測試用例", system: "contract",
-    ph: "例：發案者發任務，接案者申請、發案者同意，最後完成並通過" },
 };
 
 const stepMark = { passed: "✓", failed: "✗", skipped: "·" };
@@ -45,7 +43,8 @@ function caseDetailHtml(d) {
 
 export async function renderCases(key) {
   const cfg = CASES[key];
-  const s = state[key] || (state[key] = { q: "", page: 0 });
+  // system 為頁內狀態（"" = 全部），不再寫死於路由；後續 Issue #3 由 tab 控制
+  const s = state[key] || (state[key] = { q: "", page: 0, system: "" });
   $("view").innerHTML = `
     <div class="cases-page">
       <div class="view-head"><h2>${esc(cfg.title)}</h2>
@@ -83,7 +82,8 @@ export async function renderCases(key) {
 async function loadCases(key) {
   stepCache = {};  // 列表重載（含重跑後）→ 清掉步驟詳情快取，確保 modal 拿到最新結果
   const cfg = CASES[key], s = state[key];
-  const params = new URLSearchParams({ system: cfg.system, q: s.q || "", limit: PAGE, offset: s.page * PAGE });
+  const params = new URLSearchParams({ q: s.q || "", limit: PAGE, offset: s.page * PAGE });
+  if (s.system) params.set("system", s.system);  // 空 = 全部，不帶 system（後端支援 system=None）
   if ($("rows")) $("rows").style.opacity = ".45";
   const data = await api("/api/cases?" + params).catch((e) => (toast(e.message), null));
   if (!data || !$("rows")) return;

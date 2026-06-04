@@ -11,9 +11,8 @@ import { renderSettings } from "./settings.js";
 // ── 頂部主菜單（key 對應雜湊路由 + 各業務模塊）──────────────────────────────
 const NAV = [
   { key: "jobs", label: "工作看板" },
-  { key: "job-cases", label: "工作測試用例" },
   { key: "tasks", label: "任務看板" },
-  { key: "task-cases", label: "任務測試用例" },
+  { key: "cases", label: "測試用例" },
   { key: "labors", label: "打工夥伴管理" },
   { key: "employers", label: "商家管理" },
   { key: "shops", label: "店鋪管理" },
@@ -22,7 +21,9 @@ const NAV = [
 
 function route() {
   closeDrawer();
-  const key = (location.hash.replace("#", "") || "jobs");
+  let key = (location.hash.replace("#", "") || "jobs");
+  // 相容舊雜湊：兩個用例入口已合併為單一 cases，正規化避免白屏
+  if (key === "job-cases" || key === "task-cases") key = "cases";
   NAV.forEach((n) => { const b = document.querySelector(`.nav button[data-k="${n.key}"]`); if (b) b.classList.toggle("active", n.key === key); });
   if (BOARDS[key]) return renderBoard(key);
   if (CASES[key]) return renderCases(key);
