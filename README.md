@@ -98,7 +98,7 @@ python -m worky_regression.dashboard --port 9000 --host 0.0.0.0
 | ① 介面定義 | `cases/_specs/endpoints.yaml` | **單一真實來源**：每個任務單元的 request / response / 前置 / DB 副作用（enum）/ push |
 | ② 任務單元 | `registry.py` | 從 endpoints.yaml 載入 → `Transition` registry + push type 全表 |
 | ③ 用例分解器 | `planner.py` + `autotest.py` | DeepSeek（OpenAI 相容）把自然語言用例分解成任務流；**驗證由 spec 自動推導**，不靠 LLM 寫 SQL |
-| ④ 結果記錄器 | `recorder.py` | 逐步執行並落地 `results/*.json`（失敗不中斷記錄） |
+| ④ 結果記錄器 | `recorder.py` | 逐步執行並落地到 `worky_qa_dashboard`（失敗不中斷記錄；缺 `id` 直接 raise；每跑產唯一 `run_id`） |
 
 ```bash
 source .venv/bin/activate
@@ -123,6 +123,39 @@ python -m worky_regression.autotest --path cases/job-happy-core.yaml
 
 ---
 
+## QA 持久化（worky_qa_dashboard）
+
+執行結果**只寫 DB**（不再產 `results/*.json`；舊檔留磁碟、已由 backfill 匯入）。
+dashboard 的用例清單 / 詳情 / 步驟詳情全部從這個庫讀，排查時能精準定位
+「哪個用例的哪一次跑、卡在哪一步」。
+
+- **資料庫**：`worky_qa_dashboard`（與 worky 庫同 server，共用 host/port/user/pass；
+  由 `.env` 的 `WORKY_QA_DB_NAME` 指定，預設 `worky_qa_dashboard`）。
+- **三張表**：
+  - `qa_cases` — 用例註冊（PK = 用例 id；含 file / system / source / yaml / step_count）。
+  - `qa_runs` — 每次執行（PK = `run_id`；status / started_at / passed / total / failed_at / source）。
+  - `qa_run_steps` — 每步（kind / status / elapsed_ms / error / observations(JSON)）。
+- **id 規則**（排查關鍵）：
+  - **用例 id**：YAML 的 `id:`；缺則用檔名 stem（`recorder` 缺 id 直接 raise，**不再 unnamed**）；
+    AI 分解撞號自動加 `-2 / -3`。
+  - **run_id**：`{case_id}-{started_at}-{hex}`（同秒多跑不撞；同 run_id 重入覆蓋＝冪等）。
+- **schema＝SQLAlchemy 模型 + Alembic**：真實來源是 `qa_models.py` 的模型，**不要手寫 DDL**。
+  改表流程：改模型 → `alembic revision --autogenerate -m "..."` → `alembic upgrade head`。
+  dashboard / autotest / backfill 啟動時都會自動 `migrate()`（建庫 + `upgrade head`），平常免手動。
+- **匯入舊資料**：`python -m worky_regression.qa_backfill`。
+
+```bash
+source .venv/bin/activate
+python -m worky_regression.qa_backfill          # 把現有 results/*.json 灌進新庫
+alembic upgrade head                            # 手動把 schema 帶到最新（平常啟動會自動跑）
+alembic revision --autogenerate -m "<變更>"      # 改了 qa_models 模型後產生 migration
+```
+
+> `system` 是 MySQL 8.0 保留字，`qa_store` 的 raw SQL 對該欄一律加反引號 `` `system` ``。
+> 後台用 `nohup` 起時加 `python -u`，否則 banner / log 會被緩衝看不到。
+
+---
+
 ## 目錄結構
 
 ```
@@ -135,11 +168,14 @@ src/worky_regression/
   push_type_ids.py # 相容 shim → registry
   verifier.py      # DBVerifier — query s_notifications / 業務表 / db_exec
   runner.py        # PathRunner — 讀 path → 執行 transitions → 三層驗證
-  recorder.py      # ★ RecordingRunner — 逐步記錄結果 → results/*.json
+  recorder.py      # ★ RecordingRunner — 逐步記錄結果 → worky_qa_dashboard（每跑產 run_id）
+  qa_models.py     # ★ QA 看板 schema 單一真實來源（SQLAlchemy 模型）+ migrate()
+  qa_store.py      # ★ QAStore — 用例註冊 + 執行結果讀寫（SQLAlchemy engine + 顯式 SQL）
+  qa_backfill.py   # ★ 一次性把舊 results/*.json 匯入 DB
   planner.py       # ★ DeepSeek 用例分解器（lean plan + 自動推導 expect）
   autotest.py      # ★ CLI：用例 → 任務流 → 執行 → 記錄
   dashboard/       # PC 任務看板（純檢視，stdlib HTTP）
-    status.py / service.py / server.py / static/
+    status.py / service.py / server.py / cases.py / static/
 
 cases/
   _specs/endpoints.yaml          # ★ 介面/任務單元單一真實來源
@@ -147,12 +183,14 @@ cases/
   path-*.yaml / job-*.yaml       # 一個檔 = 一條審批流路徑
   generated/                     # AI 分解器產出（gitignore；要保留就移上層）
 
+alembic/           # QA 看板 schema 遷移（versions/ 為 autogenerate 產出）
+alembic.ini
 tests/
   test_smoke.py    # 環境連通性
   test_paths.py    # parametrize over cases/path-*.yaml
   test_jobs.py     # parametrize over cases/job-*.yaml
 conftest.py        # session fixtures（settings/db/publisher/receiver/employer/labor）
-results/           # 執行結果記錄（gitignore）
+results/           # 舊執行結果記錄（gitignore；已匯入 DB，現以 DB 為準）
 ```
 
 ---
@@ -206,78 +244,99 @@ md5(
 
 ## 已知限制與陷阱
 
+### 0. dev 環境 contract / job 分庫（現況：next-v31x）
+
+- **job** 流程在 `WORKY_DB_NAME = worky_next_v31x`（22k+ `s_jobs`）。
+- **contract** 流程：dev API 把 `s_contract_tasks` 等寫到 **`worky_next_staging_v30x`**
+  （由 `WORKY_CONTRACT_DB_NAME` 指定）。`Settings.for_system()` 依 path 系統自動選庫。
+  **改庫只動 `.env`，別寫死。**
+- 兩套角色不同：contract 雙方皆 Labor（`user_type=2`）；job = employer（`user_type=1`）+ labor（`user_type=2`）。
+
 ### 1. PHP-FPM worker static 變數污染（Happy Path 卡關的根因）
 
-`api/modules/v1/forms/contract/ReceiverMatchTaskForm::getTask()` 使用：
-
-```php
-private function getTask(string $taskSn): array
-{
-    static $task = [];
-    if (isset($task[$taskSn])) return $task[$taskSn];
-    // ... query DB ...
-    $task[$taskSn] = $row ?: [];
-    return $task[$taskSn];
-}
-```
-
-`static` 變數在 PHP-FPM 模式下會**跨 request 在同一個 worker 內存活**。一旦
-某次請求把某 `task_sn` cache 成 `[]`（task 還沒 commit 或 cache miss 回空），
-同 worker 之後**所有**請求對該 task 都回空 → API 報 `50010「錯誤任務編號」`。
+`api/modules/v1/forms/contract/ReceiverMatchTaskForm::getTask()` 用了 `static $task = []`，
+在 PHP-FPM 模式下會**跨 request 在同一 worker 內存活**。一旦某 `task_sn` 被 cache 成 `[]`，
+同 worker 之後**所有**該 task 的請求都回空 → API 報 `50010「錯誤任務編號」`。
 
 **症狀**：T1 剛建立的 task_sn，T2 馬上就找不到。
-
-**繞過**：
-- 重啟 php-fpm（需 sudo）：`sudo systemctl restart php8.2-fpm`
-- 或讓 worker 自然輪替（idle 一段時間）
-
-**根治建議**（值得另開 WKD 單）：把 `static $task = []` 改為 instance property
-`private array $taskCache = []`，避免 worker-level 污染。
+**繞過**：`sudo systemctl restart php8.2-fpm`（框架無法在 Python 端清）。
+**根治建議**（值得另開 WKD 單）：改 instance property `private array $taskCache = []`。
 
 ### 2. Memcached `flush_all` 副作用
 
-`DBVerifier.flush_memcached()` 會清光整個 memcached。但**清不掉 worker-local
-PHP `static`**，反而會讓 worker 對「不存在的 task」做出錯誤緩存決定。
-runner 預設 `db_exec` step 才 flush，不在每個 transition 之間 flush。
+`flush_all` 清不掉 worker-local PHP `static`，反而可能讓 worker 對「不存在的 task」做出
+錯誤緩存決定。runner 預設只在 `db_exec`（顯式 `flush_cache: true`）才 flush。
 
-### 3. ATM 付款卡關
+### 3. 付款方式：改用 ATM（v31x 已無 FunPoint 綁卡）
 
-`payment_method_id=3` (ATM) 在 T3a 之後會卡住 T6，因為需要 publisher 實際支付
-才能 `start_task`。專案改用 `payment_method_id=1` (FunPoint 信用卡)：
+`s_contract_pay_fun_point_credit_cards` 在 v31x **整張空**，用 `payment_method_id=1`（信用卡）
+會被擋 `20023`。`TaskPublishForm` 對 ATM（`payment_method_id=3`）只查金額上限、不需綁卡，
+故 endpoints.yaml 的 T1 統一改 **`payment_method_id=3`**。ATM 原本「T6 卡住等付款」靠 happy path
+用 `db_exec` 把 `pay_status` 改 `102`（PAYMENT_SUCCESS）繞過：
 
-- publisher 236 的 `s_pay_user_invoice_info` 已 INSERT 發票設定
-- publisher 236 的 `s_contract_pay_fun_point_credit_cards` 已 clone 既有卡 binding
-
-但 dev 環境 FunPoint 不會真扣款，path 中需要一個 `db_exec` step 做：
-```sql
-UPDATE s_contract_tasks SET pay_status=102 WHERE task_sn='{{state.task_sn}}'
+```yaml
+- db_exec: >
+    UPDATE s_contract_tasks SET pay_status=102,
+      start_at=UNIX_TIMESTAMP()-60, end_at=UNIX_TIMESTAMP()+3600
+    WHERE task_sn='{{state.task_sn}}'
+  flush_cache: true
 ```
-並 `flush_cache: true`（清 model cache）。
 
 ### 4. 任務時段條件
 
-- `start_time >= now + MIN_PUBLISH_INTERVAL_SECONDS`（dev = 720s ≈ 0.2h）
-- `end_time - start_time >= 3600s`
-- runner 預設 `start_time = now + 900`，`end_time = now + 900 + 3700`
+- contract：`start_time >= now + 86400s`（dev `MIN_PUBLISH_INTERVAL_SECONDS = 24h`）、
+  `end_time - start_time ∈ [3600s, 30d]`、`start_time <= now + 90d`。
+  runner 自動設 `start = now + 90000`（≈25h）、`end = start + 3700`，YAML 不用自己算。
+  但 T6/T7 要求 `start_at <= now`、`end_at > now`，故發佈後須用 db_exec 把 `start_at/end_at`
+  拉回當下（見 `cases/path-contract-happy-green.yaml` 橋接步驟）。
+- job 系統時段由 `_job_slot_vars` 算（+3~+13 天）。
 
-`taskStart` / `taskEnd` service 內 stamp now，不檢查實際時間，所以連續跑沒問題。
+### 5. 發票 preflight（50045）
 
-### 5. 城市/區編號
+contract publish 要求發案者先設發票。`autotest.ensure_publisher_invoice()` 以 audit publisher
+呼叫 `/contract/invoice/update` 寫最小設定（捐贈發票）；`_actors_for("contract")` 與 conftest 都會跑。
 
-不要亂填，需要存在於 `s_districts`。沿用 worky 既有任務最常見的 `city_id=19, district_id=194`。
+### 6. receiver 連續操作 1s 節流（9002）
+
+`ReceiverTaskForm::validateTooFast()` 對同一 receiver 設 1s TTL 旗標，`T6→T7` < 1s 會回 `9002`。
+runner 支援 `- sleep: <秒>` step，happy path 在 T6/T7 間插 `- sleep: 2`。
+
+### 7. v31x 後端 J2 labor-apply 壞了（回歸框架已抓到）
+
+J2（`/labor/job-match/job-apply`）回 `Setting unknown property: …LaborMatchJob::is_hidden_by_user_status`
+——主倉 next-v31x 的 PHP 端 bug。**這是被測對象的 regression，不要在框架側修**，回報主倉即可。
+
+### 8. 城市/區編號
+
+不要亂填，需存在於 `s_districts`；contract T1 目前用 `city_id=19, district_id=193`。
 
 ---
 
 ## 加新 transition / case
 
-1. 在 `transitions.py` 新增 `Transition(...)` 條目，注意：
+1. **只動 `cases/_specs/endpoints.yaml`**（單一真實來源）新增任務單元，注意：
    - `endpoint` 對齊 `/www/wwwroot/worky/documents/api/` 文件
-   - `push_type_id` 對齊 `common\\components\\PushNotification\\Type` 常量
-   - 若新類型 → 同步加進 `push_type_ids.py`
-2. 在 `cases/` 新增 `path-<scenario>.yaml`，列出 transition 序列與 expect
+   - push `type_id` 對齊 `common\\components\\PushNotification\\Type` 常量
+   - `transitions.py` / `push_type_ids.py` 已是 shim，**不要往裡塞資料**
+2. 在 `cases/` 新增 `path-<scenario>.yaml`（或 `job-*.yaml`），列出 transition 序列與 expect
 3. `pytest tests/test_paths.py -k <scenario>` 跑
 
-YAML 模板可參考 `cases/path-happy-publisher-pass.yaml`。
+YAML 模板可參考 `cases/path-contract-happy-green.yaml`。
+
+---
+
+## 跨倉資訊查詢
+
+需要查 endpoint 文件、Event/Handler 程式碼、推播 Type 常量時，直接讀 `/www/wwwroot/worky/`：
+
+- API 文件：`/www/wwwroot/worky/documents/api/<編號>-*.md`
+- Event：`/www/wwwroot/worky/common/components/Contract/Event/After*.php`
+- EventHandler：`/www/wwwroot/worky/common/components/Contract/EventHandler/After*/`
+- PushNotification 子類：`.../Contract/EventHandler/After*/PushNotification.php`
+- Type 常量：`/www/wwwroot/worky/common/components/PushNotification/Type.php`
+- Consumer 屬性類：`.../common/components/RabbitMQ/Attribute/RabbitMQConsumer.php`
+- OnEvent 屬性類：`.../common/components/EventTrigger/Attribute/OnEvent.php`
+- ConfigLoader（自動掃描來源）：`.../common/helpers/ConfigLoader.php`
 
 ---
 
@@ -288,8 +347,12 @@ YAML 模板可參考 `cases/path-happy-publisher-pass.yaml`。
 | `WORKY_API_BASE` | `http://api.dev.worky.com.tw/v1` | 目標 API |
 | `WORKY_API_SECRET` | (dev 共用) | 簽名 secret |
 | `WORKY_AUDIT_SMS_CODE` | `9527` | audit 帳號固定碼 |
-| `WORKY_DB_HOST/PORT/USER/PASS/NAME` | 192.168.101.213 / worky_next_v30x | DB 驗證連線 |
+| `WORKY_DB_HOST/PORT/USER/PASS` | 192.168.101.213 / 3306 / root | DB 連線 |
+| `WORKY_DB_NAME` | `worky_next_v31x` | job 流程驗證庫 |
+| `WORKY_CONTRACT_DB_NAME` | `worky_next_staging_v30x` | contract 流程驗證庫（dev 分庫） |
+| `WORKY_QA_DB_NAME` | `worky_qa_dashboard` | QA 看板庫（用例註冊 + 執行結果） |
 | `WORKY_PLATFORM` | `WebPC` | header 用 |
+| `DEEPSEEK_API_KEY / _BASE_URL / _MODEL` | — / api.deepseek.com / deepseek-chat | AI 用例分解器（Layer ③） |
 
 ---
 
