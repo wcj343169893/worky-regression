@@ -17,6 +17,9 @@
 - **QA 看板 schema（worky_qa_dashboard）改動**：只改 `qa_models.py` 的 SQLAlchemy 模型，
   再 `alembic revision --autogenerate -m "..."` → `alembic upgrade head`；**不要手寫 DDL**。
 - `qa_store` 的 raw SQL 對 `system` 欄一律加反引號 `` `system` ``（MySQL 8.0 保留字）。
+- **測試帳號要按「能力」拿，不要在執行期 SQL 挖工作庫**：用 `AccountPool.acquire(role, caps, n)`
+  （`qa_accounts.py`）。新增/校正帳號走 `provision()`（特權、偶發），不在用例裡臨時改帳號硬狀態。
+  加多夥伴用例：`bind: {labor: laborN}` 切身份、spec 頂層 `vars:` 帶參數、`assert_state:` 驗負向。
 - 後台用 `nohup` 起時加 `python -u`（否則 banner / log 被緩衝看不到）。
 - commit message 格式：`<type>: <描述>(WKD-XXXXX)`（沿用 worky 慣例；有對應 Jira 單再帶號）。
 

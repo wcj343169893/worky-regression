@@ -27,6 +27,11 @@ receiver_backup:
     phone: "0900000001"
     is_profile_complete: 0    # profile 未填，部份 endpoint 可能擋
 
+# 工作系統的「多夥伴」帳號改由 **帳號池(qa_accounts)** 按能力配發，不再寫死於此檔。
+# 種子 id 與供給邏輯見 src/worky_regression/qa_accounts.py（SEED_LABOR_IDS / provision）。
+# 執行期 runner 從池取「verified+profile_complete+audit_role+active+clean」的 labor，
+# 不直連工作庫挑帳號。供給/同步：python -m worky_regression.qa_accounts provision
+
 # === 商家（user_type=1）：「工作」系統用 ===
 # 工作系統雇主=商家(user_type=1)、勞工=打工夥伴(user_type=2)，與承攬制不同。
 # v31x 原本沒有任何雇主，此帳號由 scripts/bootstrap_job_env.py 從 v30x 複製而來

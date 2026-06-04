@@ -16,7 +16,13 @@ path:
         equals:
           status: 1                      # Task/JobStatus MATCHING
 
-  # J2 打工夥伴申請上工 → 商家收 LABOR_JOB_APPLY(10021)，媒合列 status=4
+  # 前置(guard→setup)：清掉夥伴殘留的「上工」工作，繞 30207 時段重疊 / 30229 同店同日
+  - db_exec: >
+      UPDATE s_labor_jobs SET status = 8
+      WHERE labor_id = {{labor.user_id}} AND status = 1 AND end_at > UNIX_TIMESTAMP()
+    expect_min_affected: 0
+
+  # J2 打工夥伴申請上工 → 商家收 LABOR_JOB_APPLY_V2(10025)，媒合列 status=4
   - transition: J2_labor_apply
     expect:
       http: 200

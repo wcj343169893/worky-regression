@@ -1,0 +1,73 @@
+id: job-accept-1-of-2
+description: >
+  商家發佈工作(招募1人)→兩位不同打工夥伴各自申請→商家錄取其中一位，另一位仍停留在申請中。
+  示範「簡單需求、實則多子任務」的正確拆分：
+   · 身份：兩個不同 labor，由帳號池按 caps(verified/active/clean…) 配發，用例只宣告不指定 id；
+   · 時段：前置清掉殘留「上工」工作(繞 30207 重疊 + 30229 同店同日)；
+   · 上工要求：認證/未停權/無違規等硬狀態由帳號池保證(provision 階段校正)。
+# 招募 1 人 → 錄取 1 位；第 2 位申請成功但不被錄取。
+vars:
+  job_recruit_count: 1
+
+path:
+# ── Phase 0 前置：發佈工作 ──────────────────────────────────────────────────
+- transition: J1_employer_publish_job
+  save:
+    job_sn: job_sn_list.0
+  expect:
+    http: 200
+    state:
+      sql: "SELECT status FROM s_jobs WHERE job_sn='{{state.job_sn}}'"
+      equals:
+        status: 1                       # JobStatus 媒合中
+
+# ── Phase 0 前置：清確認工作（繞 30207 時段重疊 + 30229 同店同日）────────────
+# 申請工作的 form rule 會擋兩種殘留的「上工(STATUS_GO_TO_WORK=1)」工作：
+#   30207 該時段已有確認工作（時段重疊）；30229 同一企業每日僅限一次（同店同日）。
+# 兩位都是測試 labor，把其「未來未完成的上工工作」一律標記已完成(8)即可確定性繞過。
+# 註：這是「交易級」資料守衛，將來驗證層遷出 SQL 時，這步應改由夥伴自己的 API 動作完成。
+- db_exec: >
+    UPDATE s_labor_jobs
+    SET status = 8
+    WHERE labor_id IN ({{labor1.user_id}}, {{labor2.user_id}})
+      AND status = 1
+      AND end_at > UNIX_TIMESTAMP()
+  expect_min_affected: 0
+
+# ── Phase 1 動作：兩位夥伴各自申請（bind 切換身份；商家收 10025）──────────────
+- transition: J2_labor_apply
+  bind: {labor: labor1}
+  expect:
+    http: 200
+    push: {}
+    state:
+      sql: "SELECT status FROM s_labor_match_jobs WHERE job_id=(SELECT id FROM s_jobs WHERE job_sn='{{state.job_sn}}') AND labor_id={{labor.user_id}}"
+      equals:
+        status: 4                       # STATUS_LABOR_APPLY
+- transition: J2_labor_apply
+  bind: {labor: labor2}
+  expect:
+    http: 200
+    push: {}
+    state:
+      sql: "SELECT status FROM s_labor_match_jobs WHERE job_id=(SELECT id FROM s_jobs WHERE job_sn='{{state.job_sn}}') AND labor_id={{labor.user_id}}"
+      equals:
+        status: 4
+
+# ── Phase 2 動作：商家錄取其中一位（labor1；收 EMPLOYER_ACCEPT_APPLY）──────────
+- transition: J3_employer_accept
+  bind: {labor: labor1}
+  expect:
+    http: 200
+    push: {}
+    state:
+      sql: "SELECT status, job_status FROM s_labor_jobs WHERE job_id=(SELECT id FROM s_jobs WHERE job_sn='{{state.job_sn}}') AND labor_id={{labor.user_id}}"
+      equals:
+        status: 1                       # 上工
+        job_status: 1                   # 待上工
+
+# ── Phase 2 斷言：第二位未被錄取（s_labor_jobs 無其紀錄）────────────────────────
+- assert_state:
+    sql: "SELECT COUNT(*) AS cnt FROM s_labor_jobs WHERE job_id=(SELECT id FROM s_jobs WHERE job_sn='{{state.job_sn}}') AND labor_id={{labor2.user_id}}"
+    equals:
+      cnt: 0

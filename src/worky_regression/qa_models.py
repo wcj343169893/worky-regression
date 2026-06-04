@@ -90,6 +90,36 @@ class QARunStep(Base):
     __table_args__ = (Index("idx_run", "run_id", "step_index"),)
 
 
+class QAAccount(Base):
+    """測試帳號池（QA 自管的真相）。
+
+    用例按「能力(caps)」要帳號，runner 從這裡配發，**執行期不再直連工作庫挖帳號**。
+    硬狀態(認證/停權/profile)由特權同步任務(有 DB/後台權限時)寫入 caps；執行期只讀本表。
+    """
+    __tablename__ = "qa_accounts"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    account_id: Mapped[int] = mapped_column(Integer, nullable=False)        # worky labor/employer id
+    role: Mapped[str] = mapped_column(String(32), nullable=False)          # 'labor' | 'employer'
+    user_type: Mapped[int] = mapped_column(Integer, nullable=False)        # 1 商家 / 2 打工夥伴
+    phone: Mapped[str] = mapped_column(String(32), nullable=False, server_default="")
+    username: Mapped[str | None] = mapped_column(String(64))
+    shop_id: Mapped[int | None] = mapped_column(Integer)
+    # 能力標籤（JSON 陣列），例：["verified","active","profile_complete","audit_role"]
+    caps: Mapped[list | None] = mapped_column(JSON)
+    state: Mapped[str] = mapped_column(String(16), nullable=False, server_default="available")  # available|leased|disabled
+    note: Mapped[str | None] = mapped_column(String(255))
+    synced_at: Mapped[int] = mapped_column(BigInteger, nullable=False, server_default="0")
+    # 軟租約：避免同一帳號被並行 run 重複借走
+    lease_owner: Mapped[str | None] = mapped_column(String(160))
+    lease_expires_at: Mapped[int] = mapped_column(BigInteger, nullable=False, server_default="0")
+
+    __table_args__ = (
+        Index("uq_account_role", "account_id", "role", unique=True),
+        Index("idx_role_state", "role", "state"),
+    )
+
+
 # ── 連線 / URL ───────────────────────────────────────────────────────────────
 def db_url(settings: Settings, database=_UNSET) -> URL:
     """組 SQLAlchemy 連線 URL；database=None → 連到 server（不指定庫，供建庫用）。"""

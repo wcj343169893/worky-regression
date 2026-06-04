@@ -72,7 +72,7 @@ class RecordingRunner:
         spec = path if isinstance(path, dict) else self._load(path)
         state = self.runner.init_state(
             actors=actors, publisher=publisher, receiver=receiver,
-            employer=employer, labor=labor,
+            employer=employer, labor=labor, extra_vars=spec.get("vars"),
         )
 
         steps: list[StepResult] = []
@@ -83,8 +83,11 @@ class RecordingRunner:
         for i, step in enumerate(spec["path"]):
             is_db = "db_exec" in step
             is_sleep = "sleep" in step
+            is_assert = "assert_state" in step
             if is_db:
                 kind = name = "db_exec"
+            elif is_assert:
+                kind, name = "assert_state", "assert_state"
             elif is_sleep:
                 kind, name = "sleep", f"sleep {step['sleep']}s"
             else:
@@ -96,6 +99,8 @@ class RecordingRunner:
             try:
                 if is_db:
                     obs = self.runner._run_db_exec(step, state)
+                elif is_assert:
+                    obs = self.runner._run_assert(step, state)
                 elif is_sleep:
                     obs = self.runner._run_sleep(step, state)
                 else:

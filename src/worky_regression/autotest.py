@@ -28,6 +28,7 @@ from .actor import Actor
 from .client import WorkyClient
 from .config import Settings
 from .planner import TaskPlan, build_path, decompose, plan_to_json
+from .qa_accounts import AccountPool, PooledAccount
 from .qa_store import QAStore
 from .recorder import RecordingRunner
 from .verifier import DBVerifier
@@ -42,6 +43,15 @@ def _build_actor(s: Settings, accounts: dict, role: str, key: str, user_type: in
     client = WorkyClient(s, user_type=user_type)
     actor = Actor(role=role, user_type=user_type, phone=cfg["phone"],
                   user_id=cfg["id"], client=client, shop_id=cfg.get("shop_id"))
+    actor.login(audit_code=s.audit_sms_code)
+    return actor
+
+
+def _actor_from_pool(s: Settings, pa: PooledAccount, role: str) -> Actor:
+    """用帳號池配發的帳號登入成 Actor（執行期只認 caps，不認 id）。"""
+    client = WorkyClient(s, user_type=pa.user_type)
+    actor = Actor(role=role, user_type=pa.user_type, phone=pa.phone,
+                  user_id=pa.account_id, client=client, shop_id=pa.shop_id)
     actor.login(audit_code=s.audit_sms_code)
     return actor
 
@@ -76,10 +86,24 @@ def _actors_for(system: str, s: Settings) -> dict[str, Actor]:
     """依系統登入對應角色（承攬制 publisher 會做發票 preflight）。"""
     accounts = yaml.safe_load(ACCOUNTS.read_text(encoding="utf-8"))
     if system == "job":
-        return {
-            "employer": _build_actor(s, accounts, "employer", "employer_primary", 1),
-            "labor": _build_actor(s, accounts, "labor", "publisher_primary", 2),
+        # 從帳號池按「能力」配發，不再寫死 id：labor1/2/3 為三個合格夥伴（bind 切換身份），
+        # employer 為已驗證店鋪商家。執行期只讀 qa_accounts，不直連工作庫挖帳號。
+        pool = AccountPool(s)
+        labor_caps = ["verified", "profile_complete", "audit_role", "active", "clean"]
+        labors = pool.acquire("labor", labor_caps, 2, owner="job-actors", lease=False)
+        emp = pool.acquire("employer", ["active", "verified_shop"], 1,
+                           owner="job-actors", lease=False)[0]
+        la = [_actor_from_pool(s, pa, "labor") for pa in labors]
+        actors = {
+            "employer": _actor_from_pool(s, emp, "employer"),
+            "labor": la[0],
+            "labor1": la[0],
+            "labor2": la[1],
         }
+        # 第三個合格夥伴待帳號池補足（目前 clean 的 audit labor 僅 236/365 兩個）。
+        if len(labors) >= 3:
+            actors["labor3"] = _actor_from_pool(s, labors[2], "labor")
+        return actors
     publisher = _build_actor(s, accounts, "publisher", "publisher_primary", 2)
     ensure_publisher_invoice(publisher)
     return {

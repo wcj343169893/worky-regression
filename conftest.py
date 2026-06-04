@@ -84,3 +84,13 @@ def labor(settings: Settings, accounts: dict) -> Actor:
                   user_id=cfg["id"], client=client)
     actor.login(audit_code=settings.audit_sms_code)
     return actor
+
+
+@pytest.fixture(scope="session")
+def job_actors(settings: Settings) -> dict:
+    """工作系統完整 actor map（employer + labor/labor1/labor2…），由帳號池按能力配發。
+
+    與 dashboard 走同一條 _actors_for('job')，故多夥伴用例(labor1/labor2)在 pytest 也能跑。
+    """
+    from worky_regression.autotest import _actors_for
+    return _actors_for("job", settings)

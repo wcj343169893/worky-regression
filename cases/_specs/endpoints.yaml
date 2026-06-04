@@ -333,7 +333,7 @@ task_units:
       end_time_period: "{{state.job_end_period}}"
       work_minutes: "{{state.job_work_minutes}}"   # 必須 == (end-start)-rest，否則 20030
       rest_minutes: 0
-      recruit_count: 1
+      recruit_count: "{{state.job_recruit_count}}"  # 預設 1；多人錄取用例在 spec vars 覆寫
       match_target_favor: 0
       hourly_wage: 250                              # 不可低於 230（20011）
       city_id: 19

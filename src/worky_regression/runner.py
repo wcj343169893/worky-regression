@@ -4,7 +4,7 @@ from __future__ import annotations
 import re
 import time
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -89,11 +89,13 @@ class PathRunner:
 
         state = self.init_state(
             actors=actors, publisher=publisher, receiver=receiver,
-            employer=employer, labor=labor,
+            employer=employer, labor=labor, extra_vars=spec.get("vars"),
         )
         for step in spec["path"]:
             if "db_exec" in step:
                 self._run_db_exec(step, state)
+            elif "assert_state" in step:
+                self._run_assert(step, state)
             elif "sleep" in step:
                 self._run_sleep(step, state)
             else:
@@ -103,8 +105,12 @@ class PathRunner:
     def init_state(*, actors: dict[str, Actor] | None = None,
                    publisher: Actor | None = None, receiver: Actor | None = None,
                    employer: Actor | None = None, labor: Actor | None = None,
+                   extra_vars: dict[str, Any] | None = None,
                    ) -> PathExecutionState:
-        """建立一次 path 執行的初始 state（actor map + runtime 變數）。"""
+        """建立一次 path 執行的初始 state（actor map + runtime 變數）。
+
+        extra_vars：spec 頂層 ``vars:`` 的覆寫（例如 job_recruit_count），最後合併蓋過預設。
+        """
         actor_map: dict[str, Actor] = dict(actors or {})
         for role, act in (("publisher", publisher), ("receiver", receiver),
                           ("employer", employer), ("labor", labor)):
@@ -112,7 +118,7 @@ class PathRunner:
                 actor_map[role] = act
 
         now = int(time.time())
-        return PathExecutionState(
+        state = PathExecutionState(
             actors=actor_map,
             vars={
                 "run_id": uuid.uuid4().hex[:8],
@@ -131,8 +137,13 @@ class PathRunner:
                 # （30207「該時段已有確認工作」）。日期每 30 分鐘輪進、時段每分鐘輪進，
                 # 一個 session 內幾乎不會撞號。工時固定 120 分（start→end 差 2h、rest 0）。
                 **_job_slot_vars(now),
+                # 工作招募人數（J1 用）；多人申請/錄取的用例可在 spec 頂層 vars 覆寫。
+                "job_recruit_count": 1,
             },
         )
+        if extra_vars:
+            state.vars.update(extra_vars)
+        return state
 
     def _run_db_exec(self, step: dict, state: PathExecutionState) -> dict[str, Any]:
         """執行任意 SQL（用於模擬外部副作用，例如 ATM 付款完成）。
@@ -154,6 +165,26 @@ class PathRunner:
         print(f"  [db_exec] {sql[:60]}... → affected={affected} cache_flushed={flushed}")
         return {"sql": sql, "affected": affected, "cache_flushed": flushed}
 
+    def _run_assert(self, step: dict, state: PathExecutionState) -> dict[str, Any]:
+        """純 DB 狀態斷言（無 transition），用於驗證「沒被改動 / 沒被錄取」這類負向狀態。
+
+        step:  {assert_state: {sql: ..., equals: {col: val}}}
+        """
+        spec = step["assert_state"]
+        sql = state.resolve(spec["sql"])
+        row = self.db.query_one(sql)
+        if row is None:
+            raise AssertionError(f"[assert_state] query returned no rows: {sql}")
+        for col, expected in (spec.get("equals") or {}).items():
+            expected = state.resolve(expected)
+            actual = row.get(col)
+            if str(actual) != str(expected):
+                raise AssertionError(
+                    f"[assert_state] {col}: expected {expected!r}, got {actual!r}\nsql: {sql}"
+                )
+        print(f"  [assert_state] ok: {sql[:70]}")
+        return {"assert_state": sql, "row": dict(row)}
+
     def _run_sleep(self, step: dict, state: PathExecutionState) -> dict[str, Any]:
         """暫停數秒。用於繞過後端「執行操作過快」(9002) 類的短窗節流（TTL 約 1s）。"""
         secs = float(step.get("sleep", 0))
@@ -163,6 +194,18 @@ class PathRunner:
 
     def _run_step(self, step: dict, state: PathExecutionState) -> dict[str, Any]:
         transition = get_transition(step["transition"])
+
+        # 步驟級 role 重綁：bind: {labor: labor2} 讓本步的 request/驗證 SQL/push 目標
+        # 一致指向 labor2（多身份用例必要，且完全不用改 endpoints.yaml 模板）。
+        bind = step.get("bind")
+        if bind:
+            actors = dict(state.actors)
+            for role, src in bind.items():
+                if src not in state.actors:
+                    raise KeyError(f"bind: 未知 actor {src!r}（可用：{sorted(state.actors)}）")
+                actors[role] = state.actors[src]
+            state = replace(state, actors=actors)  # 共用同一 vars dict，save 仍寫回原 state
+
         actor = state.actors[transition.actor_role]
 
         body = state.resolve(transition.body_template)

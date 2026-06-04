@@ -15,6 +15,6 @@ JOB_FILES = sorted(CASES_DIR.glob("job-*.yaml"))
 
 @pytest.mark.job
 @pytest.mark.parametrize("path_file", JOB_FILES, ids=lambda p: p.stem)
-def test_job_path(path_file: Path, db, employer, labor):
+def test_job_path(path_file: Path, db, job_actors):
     runner = PathRunner(db)
-    runner.run(path_file, employer=employer, labor=labor)
+    runner.run(path_file, actors=job_actors)
