@@ -313,6 +313,20 @@ task_units:
 
   # ===========================================================================
   # 工作系統 job（J1–J7）— enum 已對源碼確認（next-v31x）
+  #
+  # guards / branches 結構（給分解器依 coverage level 產用例；對齊 worky form rule）：
+  #   guards   ── 前置守衛：happy path 必須滿足，轉成 setup，不獨立成用例。
+  #     - need:    人類可讀條件
+  #       satisfy: 擇一 ── caps:[..]（帳號池配具該能力帳號）
+  #                       ｜ by: <transition>（由前序步驟建立狀態）
+  #                       ｜ db_exec: "<SQL>"（交易級資料前置；待驗證層 API 化後改 API 動作）
+  #   branches ── 業務分支：L1 各生一條「負向子用例」（預期 API 失敗）。
+  #     - when:        觸發條件
+  #       expect_fail: {code: <int>} 或 {message_contains: "<片語>"}
+  #       arrange:     擇一 ── caps_lacking:[..]（配缺該能力的帳號）
+  #                          ｜ by:[<transition>..]（跑前序步驟造出該前提）
+  #                          ｜ note: "<需特殊安排的說明>"
+  # 錯誤碼來源：/www/wwwroot/worky/api/base/Exception/ApiExceptionCode.php
   # ===========================================================================
   J1_employer_publish_job:
     system: job
@@ -356,7 +370,27 @@ task_units:
     saves:
       job_sn: job_sn_list.0
     push: null
-    preconditions: [雇主已登入且店鋪已驗證]
+    guards:
+      - need: 商家已登入且店鋪已驗證（validation_type=2）
+        satisfy: {caps: [active, verified_shop]}
+      - need: 時薪、工時、招募人數等發佈參數合法
+        satisfy: {note: "happy 用 request 預設值；非法值見 branches"}
+    branches:
+      - when: 時薪低於下限（230）
+        expect_fail: {code: 20011}                  # HOURLY_WAGE_TOO_LOW
+        arrange: {note: "request.hourly_wage 設 < 230"}
+      - when: 時薪高於上限
+        expect_fail: {code: 20012}                  # HOURLY_WAGE_TOO_HIGH
+        arrange: {note: "request.hourly_wage 設超過上限"}
+      - when: work_minutes != (end-start)-rest
+        expect_fail: {code: 20030}                  # JOB_WORK_HOURS_NOT_IDENTICAL
+        arrange: {note: "request.work_minutes 與時段不符"}
+      - when: 工時低於最短限制
+        expect_fail: {code: 20040}                  # JOB_MIN_WORK_MINUTES
+        arrange: {note: "時段差距小於最短工時"}
+      - when: 店鋪不存在 / 非本商家
+        expect_fail: {code: 30205}                  # SHOP_NOT_FOUND
+        arrange: {note: "request.shop_id 給不存在或他人店鋪"}
     side_effects:
       - table: s_jobs
         key: "job_sn='{{state.job_sn}}'"
@@ -373,7 +407,48 @@ task_units:
     event: common\components\Event\Events\LaborJobApplyFinishedEvent
     request: {job_sn: "{{state.job_sn}}"}
     push: {to: employer, type: LABOR_JOB_APPLY_V2}   # 手動錄取路徑送 V2(10025)；舊 10021 僅 AUTO_ACCEPT
-    preconditions: [工作媒合中（J1）]
+    # 對齊 worky JobMatchForm::validateCanApplyJob / validateRecruitJob（labor 端）
+    guards:
+      - need: 工作存在且在媒合中、招募未滿、未過截止
+        satisfy: {by: J1_employer_publish_job}
+      - need: 夥伴已實名認證且 profile 完整、未停權
+        satisfy: {caps: [verified, profile_complete, active]}
+      - need: 夥伴該時段無已確認工作（s_labor_jobs status=1, end_at>now）
+        satisfy: {db_exec: "UPDATE s_labor_jobs SET status=8 WHERE labor_id={{labor.user_id}} AND status=1 AND end_at>UNIX_TIMESTAMP()"}
+    branches:
+      - when: 夥伴尚未填寫個人資訊
+        expect_fail: {code: 30211}                  # LABOR_PROFILE_NOT_FILLED
+        arrange: {caps_lacking: [profile_complete]}
+      - when: 夥伴 profile 未完成
+        expect_fail: {code: 30215}                  # LABOR_PROFILE_INCOMPLETE
+        arrange: {caps_lacking: [profile_complete]}
+      - when: 夥伴身分審核中
+        expect_fail: {code: 30216}                  # LABOR_PROFILE_VALIDATING
+        arrange: {note: "配 valid_status=2(待認證) 的帳號，如 276"}
+      - when: 夥伴認證未通過
+        expect_fail: {code: 30217}                  # LABOR_PROFILE_VALIDATE_FAIL
+        arrange: {note: "配 valid_status=3(認證失敗) 的帳號"}
+      - when: 夥伴帳號停權中
+        expect_fail: {code: 30208}                  # LABOR_IS_SUSPENDED
+        arrange: {caps_lacking: [active]}
+      - when: 夥伴該時段已有確認工作
+        expect_fail: {code: 30207}                  # ALREADY_HAVE_A_JOB
+        arrange: {note: "略過 no_time_conflict 守衛，留下重疊的 s_labor_jobs"}
+      - when: 同一商家/企業當日已有工作
+        expect_fail: {code: 30229}                  # LABOR_THAT_DAY_MATCH_JOB_SUCCESS_ONLINE（同店為 30213）
+        arrange: {note: "同店同日先錄取一份再申請另一份"}
+      - when: 夥伴在該店黑名單
+        expect_fail: {code: 30301}                  # LABOR_DENIED_DUE_TO_BLOCKLIST
+        arrange: {note: "需商家把該夥伴加入黑名單"}
+      - when: 重複申請（已申請過）
+        expect_fail: {message_contains: "工作已申請成功"}
+        arrange: {by: [J2_labor_apply]}
+      - when: 招募人數已滿
+        expect_fail: {message_contains: "招募人數已滿"}
+        arrange: {note: "recruit_count=1 且已錄取額滿後再申請"}
+      - when: 已過招募截止
+        expect_fail: {message_contains: "招募已截止"}
+        arrange: {db_exec: "UPDATE s_jobs SET recruit_deadline=UNIX_TIMESTAMP()-1 WHERE job_sn='{{state.job_sn}}'"}
     side_effects:
       - table: s_labor_match_jobs
         key: "job_id=(SELECT id FROM s_jobs WHERE job_sn='{{state.job_sn}}') AND labor_id={{labor.user_id}}"
@@ -389,7 +464,13 @@ task_units:
     event: ""
     request: {job_sn: "{{state.job_sn}}"}
     push: null
-    preconditions: [已申請（J2，status=4）或備取中（16）]
+    guards:
+      - need: 夥伴已申請（J2，status=4）或備取中（16）
+        satisfy: {by: J2_labor_apply}
+    branches:
+      - when: 招募已截止後才取消
+        expect_fail: {message_contains: "招募已截止"}
+        arrange: {db_exec: "UPDATE s_jobs SET recruit_deadline=UNIX_TIMESTAMP()-1 WHERE job_sn='{{state.job_sn}}'"}
     side_effects:
       - table: s_labor_match_jobs
         key: "job_id=(SELECT id FROM s_jobs WHERE job_sn='{{state.job_sn}}') AND labor_id={{labor.user_id}}"
@@ -405,7 +486,36 @@ task_units:
     event: common\components\Event\Events\AfterEmployerJobMatchAcceptEvent
     request: {job_sn: "{{state.job_sn}}", labor_id: "{{labor.user_id}}"}
     push: {to: labor, type: EMPLOYER_ACCEPT_APPLY}
-    preconditions: [打工夥伴已申請（J2，status=4）]
+    # 對齊 worky employer/shop/JobMatchForm::validateJobAccept
+    guards:
+      - need: 該夥伴已申請（s_labor_match_jobs.status=4）且未取消/未被婉拒
+        satisfy: {by: J2_labor_apply}
+      - need: 工作仍在招募中、未額滿、未過招募時間
+        satisfy: {by: J1_employer_publish_job}
+      - need: 被錄取夥伴當日在該店無其他已確認工作
+        satisfy: {caps: [clean], note: "happy 用乾淨帳號；衝突見 branches"}
+    branches:
+      - when: 招募人數已滿（工作已 STOP_RECRUIT）
+        expect_fail: {code: 20306}                  # ACCEPT_AUDIT_RECRUIT_MAX
+        arrange: {note: "recruit_count=1，先錄取一位額滿，再錄取第二位"}
+      - when: 招募時間已結束
+        expect_fail: {code: 20307}                  # ACCEPT_AUDIT_RECRUIT_TIME_EXPIRED
+        arrange: {db_exec: "UPDATE s_jobs SET recruit_deadline=UNIX_TIMESTAMP()-1 WHERE job_sn='{{state.job_sn}}'"}
+      - when: 該夥伴已取消申請
+        expect_fail: {code: 20309}                  # ACCEPT_AUDIT_STATUS_LABOR_CANCEL
+        arrange: {by: [J2_labor_apply, J2b_labor_cancel_apply]}
+      - when: 該夥伴已被錄取（重複錄取）
+        expect_fail: {code: 20310}                  # ACCEPT_AUDIT_STATUS_EMPLOYER_ACCEPT
+        arrange: {by: [J2_labor_apply, J3_employer_accept]}
+      - when: 該夥伴已被婉拒
+        expect_fail: {code: 20311}                  # ACCEPT_AUDIT_STATUS_EMPLOYER_DECLINE
+        arrange: {by: [J2_labor_apply, J3b_employer_decline]}
+      - when: 被錄取夥伴當日在該店已有工作
+        expect_fail: {code: 30213}                  # LABOR_HAS_JOB_ON_THE_SAME_DAY_AT_THE_SHOP
+        arrange: {note: "同店同日先讓該夥伴錄取另一份"}
+      - when: 工作已取消
+        expect_fail: {code: 10201}                  # CANCELLED_JOB_STATUS
+        arrange: {note: "工作被取消後再錄取"}
     side_effects:
       - table: s_labor_jobs
         key: "job_id=(SELECT id FROM s_jobs WHERE job_sn='{{state.job_sn}}') AND labor_id={{labor.user_id}}"
@@ -422,7 +532,16 @@ task_units:
     event: ""
     request: {job_sn: "{{state.job_sn}}", labor_id: "{{labor.user_id}}"}
     push: {to: labor, type: EMPLOYER_DECLINE_APPLY}
-    preconditions: [打工夥伴已申請（J2，status=4）或備取（16）]
+    guards:
+      - need: 夥伴已申請（J2，status=4）或備取（16）
+        satisfy: {by: J2_labor_apply}
+    branches:
+      - when: 該夥伴已被婉拒（重複婉拒）
+        expect_fail: {code: 20311}                  # ACCEPT_AUDIT_STATUS_EMPLOYER_DECLINE
+        arrange: {by: [J2_labor_apply, J3b_employer_decline]}
+      - when: 該夥伴已取消申請
+        expect_fail: {code: 20309}                  # ACCEPT_AUDIT_STATUS_LABOR_CANCEL
+        arrange: {by: [J2_labor_apply, J2b_labor_cancel_apply]}
     side_effects:
       - table: s_labor_match_jobs
         key: "job_id=(SELECT id FROM s_jobs WHERE job_sn='{{state.job_sn}}') AND labor_id={{labor.user_id}}"
@@ -438,7 +557,13 @@ task_units:
     event: ""
     request: {job_sn: "{{state.job_sn}}", labor_id: "{{labor.user_id}}", canceled_reason_id: 1}
     push: {to: labor, type: EMPLOYER_CANCEL_HIRE_APPLY}
-    preconditions: [已錄取（J3，s_labor_jobs.status=1）]
+    guards:
+      - need: 夥伴已被錄取（J3，s_labor_jobs.status=1 上工）
+        satisfy: {by: J3_employer_accept}
+    branches:
+      - when: 未錄取就取消錄取（夥伴僅申請中，無 s_labor_jobs）
+        expect_fail: {message_contains: "尚未"}
+        arrange: {by: [J2_labor_apply], note: "跳過 J3，直接取消錄取"}
     side_effects:
       - table: s_labor_match_jobs
         key: "job_id=(SELECT id FROM s_jobs WHERE job_sn='{{state.job_sn}}') AND labor_id={{labor.user_id}}"
@@ -457,10 +582,17 @@ task_units:
     event: ""
     request: {job_sn: "{{state.job_sn}}", code: "{{state.start_code}}"}
     push: {to: employer, type: LABOR_CLOCK_IN}
-    preconditions:
-      - 已錄取（J3，s_labor_jobs.job_status=1 待上工、actual_clock_in_at 空）
-      - "打卡碼 code 須等於 s_labor_jobs.start_code（測試用 db_exec 塞碼）"
-      - "現在須在 end_at-24h 之後（測試用 db_exec 把 end_at 拉近）"
+    guards:
+      - need: 已錄取且待上工（J3，job_status=1、actual_clock_in_at 空）
+        satisfy: {by: J3_employer_accept}
+      - need: 已知正確上班打卡碼 start_code
+        satisfy: {db_exec: "UPDATE s_labor_jobs SET start_code='{{state.start_code}}' WHERE job_id=(SELECT id FROM s_jobs WHERE job_sn='{{state.job_sn}}') AND labor_id={{labor.user_id}}"}
+      - need: 現在已進入可打卡時間（end_at-24h 之後）
+        satisfy: {db_exec: "UPDATE s_jobs SET start_at=UNIX_TIMESTAMP(), end_at=UNIX_TIMESTAMP()+7200 WHERE job_sn='{{state.job_sn}}'"}
+    branches:
+      - when: 打卡碼錯誤
+        expect_fail: {message_contains: "打卡碼"}
+        arrange: {note: "request.code 給錯誤碼"}
     side_effects:
       - table: s_labor_jobs
         key: "job_id=(SELECT id FROM s_jobs WHERE job_sn='{{state.job_sn}}') AND labor_id={{labor.user_id}}"
@@ -476,9 +608,15 @@ task_units:
     event: ""
     request: {job_sn: "{{state.job_sn}}", code: "{{state.end_code}}"}
     push: {to: employer, type: LABOR_CLOCK_OUT}
-    preconditions:
-      - 已上班打卡（J5，job_status=2、actual_clock_out_at 空）
-      - "打卡碼 code 須等於 s_labor_jobs.end_code"
+    guards:
+      - need: 已上班打卡（J5，job_status=2、actual_clock_out_at 空）
+        satisfy: {by: J5_labor_clock_in}
+      - need: 已知正確下班打卡碼 end_code
+        satisfy: {db_exec: "UPDATE s_labor_jobs SET end_code='{{state.end_code}}' WHERE job_id=(SELECT id FROM s_jobs WHERE job_sn='{{state.job_sn}}') AND labor_id={{labor.user_id}}"}
+    branches:
+      - when: 打卡碼錯誤
+        expect_fail: {message_contains: "打卡碼"}
+        arrange: {note: "request.code 給錯誤碼"}
     side_effects:
       - table: s_labor_jobs
         key: "job_id=(SELECT id FROM s_jobs WHERE job_sn='{{state.job_sn}}') AND labor_id={{labor.user_id}}"
@@ -494,9 +632,15 @@ task_units:
     event: ""
     request: {job_sn: "{{state.job_sn}}", canceled_reason_id: 1}
     push: {to: employer, type: LABOR_JOB_CANCELED}
-    preconditions:
-      - 已錄取（J3，s_labor_jobs.status=1 上工）
-      - "現在須早於 s_jobs.start_at（工作開始前才可取消）"
+    guards:
+      - need: 已錄取（J3，s_labor_jobs.status=1 上工）
+        satisfy: {by: J3_employer_accept}
+      - need: 現在早於 s_jobs.start_at（工作開始前才可取消）
+        satisfy: {note: "happy 用發佈時的未來時段；start_at 未到"}
+    branches:
+      - when: 工作已開始後才取消
+        expect_fail: {message_contains: "已開始"}
+        arrange: {db_exec: "UPDATE s_jobs SET start_at=UNIX_TIMESTAMP()-3600 WHERE job_sn='{{state.job_sn}}'"}
     side_effects:
       - table: s_labor_jobs
         key: "job_id=(SELECT id FROM s_jobs WHERE job_sn='{{state.job_sn}}') AND labor_id={{labor.user_id}}"

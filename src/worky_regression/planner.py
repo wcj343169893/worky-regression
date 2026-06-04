@@ -62,7 +62,9 @@ def _render_menu() -> str:
         push = u.get("push") or {}
         push_s = f"｜推播→{push['to']}({push['type']})" if push else ""
         saves = f"｜save {u['saves']}" if u.get("saves") else ""
-        pre = u.get("preconditions") or []
+        # 前置顯示：優先用結構化 guards 的 need 描述，無則退回舊的 preconditions 字串列。
+        guards = u.get("guards") or []
+        pre = [g["need"] for g in guards if g.get("need")] or (u.get("preconditions") or [])
         pre_s = f"｜前置：{'；'.join(pre)}" if pre else ""
         lines.append(f"- {name} [{u['system']}/{u['actor']}] {u['summary']}{push_s}{saves}{pre_s}")
     return "\n".join(lines)
