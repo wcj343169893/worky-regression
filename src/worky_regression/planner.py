@@ -143,12 +143,29 @@ def _validate_plan(data: dict[str, Any]) -> None:
             raise RuntimeError(f"steps[{i}] kind 必須是 transition/db_exec，得到 {kind!r}")
 
 
-def decompose(use_case: str, settings: Settings | None = None) -> TaskPlan:
+# planner 目前實際支援分解的 system（其餘領域先標「規劃中」，由前端友善降級）
+SUPPORTED_SYSTEMS = ("contract", "job")
+
+
+def decompose(use_case: str, settings: Settings | None = None,
+              system: str | None = None) -> TaskPlan:
     """呼叫 DeepSeek（OpenAI 相容介面）把 use_case 分解成 lean plan。需要 DEEPSEEK_API_KEY。
 
     用 JSON 輸出模式（response_format=json_object）並自行驗證；DeepSeek 對重複的
     system prompt 前綴有自動 context caching，菜單會被快取，不需手動 cache_control。
+
+    ``system`` 為呼叫端（前端 tab）指定的目標系統：
+      - 給定 ``job`` / ``contract`` 時，會在 user message 明確要求 LLM 輸出該 system，
+        並在拿到 plan 後以「呼叫端指定」為準覆蓋 ``data["system"]`` 再驗證。
+      - 給定 planner 尚未支援的 system（如 ``labor`` / ``employer``）時直接拋錯，
+        讓前端做友善降級提示，不會送進 LLM。
+      - ``None`` / 空字串時維持原行為（讓 LLM 自己判斷 system）。
     """
+    # 呼叫端指定了目標 system：先做支援度檢查（不支援者直接擋下，不浪費 API 呼叫）
+    sysname = (system or "").strip()
+    if sysname and sysname not in SUPPORTED_SYSTEMS:
+        raise RuntimeError(f"{sysname} 領域的 AI 分解尚未支援（規劃中）")
+
     s = settings or Settings.from_env()
     if not s.deepseek_api_key:
         raise RuntimeError(
@@ -160,12 +177,17 @@ def decompose(use_case: str, settings: Settings | None = None) -> TaskPlan:
     except ModuleNotFoundError as e:
         raise RuntimeError("未安裝 openai SDK，請 `pip install -e .[ai]`") from e
 
+    # 指定 system 時在 user message 明確要求 LLM 輸出該 system
+    user_msg = f"用例：{use_case}\n\n只輸出符合上述格式的 JSON。"
+    if sysname:
+        user_msg = f"用例：{use_case}\n\n目標 system 必須為 {sysname}。\n只輸出符合上述格式的 JSON。"
+
     client = OpenAI(api_key=s.deepseek_api_key, base_url=s.deepseek_base_url)
     resp = client.chat.completions.create(
         model=s.deepseek_model,
         messages=[
             {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": f"用例：{use_case}\n\n只輸出符合上述格式的 JSON。"},
+            {"role": "user", "content": user_msg},
         ],
         response_format={"type": "json_object"},
         temperature=0,
@@ -176,6 +198,9 @@ def decompose(use_case: str, settings: Settings | None = None) -> TaskPlan:
         data = json.loads(text)
     except json.JSONDecodeError as e:
         raise RuntimeError(f"分解器回傳非合法 JSON：{e}\n原文：{text[:500]}") from e
+    # 呼叫端指定了 system → 以指定為準覆蓋 LLM 回傳，再做驗證
+    if sysname:
+        data["system"] = sysname
     _validate_plan(data)
     return TaskPlan(path_id=data["path_id"], description=data["description"],
                     system=data["system"], steps=data["steps"], raw=data)

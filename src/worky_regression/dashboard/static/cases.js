@@ -9,6 +9,27 @@ export const CASES = {
     ph: "例：商家發工作，夥伴申請後商家取消錄取" },
 };
 
+// AI 分解領域 tab（可擴充）：
+//   key      —— tab 識別碼（all 代表「全部」，不帶 system 篩選）
+//   label    —— 顯示名稱
+//   system   —— 對應的目標 system（all 為 ""，即全部 / 不指定）
+//   ph       —— 切到此 tab 時 textarea 的 placeholder（領域提示語）
+//   planned  —— true 表示 planner 尚未支援（標「規劃中」，分解失敗時友善降級）
+const DECOMPOSE_TABS = [
+  { key: "all", label: "全部", system: "",
+    ph: "例：商家發工作，夥伴申請後商家取消錄取" },
+  { key: "job", label: "工作", system: "job",
+    ph: "工作流程，例：商家發工作，夥伴申請後商家錄取再打卡" },
+  { key: "contract", label: "任務", system: "contract",
+    ph: "承攬任務流程，例：發案方發布任務，夥伴接案後完成驗收" },
+  { key: "labor", label: "打工夥伴", system: "labor", planned: true,
+    ph: "打工夥伴帳號生命週期（註冊 / 審核…）— 規劃中，暫不支援分解" },
+  { key: "employer", label: "商家", system: "employer", planned: true,
+    ph: "商家建立店鋪 / 審核等流程 — 規劃中，暫不支援分解" },
+];
+
+const tabByKey = (key) => DECOMPOSE_TABS.find((t) => t.key === key) || DECOMPOSE_TABS[0];
+
 const stepMark = { passed: "✓", failed: "✗", skipped: "·" };
 
 function runResultHtml(res) {
@@ -43,8 +64,13 @@ function caseDetailHtml(d) {
 
 export async function renderCases(key) {
   const cfg = CASES[key];
-  // system 為頁內狀態（"" = 全部），不再寫死於路由；後續 Issue #3 由 tab 控制
-  const s = state[key] || (state[key] = { q: "", page: 0, system: "" });
+  // system 為頁內狀態（"" = 全部），由 AI 分解 tab 控制；tab 記住當前選中的領域 key
+  const s = state[key] || (state[key] = { q: "", page: 0, system: "", tab: "all" });
+  if (s.tab == null) s.tab = "all";
+  const cur = tabByKey(s.tab);
+  const tabsHtml = DECOMPOSE_TABS.map((t) =>
+    `<button class="dc-tab${t.key === cur.key ? " active" : ""}" data-tab="${esc(t.key)}">${esc(t.label)}${t.planned ? `<span class="dc-soon">規劃中</span>` : ""}</button>`
+  ).join("");
   $("view").innerHTML = `
     <div class="cases-page">
       <div class="view-head"><h2>${esc(cfg.title)}</h2>
@@ -52,8 +78,9 @@ export async function renderCases(key) {
       <div class="card ai-panel">
         <div class="panel-head"><h3>AI 用例分解</h3>
           <span class="sub2">自然語言用例 → DeepSeek 分解成任務流（存入 generated/）</span></div>
+        <div class="dc-tabs">${tabsHtml}</div>
         <div class="ai-form">
-          <textarea id="uc" rows="2" placeholder="${esc(cfg.ph)}"></textarea>
+          <textarea id="uc" rows="2" placeholder="${esc(cur.ph)}"></textarea>
           <label class="ck"><input type="checkbox" id="uc-run" /> 分解後立即執行</label>
           <button class="btn primary" id="uc-go">分解</button>
         </div>
@@ -76,6 +103,17 @@ export async function renderCases(key) {
     </div>`;
   let t; $("q").oninput = (e) => { clearTimeout(t); s.q = e.target.value; t = setTimeout(() => { s.page = 0; loadCases(key); }, 300); };
   $("uc-go").onclick = () => doDecompose(key);
+  // 切 tab：①切換目標 system + placeholder ②回首頁重載清單 ③更新 active 樣式
+  $("view").querySelectorAll(".dc-tab").forEach((b) => b.onclick = () => {
+    const t2 = tabByKey(b.dataset.tab);
+    s.tab = t2.key;
+    s.system = t2.system;            // all → ""，loadCases 空 system 即不帶篩選
+    s.page = 0;
+    const ucEl = $("uc"); if (ucEl) ucEl.placeholder = t2.ph;
+    $("view").querySelectorAll(".dc-tab").forEach((x) =>
+      x.classList.toggle("active", x.dataset.tab === t2.key));
+    loadCases(key);
+  });
   loadCases(key);
 }
 
@@ -217,10 +255,14 @@ async function openStepModal(cid, idx) {
 async function doDecompose(key) {
   const uc = $("uc").value.trim();
   if (!uc) { toast("請先輸入用例"); return; }
+  const s = state[key] || {}, cur = tabByKey(s.tab);
+  // 規劃中領域（labor/employer）：前端先攔，給明確提示，不送後端
+  if (cur.planned) { toast(`${cur.label}領域分解規劃中，暫不支援`); return; }
   const run = $("uc-run").checked, btn = $("uc-go"), old = btn.textContent;
   btn.disabled = true; btn.textContent = run ? "分解 + 執行中…" : "分解中…";
   try {
-    const d = await apiPost("/api/cases/decompose", { use_case: uc, run });
+    // 帶上當前 tab 的 system（all 為 ""，後端視為不指定）
+    const d = await apiPost("/api/cases/decompose", { use_case: uc, run, system: cur.system });
     const plan = d.plan || {};
     const steps = (plan.steps || []).map((st, i) => {
       const lbl = st.kind === "db_exec" ? "db_exec" : esc(st.transition || "?");

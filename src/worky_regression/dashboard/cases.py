@@ -235,11 +235,13 @@ class CaseStore:
             n += 1
         return f"{base}-{n}"
 
-    def decompose(self, use_case: str, run: bool = False) -> dict:
+    def decompose(self, use_case: str, run: bool = False,
+                  system: str | None = None) -> dict:
         from ..planner import build_path
         from ..planner import decompose as _decompose
 
-        plan = _decompose(use_case, self.settings)
+        # system 為前端 tab 指定的目標系統（job/contract）；透傳給 planner
+        plan = _decompose(use_case, self.settings, system=system)
         spec = build_path(plan)
         spec["id"] = self._unique_case_id(str(spec.get("id") or "ai-case"))  # 防覆蓋
         GENERATED_DIR.mkdir(parents=True, exist_ok=True)

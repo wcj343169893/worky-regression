@@ -100,6 +100,18 @@ textarea:focus{outline:none;border-color:var(--accent)}
 .cases-page .ai-panel{flex:none;margin-bottom:0}
 .cases-list{flex:1;min-height:0;display:flex;flex-direction:column}
 .cases-list .table-wrap{max-height:none;flex:1}
+/* AI 分解領域 tab 列：沿用 .nav button / .pill 視覺語彙，active 態用 accent 漸層 */
+.dc-tabs{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:12px}
+.dc-tab{appearance:none;cursor:pointer;display:inline-flex;align-items:center;gap:6px;
+  border:1px solid var(--line);background:var(--panel2);color:var(--muted);
+  padding:5px 12px;border-radius:8px;font-size:13px;font-weight:600}
+.dc-tab:hover{color:var(--txt);border-color:var(--accent)}
+.dc-tab.active{color:#fff;border-color:transparent;
+  background:linear-gradient(135deg,var(--accent),var(--accent2))}
+/* 規劃中徽章：附在 tab 文字後，弱化呈現 */
+.dc-soon{font-size:10px;font-weight:600;padding:1px 5px;border-radius:5px;
+  background:var(--panel);border:1px solid var(--line);color:var(--muted)}
+.dc-tab.active .dc-soon{color:#fff;border-color:rgba(255,255,255,.45);background:transparent}
 .ai-form{display:flex;align-items:center;gap:12px;flex-wrap:wrap}
 .ai-form textarea{flex:1;min-width:280px}
 .ck{display:flex;align-items:center;gap:6px;color:var(--muted);font-size:13px;white-space:nowrap;cursor:pointer}

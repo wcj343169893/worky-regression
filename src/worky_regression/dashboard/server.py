@@ -176,7 +176,10 @@ class Handler(BaseHTTPRequestHandler):
                 if not uc:
                     self._send_json({"error": "缺少 use_case"}, 400)
                 else:
-                    self._send_json(_cases().decompose(uc, run=bool((body or {}).get("run"))))
+                    # system 為前端 tab 指定的目標系統（可選；空 = 讓 LLM 自己判斷）
+                    sysname = str((body or {}).get("system", "")).strip() or None
+                    self._send_json(_cases().decompose(
+                        uc, run=bool((body or {}).get("run")), system=sysname))
             else:
                 self._send_json({"error": "not found"}, 404)
         except BrokenPipeError:
