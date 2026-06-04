@@ -36,13 +36,38 @@ Worky 承攬制審批流回歸測試框架（Python + pytest）。
 | `src/worky_regression/transitions.py` | `Transition` dataclass（資料已移至 endpoints.yaml；`push_type_ids.py`/`job_*` 皆為相容 shim） |
 | `src/worky_regression/verifier.py` | `DBVerifier`：watermark、`assert_push`、`execute`、`flush_memcached` |
 | `src/worky_regression/runner.py` | `PathRunner` — 讀 path，展開 `{{state.xxx}}` / `{{publisher.user_id}}` |
-| `src/worky_regression/recorder.py` | `RecordingRunner` — 逐步記錄結果 → `results/*.json`（失敗不中斷記錄） |
+| `src/worky_regression/recorder.py` | `RecordingRunner` — 逐步記錄結果 → 寫入 `worky_qa_dashboard`（失敗不中斷記錄；缺 `id` 直接 raise；每跑產唯一 `run_id`） |
+| `src/worky_regression/qa_models.py` | QA 看板 **schema 單一真實來源**：SQLAlchemy 模型 `QACase/QARun/QARunStep` + `db_url`/`get_engine`/`bootstrap_database`/`migrate()` |
+| `src/worky_regression/qa_store.py` | `QAStore` — 用例註冊 + 執行結果讀寫（SQLAlchemy engine + 顯式 SQL；讀取回傳「前端既有形狀 + `run_id`」） |
+| `src/worky_regression/qa_backfill.py` | 一次性匯入舊 `results/*.json` → DB（`python -m worky_regression.qa_backfill`） |
 | `src/worky_regression/planner.py` | DeepSeek（OpenAI 相容）用例分解器（lean plan；expect 由 spec 自動推導，不靠 LLM 寫 SQL） |
 | `src/worky_regression/autotest.py` | CLI：用例 → 任務流 → 執行 → 記錄（`python -m worky_regression.autotest "<用例>"`） |
 | `conftest.py` | session fixtures：`settings/db/publisher/receiver/employer/labor`；publisher 自動寫發票 |
 | `cases/path-*.yaml` / `cases/job-*.yaml` | 一個檔 = 一條 path（承攬制 / 工作系統） |
 | `cases/_fixtures/test_accounts.yaml` | audit 帳號 |
-| `src/worky_regression/dashboard/` | PC 任務看板（純檢視 Web，stdlib HTTP）：`status.py` 進度碼移植 / `service.py` DB 查詢 / `server.py` 路由 / `static/` SPA。啟動：`python -m worky_regression.dashboard` |
+| `src/worky_regression/dashboard/` | PC 任務看板（純檢視 Web，stdlib HTTP）：`status.py` 進度碼移植 / `service.py` DB 查詢 / `server.py` 路由 / `cases.py` 測試用例（讀 YAML 定義 + 從 `worky_qa_dashboard` 讀執行結果） / `static/` SPA。啟動：`python -m worky_regression.dashboard`（預設 `0.0.0.0:8765`） |
+
+## QA 持久化（worky_qa_dashboard）
+
+執行結果**只寫 DB**（不再產 `results/*.json`；舊檔留磁碟、已由 backfill 匯入）。dashboard
+用例清單 / 詳情 / 步驟詳情全部從這個庫讀。
+
+- **資料庫**：`worky_qa_dashboard`（與 worky 庫同 server，共用 host/port/user/pass；由
+  `.env` 的 `WORKY_QA_DB_NAME` 指定，預設 `worky_qa_dashboard`）。
+- **三張表**：`qa_cases`（用例註冊，PK=用例 id）/ `qa_runs`（每次執行，PK=`run_id`）/
+  `qa_run_steps`（每步：kind/status/elapsed_ms/error/observations(JSON)）。
+- **id 規則**（排查的關鍵）：
+  - **用例 id**：YAML 的 `id:`；缺則用檔名 stem（`recorder` 缺 id 直接 raise，**不再 unnamed**）。
+    AI 分解撞號自動加 `-2/-3`。
+  - **run_id**：`{case_id}-{started_at}-{hex}`（同秒多跑不撞；同 run_id 重入會覆蓋＝冪等）。
+- **schema 管理＝SQLAlchemy 模型 + Alembic**：
+  - schema 真實來源是 `qa_models.py` 的模型，**不要手寫 DDL**。
+  - 改表流程：改模型 → `alembic revision --autogenerate -m "..."` → `alembic upgrade head`。
+  - dashboard / autotest / backfill 啟動時都會自動 `migrate()`（建庫 + `upgrade head`），平常免手動。
+- **匯入舊資料**：`python -m worky_regression.qa_backfill`。
+
+> 注意：`system` 是 MySQL 8.0 保留字，`qa_store` 的 raw SQL 對該欄一律加反引號 `` `system` ``。
+> 後台用 `nohup` 起時請加 `python -u`（否則 banner/log 會被緩衝看不到）。
 
 ## 開發/驗證流程
 
