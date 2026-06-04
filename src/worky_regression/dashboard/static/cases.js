@@ -63,7 +63,7 @@ export async function renderCases(key) {
         <div class="panel-head"><h3>用例清單</h3>
           <input type="search" id="q" placeholder="搜尋 名稱 / 描述…" value="${esc(s.q)}" /></div>
         <div class="table-wrap"><table>
-          <thead><tr><th>用例</th><th>來源</th><th>建立時間</th><th class="num">步驟</th><th>任務流</th><th>最近結果</th><th class="act">操作</th></tr></thead>
+          <thead><tr><th>用例 ID / 描述</th><th>來源</th><th>建立時間</th><th class="num">步驟</th><th>任務流</th><th>最近結果</th><th class="act">操作</th></tr></thead>
           <tbody id="rows"></tbody>
         </table></div>
         <div class="pager">
@@ -111,7 +111,7 @@ function renderCaseRows(key, items) {
     const lrHtml = lr ? `${resBadge(lr.status)} <span class="sub2">${lr.passed}/${lr.total} · ${fmtTs(lr.started_at)}</span>`
       : `<span class="sub2">—</span>`;
     return `<tr>
-      <td><div class="strong">${esc(c.id)}</div><div class="sub2">${esc((c.description || "").slice(0, 50))}</div></td>
+      <td><div class="cid">${c.seq != null ? `<span class="seq">#${c.seq}</span>` : ""}<code>${esc(c.id)}</code></div><div class="sub2">${esc((c.description || "").slice(0, 50))}</div></td>
       <td><span class="pill">${c.source === "generated" ? "AI 產生" : "內建"}</span></td>
       <td><span class="sub2">${fmtTs(c.created_at)}</span></td>
       <td class="num">${c.step_count}</td>

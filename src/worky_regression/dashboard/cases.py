@@ -110,8 +110,9 @@ class CaseStore:
         items.sort(key=lambda x: x["created_at"], reverse=True)
         total = len(items)
         page = items[offset:offset + limit] if limit else items
-        # 每頁項目的執行彙總從 DB 取（只查當頁，避免大量查詢）
+        # 每頁項目的序號與執行彙總從 DB 取（只查當頁，避免大量查詢）
         for it in page:
+            it["seq"] = self.qa.case_seq(it["id"])
             it["last_result"] = self.qa.latest_summary(it["id"])
             it["run_count"] = self.qa.run_count(it["id"])
         return {"items": page, "total": total}
