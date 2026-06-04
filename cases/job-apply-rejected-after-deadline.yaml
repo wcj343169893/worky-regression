@@ -1,0 +1,34 @@
+id: job-apply-rejected-after-deadline
+description: >
+  負向(L1)：招募截止後，打工夥伴申請上工應被拒。對應 J2_labor_apply 的 branch
+  「已過招募截止」。示範 branch → 可跑負向子用例（expect.success=false + message_contains）。
+vars:
+  job_recruit_count: 1
+
+path:
+# Phase 0：發佈工作（媒合中）
+- transition: J1_employer_publish_job
+  save:
+    job_sn: job_sn_list.0
+  expect:
+    http: 200
+    state:
+      sql: "SELECT status FROM s_jobs WHERE job_sn='{{state.job_sn}}'"
+      equals:
+        status: 1
+
+# guard(no_time_conflict) setup：清夥伴殘留的上工工作，確保失敗來自「截止」而非時段衝突
+- db_exec: >
+    UPDATE s_labor_jobs SET status = 8
+    WHERE labor_id = {{labor1.user_id}} AND status = 1 AND end_at > UNIX_TIMESTAMP()
+  expect_min_affected: 0
+
+# arrange(branch)：把招募截止時間拉到過去
+- db_exec: "UPDATE s_jobs SET recruit_deadline = UNIX_TIMESTAMP() - 1 WHERE job_sn='{{state.job_sn}}'"
+
+# 斷言：申請被後端拒絕（招募已截止）
+- transition: J2_labor_apply
+  bind: {labor: labor1}
+  expect:
+    success: false
+    message_contains: "招募已截止"

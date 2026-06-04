@@ -220,16 +220,46 @@ class PathRunner:
                 f"body={resp.text[:500]}"
             )
 
-        # 業務層成功檢查：worky 統一回 {success, code, data}；success=false 必失敗
+        # 業務層檢查：worky 統一回 {success, code, data}。
         payload: dict = {}
         if resp.headers.get("content-type", "").startswith("application/json"):
             payload = resp.json()
-            if payload.get("success") is False:
+        success = payload.get("success")
+        expect = step.get("expect", {})
+
+        # 負向斷言：expect.success=false 表示「預期 API 拒絕」（branches 用）。
+        # 此時 success=true 反而是失敗；並可比對 code / message_contains。拒絕了就無副作用，提早返回。
+        if expect.get("success") is False:
+            if success is not False:
                 raise AssertionError(
-                    f"[{transition.name}] API success=false: "
-                    f"code={payload.get('code')} message={payload.get('message')!r} "
-                    f"data={payload.get('data')}"
+                    f"[{transition.name}] 預期 API 拒絕(success=false)，實得 success={success!r}"
+                    f" code={payload.get('code')} data={payload.get('data')}"
                 )
+            exp_code = expect.get("code")
+            if exp_code is not None and payload.get("code") != exp_code:
+                raise AssertionError(
+                    f"[{transition.name}] 預期錯誤碼 {exp_code}，實得 {payload.get('code')}"
+                    f" message={payload.get('message')!r}"
+                )
+            sub = state.resolve(expect["message_contains"]) if expect.get("message_contains") else None
+            if sub and sub not in (payload.get("message") or ""):
+                raise AssertionError(
+                    f"[{transition.name}] 預期訊息含 {sub!r}，實得 {payload.get('message')!r}"
+                )
+            return {
+                "transition": transition.name, "endpoint": transition.endpoint,
+                "http": resp.status_code, "code": payload.get("code"),
+                "message": payload.get("message"), "saved": {},
+                "checks": [{"kind": "expect_fail", "code": payload.get("code")}],
+            }
+
+        # 正向：success=false 必失敗
+        if success is False:
+            raise AssertionError(
+                f"[{transition.name}] API success=false: "
+                f"code={payload.get('code')} message={payload.get('message')!r} "
+                f"data={payload.get('data')}"
+            )
 
         data = payload.get("data") if isinstance(payload.get("data"), dict) else payload
 
