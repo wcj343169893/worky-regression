@@ -76,16 +76,22 @@ pytest tests/test_paths.py -v
 
 ### 環境已切到 next-v31x（工作系統）
 
-`.env` 的 `WORKY_DB_NAME` 目前指向 **`worky_next_v31x`**（工作系統 job 流程在此庫驗證）；
-本檔上方歷史描述的 `worky_next_v30x` 是承攬制流程的舊庫。兩套流程角色不同
-（contract 雙方皆 Labor；job = employer user_type=1 + labor user_type=2）。
+**dev 環境 contract 與 job 分屬不同 DB**（已用 regression 實測確認）：
+- **job** 流程在 `WORKY_DB_NAME = worky_next_v31x`（22k+ `s_jobs`）。
+- **contract** 流程：dev API 實際把 `s_contract_tasks` 等寫到 **`worky_next_staging_v30x`**
+  （v31x 的 `s_contract_tasks` 是 0 筆）。框架用 `WORKY_CONTRACT_DB_NAME` 指定，
+  `Settings.for_system("contract")` 自動切庫；run 管線（autotest / dashboard CaseStore）
+  依 path 系統選 DB。**改庫只動 `.env`，別寫死。**
 
-### 承攬制發任務需「24 小時後」開始（dev 已漂移）
+兩套流程角色不同（contract 雙方皆 Labor；job = employer user_type=1 + labor user_type=2）。
 
-T1 contract publish 現在回 `20006 只能發佈距離現在 24 小時以後開始的工作`，
-但 `runner.init_state` 注入的 `start_time = now + 900`（15 分）已過時。
-**現象**：`cases/path-*.yaml` 在 T1 即失敗。修法：把 runner 的 contract `start_time`
-拉到 `now + 86400 + buffer`（或在 path 用 db_exec 直接寫 `start_time`）。
+### 承攬制發任務需「24 小時後」開始（已修）
+
+T1 contract publish 規則（`TaskPublishForm`）：`start_time >= now + 86400`（MIN_PUBLISH_INTERVAL）
+且 `start_time - 86400 >= now`（招募截止）、`3600 <= end-start <= 30d`、`<= now+90d`。
+**已修**：`runner.init_state` 改注入 `start_time = now + 90000`（≈25h，含 1h buffer 防時鐘飄移）。
+但 T6/T7 要求 `start_at <= now`、`end_at > now`，故發佈後須用 db_exec 把 `start_at/end_at`
+拉回當下（見 `cases/path-contract-happy-green.yaml` 的橋接步驟）。
 
 ### v31x 後端 J2 labor-apply 壞了（回歸框架已抓到）
 
@@ -110,22 +116,40 @@ J1 發佈正常但 J2 申請就炸。**這是被測對象的 regression，不要
 `flush_all` 不會清 PHP `static`，反而可能讓 worker 進入「task 不存在」的錯誤狀態。
 runner 預設只在 `db_exec` step（顯式宣告 `flush_cache: true`）才 flush。
 
-### ATM 付款
+### 付款方式：改用 ATM（v31x 已無 FunPoint 綁卡）
 
-`payment_method_id=3` 會在 T6 卡住等付款。框架統一改用 `payment_method_id=1`（FunPoint
-信用卡，publisher 236 已預先綁定），但 dev 環境不會真扣款，path 中要靠 `db_exec`：
+`s_contract_pay_fun_point_credit_cards` 在 v31x 庫**整張空**（舊 v30x 的 publisher 236
+綁卡已不存在），用 `payment_method_id=1`（信用卡）發佈會被擋 `20023 需先設定信用卡`。
+`TaskPublishForm` 對 ATM（`payment_method_id=3`）只查金額上限、不需綁卡，故 endpoints.yaml
+的 T1 已統一改 **`payment_method_id=3`**。ATM 原本「T6 卡住等付款」的問題，靠 happy path
+一律用 db_exec 把 `pay_status` 改 `102`（PAYMENT_SUCCESS）繞過：
 
 ```yaml
-- db_exec: "UPDATE s_contract_tasks SET pay_status=102 WHERE task_sn='{{state.task_sn}}'"
+- db_exec: >
+    UPDATE s_contract_tasks SET pay_status=102,
+      start_at=UNIX_TIMESTAMP()-60, end_at=UNIX_TIMESTAMP()+3600
+    WHERE task_sn='{{state.task_sn}}'
   flush_cache: true
 ```
 
+### 發票 preflight（50045）
+
+contract publish 要求發案者先設發票，否則 `50045 尚未設定發票資訊`。
+`autotest.ensure_publisher_invoice()` 會以 audit publisher 呼叫 `/contract/invoice/update`
+寫最小設定（捐贈發票）；`_actors_for("contract")` 與 conftest 都會跑這個 preflight。
+
+### receiver 連續操作 1s 節流（9002）
+
+`ReceiverTaskForm::validateTooFast()` 對同一 receiver 設 1s TTL 旗標，T6→T7 若 < 1s
+會回 `9002 執行操作過快`。runner 已支援 **`- sleep: <秒>`** step，happy path 在 T6/T7 間插
+`- sleep: 2`。
+
 ### 時段條件
 
-- `start_time >= now + 720s`（dev `MIN_PUBLISH_INTERVAL_SECONDS = 0.2h`）
-- `end_time - start_time >= 3600s`
-
-runner 自動設 `start = now + 900`, `end = now + 4600`，YAML 不用自己算。
+- contract：`start_time >= now + 86400s`（dev `MIN_PUBLISH_INTERVAL_SECONDS = 24h`）、
+  `end_time - start_time ∈ [3600s, 30d]`、`start_time <= now + 90d`
+- runner 自動設 contract `start = now + 90000`（≈25h）、`end = start + 3700`，YAML 不用自己算；
+  job 系統時段由 `_job_slot_vars` 算（+3~+13 天）。
 
 ## 不要做的事
 

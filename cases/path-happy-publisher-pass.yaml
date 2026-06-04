@@ -26,9 +26,22 @@ path:
     expect:
       http: 200
 
+  # 橋接：dev FunPoint 不真扣款 + T1 發佈須 24h 後開始，故標記已付款並把時段拉回當下
+  # （T6 需 pay_status=102 且 end_at>now；T7 需 start_at<=now）。詳見 path-contract-happy-green.yaml
+  - db_exec: >
+      UPDATE s_contract_tasks
+      SET pay_status=102,
+          start_at=UNIX_TIMESTAMP()-60,
+          end_at=UNIX_TIMESTAMP()+3600
+      WHERE task_sn='{{state.task_sn}}'
+    flush_cache: true
+
   - transition: T6_receiver_start_task
     expect:
       http: 200
+
+  # receiver 連續操作 1s 節流（9002），T6→T7 需間隔 > 1s
+  - sleep: 2
 
   - transition: T7_receiver_end_task
     expect:

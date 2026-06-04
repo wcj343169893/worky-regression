@@ -94,6 +94,8 @@ class PathRunner:
         for step in spec["path"]:
             if "db_exec" in step:
                 self._run_db_exec(step, state)
+            elif "sleep" in step:
+                self._run_sleep(step, state)
             else:
                 self._run_step(step, state)
 
@@ -115,9 +117,15 @@ class PathRunner:
             vars={
                 "run_id": uuid.uuid4().hex[:8],
                 # --- 承攬制任務時段 ---
-                # start_time >= now + MIN_PUBLISH_INTERVAL（dev 720s）；end-start >= 3600s
-                "start_time": now + 900,           # 15 分鐘後開始
-                "end_time": now + 900 + 3700,      # +1h1m
+                # dev 後端 TaskPublishForm 規則（next-v31x）：
+                #   start_time >= now + MIN_PUBLISH_INTERVAL_SECONDS（86400=24h）
+                #   且 start_time - RECRUIT_DEADLINE_OFFSET_SECONDS（86400）>= now
+                #   且 3600 <= end-start <= 30d、start <= now+90d
+                # 取 now + 25h（24h + 1h buffer 防 Python/PHP 間時鐘飄移與請求延遲）。
+                # 註：T6/T7「開始/結束任務」需 start_at<=now、end_at>now、pay_status=102，
+                #     故發佈後須用 db_exec 把 start_at/end_at 拉回當下（見 path 的橋接步驟）。
+                "start_time": now + 90000,         # ≈25 小時後開始（過 24h 門檻）
+                "end_time": now + 90000 + 3700,    # +1h1m（end-start 3700s）
                 # --- 工作系統發佈用 ---
                 # 每次跑用「不同的未來時段」，避免打工夥伴在同一時段重複被確認工作
                 # （30207「該時段已有確認工作」）。日期每 30 分鐘輪進、時段每分鐘輪進，
@@ -145,6 +153,13 @@ class PathRunner:
         flushed = self.db.flush_memcached() if step.get("flush_cache", True) else False
         print(f"  [db_exec] {sql[:60]}... → affected={affected} cache_flushed={flushed}")
         return {"sql": sql, "affected": affected, "cache_flushed": flushed}
+
+    def _run_sleep(self, step: dict, state: PathExecutionState) -> dict[str, Any]:
+        """暫停數秒。用於繞過後端「執行操作過快」(9002) 類的短窗節流（TTL 約 1s）。"""
+        secs = float(step.get("sleep", 0))
+        time.sleep(secs)
+        print(f"  [sleep] {secs}s")
+        return {"slept": secs}
 
     def _run_step(self, step: dict, state: PathExecutionState) -> dict[str, Any]:
         transition = get_transition(step["transition"])

@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -19,6 +19,9 @@ class Settings:
     db_user: str
     db_pass: str
     db_name: str
+    # 承攬制資料所在 DB：dev 環境 contract 與 job 分庫（job 在 db_name=worky_next_v31x，
+    # contract 由 API 寫到 worky_next_staging_v30x）。空字串→沿用 db_name。
+    contract_db_name: str
 
     platform: str
     sdk_version: str
@@ -51,6 +54,7 @@ class Settings:
             db_user=req("WORKY_DB_USER"),
             db_pass=req("WORKY_DB_PASS"),
             db_name=req("WORKY_DB_NAME"),
+            contract_db_name=os.environ.get("WORKY_CONTRACT_DB_NAME", ""),
             platform=os.environ.get("WORKY_PLATFORM", "WebPC"),
             sdk_version=os.environ.get("WORKY_SDK_VERSION", "1.0.0"),
             device_name=os.environ.get("WORKY_DEVICE_NAME", "regression-runner"),
@@ -58,3 +62,9 @@ class Settings:
             deepseek_base_url=os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com"),
             deepseek_model=os.environ.get("DEEPSEEK_MODEL", "deepseek-chat"),
         )
+
+    def for_system(self, system: str) -> "Settings":
+        """回傳該系統要連的 DB 設定：contract 走 contract_db_name（若有設），其餘沿用。"""
+        if system == "contract" and self.contract_db_name:
+            return replace(self, db_name=self.contract_db_name)
+        return self

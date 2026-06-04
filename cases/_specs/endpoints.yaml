@@ -161,7 +161,10 @@ task_units:
       end_time: "{{state.end_time}}"
       recruit_count: 1
       task_amount: 300
-      payment_method_id: 1
+      # 3=FUN_POINT_VIRTUAL_ATM。v31x DB 已無 publisher 236 的 FunPoint 綁卡
+      # （信用卡=1 會被擋 20023 需先綁卡），ATM 發佈只查金額上限不需綁卡；
+      # happy path 一律用 db_exec 把 pay_status 改 102，故 ATM 的「T6 等付款」不再卡關。
+      payment_method_id: 3
       contact_name: regression
       contact_phone: "0912345678"
       show_to_taker: 0

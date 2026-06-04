@@ -1,0 +1,68 @@
+# Path: 承攬制完整 happy path（全綠示範，可在後台「任務測試用例」點執行）
+#
+# 流程：T1 發佈 → T2 接案者申請 → T3a 發案者錄取 →〔db_exec 橋接〕→
+#       T6 開始任務 → T7 結束任務 → T8 發案者通過
+#
+# 為何要 db_exec 橋接（單一真實來源：worky next-v31x TaskPublishForm / ReceiverTaskForm）：
+#   - 發佈規則：start_time 必須 >= now+24h（runner 已注入 now+25h，故 T1 過關）。
+#   - 但「開始任務」(T6) 要求 pay_status=102（FunPoint dev 不真扣款）且 end_at>now；
+#     「結束任務」(T7) 要求 start_at<=now。發佈當下 start_at 在 25h 後，兩者衝突，
+#     因此錄取後用一個 db_exec 把 start_at 拉回 now-60、end_at 設 now+3600、pay_status=102。
+#
+# 三層驗證：HTTP 200 + 業務 success + 推播落地（push: {} 只驗 type_id 落地 s_notifications）。
+id: path-contract-happy-green
+description: "承攬制全綠 happy path：發→申→錄取→(橋接)→開始→結束→通過（含推播驗證）"
+
+path:
+  # T1 發案者發佈任務（ATM 付款，免綁卡；發票由 actor preflight 自動寫入），存 task_sn
+  - transition: T1_publisher_publish_task
+    save:
+      task_sn: task_sn
+    expect:
+      http: 200
+      state:
+        sql: "SELECT status FROM s_contract_tasks WHERE task_sn='{{state.task_sn}}'"
+        equals:
+          status: 1                       # 媒合中
+
+  # T2 接案者申請 → publisher 收 CONTRACT_RECEIVER_APPLY_TASK
+  - transition: T2_receiver_apply
+    expect:
+      http: 200
+      push: {}
+
+  # T3a 發案者錄取 → receiver 收 CONTRACT_PUBLISHER_ACCEPT_APPLY（並建立 receiver task）
+  - transition: T3a_publisher_accept_apply
+    expect:
+      http: 200
+      push: {}
+
+  # 橋接：標記已付款 + 把任務時段拉回當下（滿足 T6 end_at>now、T7 start_at<=now）
+  - db_exec: >
+      UPDATE s_contract_tasks
+      SET pay_status=102,
+          start_at=UNIX_TIMESTAMP()-60,
+          end_at=UNIX_TIMESTAMP()+3600
+      WHERE task_sn='{{state.task_sn}}'
+    flush_cache: true
+
+  # T6 接案者開始任務 → publisher 收 CONTRACT_RECEIVER_START_TASK
+  - transition: T6_receiver_start_task
+    expect:
+      http: 200
+      push: {}
+
+  # 後端對 receiver 連續操作有 1s 節流（9002 執行操作過快），T6→T7 需間隔 > 1s
+  - sleep: 2
+
+  # T7 接案者結束任務 → publisher 收 CONTRACT_RECEIVER_END_TASK
+  - transition: T7_receiver_end_task
+    expect:
+      http: 200
+      push: {}
+
+  # T8 發案者通過任務完成 → receiver 收 CONTRACT_PUBLISHER_PASS_TASK
+  - transition: T8_publisher_pass_task
+    expect:
+      http: 200
+      push: {}

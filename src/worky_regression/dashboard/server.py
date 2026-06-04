@@ -19,6 +19,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
 
 from .service import DashboardService
+from .cases import CaseStore
 from . import status as st
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
@@ -27,6 +28,11 @@ STATIC_DIR = Path(__file__).resolve().parent / "static"
 @lru_cache(maxsize=1)
 def _service() -> DashboardService:
     return DashboardService()
+
+
+@lru_cache(maxsize=1)
+def _cases() -> CaseStore:
+    return CaseStore()
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -125,6 +131,20 @@ class Handler(BaseHTTPRequestHandler):
                     limit=_int(query, "limit", 50), offset=_int(query, "offset", 0)))
             elif path == "/api/settings":
                 self._send_json(_service().settings_info())
+            # ── 測試用例 ──
+            elif path == "/api/cases":
+                self._send_json(_cases().list_cases(
+                    system=_one(query, "system", "") or None,
+                    q=_one(query, "q", ""),
+                    limit=_int(query, "limit", 20),
+                    offset=_int(query, "offset", 0)))
+            elif path.startswith("/api/cases/"):
+                cid = path[len("/api/cases/"):]
+                detail = _cases().case_detail(cid)
+                if detail is None:
+                    self._send_json({"error": f"case {cid} not found"}, 404)
+                else:
+                    self._send_json(detail)
             else:
                 self._send_json({"error": "not found"}, 404)
         except BrokenPipeError:
@@ -132,6 +152,40 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as e:  # noqa: BLE001
             traceback.print_exc()
             self._send_json({"error": str(e)}, 500)
+
+    def do_POST(self):  # noqa: N802
+        parsed = urlparse(self.path)
+        path = unquote(parsed.path)
+        try:
+            body = self._read_json()
+            if path == "/api/cases/run":
+                cid = (body or {}).get("id")
+                if not cid:
+                    self._send_json({"error": "缺少 id"}, 400)
+                else:
+                    self._send_json(_cases().run_case(cid))
+            elif path == "/api/cases/decompose":
+                uc = str((body or {}).get("use_case", "")).strip()
+                if not uc:
+                    self._send_json({"error": "缺少 use_case"}, 400)
+                else:
+                    self._send_json(_cases().decompose(uc, run=bool((body or {}).get("run"))))
+            else:
+                self._send_json({"error": "not found"}, 404)
+        except BrokenPipeError:
+            pass
+        except Exception as e:  # noqa: BLE001
+            traceback.print_exc()
+            self._send_json({"error": str(e)}, 500)
+
+    def _read_json(self) -> dict:
+        length = int(self.headers.get("Content-Length") or 0)
+        if not length:
+            return {}
+        try:
+            return json.loads(self.rfile.read(length).decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            return {}
 
 
 def _one(q: dict, key: str, default: str = "") -> str:

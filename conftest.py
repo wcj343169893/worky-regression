@@ -9,6 +9,7 @@ from worky_regression.config import Settings
 from worky_regression.client import WorkyClient
 from worky_regression.actor import Actor
 from worky_regression.verifier import DBVerifier
+from worky_regression.autotest import ensure_publisher_invoice
 
 
 PROJECT_ROOT = Path(__file__).parent
@@ -43,33 +44,8 @@ def publisher(settings: Settings, accounts: dict) -> Actor:
     actor = Actor(role="publisher", user_type=cfg["user_type"], phone=cfg["phone"],
                   user_id=cfg["id"], client=client)
     actor.login(audit_code=settings.audit_sms_code)
-    _ensure_publisher_invoice(actor)
+    ensure_publisher_invoice(actor)            # preflight：寫最小發票設定，避免 50045
     return actor
-
-
-def _ensure_publisher_invoice(actor: Actor) -> None:
-    """以 audit publisher 身份呼叫 /contract/invoice/update 寫入最小發票設定。
-
-    Idempotent：每 session 跑一次，覆寫舊值不會壞事。
-    """
-    resp = actor.client.post(
-        "/contract/invoice/update",
-        body={
-            "type": 0,                          # 捐贈發票
-            "name": "regression",
-            "phone": actor.phone,
-            "email": "regression@worky.local",
-            "e_invoice_carrier_type": 0,        # 無載具（捐贈用）
-            "mobile_carrier_number": "",
-            "citizen_carrier_number": "",
-            "tax_id_number": "",
-            "tax_id_number_title": "",
-        },
-    )
-    if resp.status_code != 200 or resp.json().get("success") is False:
-        raise RuntimeError(
-            f"failed to setup invoice for publisher id={actor.user_id}: {resp.text[:300]}"
-        )
 
 
 @pytest.fixture(scope="session")

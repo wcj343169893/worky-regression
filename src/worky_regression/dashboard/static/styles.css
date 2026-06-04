@@ -76,9 +76,51 @@ table{width:100%;border-collapse:collapse;font-size:13px}
 thead th{text-align:left;padding:11px 14px;color:var(--muted);font-weight:600;
   border-bottom:1px solid var(--line);position:sticky;top:0;background:var(--panel2);white-space:nowrap}
 tbody td{padding:11px 14px;border-bottom:1px solid rgba(38,48,77,.5);vertical-align:middle}
-tbody tr{cursor:pointer;transition:.1s}
+tbody tr{cursor:default;transition:.1s}
 tbody tr:hover{background:var(--panel2)}
-tbody tr.norow{cursor:default} tbody tr.norow:hover{background:transparent}
+tbody tr.norow:hover{background:transparent}
+tbody tr.sel{background:rgba(91,140,255,.12)}
+td.act,th.act{text-align:center;white-space:nowrap;width:1%}
+td.act{display:flex;gap:6px;justify-content:center}
+.view-btn{padding:5px 14px;font-size:13px;border-radius:8px}
+.view-btn:hover{background:var(--accent);border-color:var(--accent);color:#fff}
+.run-btn{padding:5px 14px;font-size:13px;border-radius:8px}
+.run-btn:hover{background:var(--ok);border-color:var(--ok);color:#0b1020}
+
+/* 測試用例頁 */
+.btn.primary{background:linear-gradient(135deg,var(--accent),#7c5cff);border-color:transparent;color:#fff}
+.btn.primary:hover{filter:brightness(1.08);color:#fff}
+textarea{width:100%;background:var(--panel2);border:1px solid var(--line);border-radius:10px;
+  color:var(--txt);padding:10px 12px;font-family:inherit;font-size:14px;resize:vertical}
+textarea:focus{outline:none;border-color:var(--accent)}
+.ai-panel{margin-bottom:16px}
+/* 測試用例：全屏頁（AI 面板固定高，清單填滿剩餘高度，分頁條釘在底部）*/
+.cases-page{display:flex;flex-direction:column;gap:16px;height:calc(100vh - 60px - 40px)}
+.cases-page .view-head{margin-bottom:0}
+.cases-page .ai-panel{flex:none;margin-bottom:0}
+.cases-list{flex:1;min-height:0;display:flex;flex-direction:column}
+.cases-list .table-wrap{max-height:none;flex:1}
+.ai-form{display:flex;align-items:center;gap:12px;flex-wrap:wrap}
+.ai-form textarea{flex:1;min-width:280px}
+.ck{display:flex;align-items:center;gap:6px;color:var(--muted);font-size:13px;white-space:nowrap;cursor:pointer}
+.tflow{display:flex;flex-wrap:wrap;gap:4px}
+.tchip{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:11px;padding:1px 7px;
+  border-radius:6px;background:var(--panel2);border:1px solid var(--line);color:var(--muted)}
+.cstep{display:flex;align-items:center;gap:8px;padding:5px 0;flex-wrap:wrap}
+.cstep .ci{width:20px;text-align:right;color:var(--muted);font-size:12px}
+.cstep code{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px;color:var(--muted);word-break:break-all}
+.ck-db{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px;color:#ffb454}
+.run-log{display:flex;flex-direction:column;gap:3px}
+.run-step{display:grid;grid-template-columns:18px 1fr auto;gap:8px;align-items:center;
+  padding:6px 9px;border-radius:8px;background:var(--panel2)}
+.run-step .rs-mark{font-weight:700}
+.run-step.passed .rs-mark{color:var(--ok)}
+.run-step.failed .rs-mark{color:var(--danger)}
+.run-step.skipped{opacity:.5}
+.run-step .rs-ms{color:var(--muted);font-size:12px}
+.run-step .err{grid-column:1/-1;color:var(--danger);font-size:12px;word-break:break-all}
+pre.yaml{background:var(--panel2);border:1px solid var(--line);border-radius:10px;padding:12px;
+  overflow:auto;font-size:12px;max-height:340px;color:var(--muted);white-space:pre-wrap;word-break:break-word}
 td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
 .mono{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px;color:var(--muted)}
 .strong{font-weight:700}
@@ -96,8 +138,13 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
 .b-canceled{color:var(--muted);border-color:var(--line);background:var(--panel2)}
 .b-draft{color:var(--muted);border-color:var(--line);background:var(--panel2)}
 
-.pager{display:flex;align-items:center;justify-content:flex-end;gap:12px;padding:12px 4px;color:var(--muted)}
+/* 分頁條：統一風格——卡片底部頁尾，靠右，頂部分隔線 */
+.pager{display:flex;align-items:center;justify-content:flex-end;gap:8px;
+  padding:12px 16px;color:var(--muted);border-top:1px solid var(--line)}
 .pager b{color:var(--accent);font-variant-numeric:tabular-nums}
+.pager #pginfo{margin:0 6px;font-size:13px}
+.pager .btn{padding:6px 12px;font-size:13px}
+.pager .btn:disabled{opacity:.4;cursor:not-allowed;border-color:var(--line);color:var(--muted)}
 .pill{display:inline-block;padding:2px 8px;border-radius:6px;background:var(--panel2);
   border:1px solid var(--line);font-size:12px}
 .flag-on{color:var(--danger)} .flag-off{color:var(--muted)}

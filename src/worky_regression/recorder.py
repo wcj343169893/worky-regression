@@ -82,15 +82,24 @@ class RecordingRunner:
 
         for i, step in enumerate(spec["path"]):
             is_db = "db_exec" in step
-            kind = "db_exec" if is_db else "transition"
-            name = "db_exec" if is_db else step.get("transition", "?")
+            is_sleep = "sleep" in step
+            if is_db:
+                kind = name = "db_exec"
+            elif is_sleep:
+                kind, name = "sleep", f"sleep {step['sleep']}s"
+            else:
+                kind, name = "transition", step.get("transition", "?")
             if stopped:
                 steps.append(StepResult(i, kind, name, "skipped", 0))
                 continue
             t0 = time.time()
             try:
-                obs = (self.runner._run_db_exec(step, state) if is_db
-                       else self.runner._run_step(step, state))
+                if is_db:
+                    obs = self.runner._run_db_exec(step, state)
+                elif is_sleep:
+                    obs = self.runner._run_sleep(step, state)
+                else:
+                    obs = self.runner._run_step(step, state)
                 steps.append(StepResult(i, kind, name, "passed",
                                         int((time.time() - t0) * 1000), obs or {}))
             except Exception as e:  # noqa: BLE001 — 記錄任何失敗，含 AssertionError

@@ -45,16 +45,44 @@ def _build_actor(s: Settings, accounts: dict, role: str, key: str, user_type: in
     return actor
 
 
+def ensure_publisher_invoice(actor: Actor) -> None:
+    """確保承攬制 publisher 已設定發票資訊，否則 /contract/task/publish 會 throw 50045。
+
+    以 audit publisher 身份呼叫 /contract/invoice/update 寫入最小設定（type=0 捐贈發票）。
+    Idempotent：覆寫舊值不會壞事。conftest 與 autotest/dashboard 共用此 preflight。
+    """
+    resp = actor.client.post(
+        "/contract/invoice/update",
+        body={
+            "type": 0,                          # 捐贈發票
+            "name": "regression",
+            "phone": actor.phone,
+            "email": "regression@worky.local",
+            "e_invoice_carrier_type": 0,        # 無載具（捐贈用）
+            "mobile_carrier_number": "",
+            "citizen_carrier_number": "",
+            "tax_id_number": "",
+            "tax_id_number_title": "",
+        },
+    )
+    if resp.status_code != 200 or resp.json().get("success") is False:
+        raise RuntimeError(
+            f"failed to setup invoice for publisher id={actor.user_id}: {resp.text[:300]}"
+        )
+
+
 def _actors_for(system: str, s: Settings) -> dict[str, Actor]:
-    """依系統登入對應角色。"""
+    """依系統登入對應角色（承攬制 publisher 會做發票 preflight）。"""
     accounts = yaml.safe_load(ACCOUNTS.read_text(encoding="utf-8"))
     if system == "job":
         return {
             "employer": _build_actor(s, accounts, "employer", "employer_primary", 1),
             "labor": _build_actor(s, accounts, "labor", "publisher_primary", 2),
         }
+    publisher = _build_actor(s, accounts, "publisher", "publisher_primary", 2)
+    ensure_publisher_invoice(publisher)
     return {
-        "publisher": _build_actor(s, accounts, "publisher", "publisher_primary", 2),
+        "publisher": publisher,
         "receiver": _build_actor(s, accounts, "receiver", "receiver_primary", 2),
     }
 
@@ -113,8 +141,8 @@ def main(argv: list[str] | None = None) -> int:
         print(yaml.safe_dump(spec, allow_unicode=True, sort_keys=False))
         return 0
 
-    # 3) 登入角色 + 執行 + 記錄
-    db = DBVerifier(s)
+    # 3) 登入角色 + 執行 + 記錄（contract 與 job 在 dev 分庫，依系統選 DB）
+    db = DBVerifier(s.for_system(system))
     actors = _actors_for(system, s)
     result = RecordingRunner(db).run(spec, actors=actors)
 
