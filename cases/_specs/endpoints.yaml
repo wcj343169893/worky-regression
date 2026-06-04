@@ -78,7 +78,8 @@ push_types:
     LABOR_CLOCK_IN: 10009                        # 打工夥伴上班打卡
     JOB_END: 10010                               # 工作結束
     LABOR_CLOCK_OUT: 10011                       # 打工夥伴下班打卡
-    LABOR_JOB_APPLY: 10021                       # 打工夥伴申請上工
+    LABOR_JOB_APPLY: 10021                       # 打工夥伴申請上工（舊；僅自動錄取 work_mode=AUTO_ACCEPT 走）
+    LABOR_JOB_APPLY_V2: 10025                     # 打工夥伴申請上工 V2（手動錄取走，現行路徑）
     LABOR_JOB_CANCELED_BEFORE_RECRUIT_DEADLINE: 10026  # 取消工作（招募截止前）
     # === 打工夥伴收（20xxx）===
     EMPLOYER_INVITED_TO_WORK: 20001              # 商家邀請工作
@@ -371,7 +372,7 @@ task_units:
     doc_id: 210-1
     event: common\components\Event\Events\LaborJobApplyFinishedEvent
     request: {job_sn: "{{state.job_sn}}"}
-    push: {to: employer, type: LABOR_JOB_APPLY}
+    push: {to: employer, type: LABOR_JOB_APPLY_V2}   # 手動錄取路徑送 V2(10025)；舊 10021 僅 AUTO_ACCEPT
     preconditions: [工作媒合中（J1）]
     side_effects:
       - table: s_labor_match_jobs
