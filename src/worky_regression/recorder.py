@@ -12,7 +12,6 @@
 """
 from __future__ import annotations
 
-import json
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -21,9 +20,8 @@ from typing import Any
 import yaml
 
 from .actor import Actor
+from .qa_store import QAStore, make_run_id
 from .runner import PathRunner
-
-RESULTS_DIR = Path(__file__).resolve().parents[2] / "results"
 
 
 @dataclass
@@ -45,6 +43,7 @@ class RunResult:
     status: str                     # "passed" | "failed"
     steps: list[StepResult]
     failed_at: int | None = None    # 失敗步的 index
+    run_id: str | None = None       # 每次執行唯一 id（{path_id}-{started_at}-{hex}）
 
     def to_dict(self) -> dict[str, Any]:
         d = asdict(self)
@@ -58,11 +57,12 @@ class RunResult:
 
 
 class RecordingRunner:
-    """跑一條 path 並逐步記錄結果，不在失敗時 raise。"""
+    """跑一條 path 並逐步記錄結果，不在失敗時 raise；結果落地到 worky_qa_dashboard。"""
 
-    def __init__(self, db, *, results_dir: Path | None = None):
+    def __init__(self, db, *, qa_store: QAStore | None = None, system: str = ""):
         self.runner = PathRunner(db)
-        self.results_dir = results_dir or RESULTS_DIR
+        self.qa_store = qa_store
+        self.system = system
 
     def run(self, path: str | Path | dict, *,
             publisher: Actor | None = None, receiver: Actor | None = None,
@@ -108,24 +108,35 @@ class RecordingRunner:
                                         error=f"{type(e).__name__}: {e}"))
                 status, failed_at, stopped = "failed", i, True
 
+        path_id = spec.get("id")
+        if not path_id:
+            raise ValueError("用例缺少 id：每筆用例都必須有唯一 id 才能落庫追溯（請在 YAML 補 id:）")
+        ts = started_at if started_at is not None else int(time.time())
         result = RunResult(
-            path_id=spec.get("id", "unnamed"),
+            path_id=path_id,
             description=str(spec.get("description", "")).strip(),
-            started_at=started_at if started_at is not None else int(time.time()),
+            started_at=ts,
             status=status,
             steps=steps,
             failed_at=failed_at,
+            run_id=make_run_id(path_id, ts),
         )
-        if write:
-            self._write(result)
+        if write and self.qa_store is not None:
+            self._persist(result)
         return result
 
-    def _write(self, result: RunResult) -> Path:
-        self.results_dir.mkdir(parents=True, exist_ok=True)
-        out = self.results_dir / f"{result.path_id}-{result.started_at}.json"
-        with out.open("w", encoding="utf-8") as f:
-            json.dump(result.to_dict(), f, ensure_ascii=False, indent=2)
-        return out
+    def _persist(self, result: RunResult) -> None:
+        self.qa_store.insert_run(
+            run_id=result.run_id,
+            case_id=result.path_id,
+            system=self.system,
+            status=result.status,
+            description=result.description,
+            started_at=result.started_at,
+            failed_at=result.failed_at,
+            steps=[asdict(s) for s in result.steps],
+            source="run",
+        )
 
     @staticmethod
     def _load(path: str | Path) -> dict:

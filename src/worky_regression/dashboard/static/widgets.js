@@ -78,6 +78,31 @@ export function closeDrawer() {
   $("drawer").classList.remove("open"); $("drawer-mask").classList.remove("open");
 }
 
+// ── Modal 彈窗（置中，疊在 drawer 之上；用於 chip 步驟詳情）─────────────────
+function ensureModal() {
+  let m = $("modal");
+  if (m) return m;
+  m = document.createElement("div");
+  m.id = "modal";
+  m.className = "modal-mask";
+  m.innerHTML = `<div class="modal-box" role="dialog" aria-modal="true">
+    <button class="btn ghost icon modal-close" title="關閉 (Esc)">✕</button>
+    <div class="modal-body" id="modal-body"></div></div>`;
+  document.body.appendChild(m);
+  m.addEventListener("click", (e) => { if (e.target === m) closeModal(); });
+  m.querySelector(".modal-close").onclick = closeModal;
+  return m;
+}
+export function openModal(html) {
+  const m = ensureModal();
+  $("modal-body").innerHTML = html || "";
+  m.classList.add("open");
+}
+export function closeModal() {
+  const m = $("modal");
+  if (m) m.classList.remove("open");
+}
+
 // 詳情區塊組件
 export function f(k, v) { return `<div class="f"><span class="k">${k}</span><span class="v">${v}</span></div>`; }
 export function mini(headers, rows) {

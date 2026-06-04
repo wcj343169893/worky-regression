@@ -2,7 +2,7 @@
 // 測試用例（工作 / 任務）：列用例 + 執行 + AI 用例分解。
 
 import { $, api, apiPost, esc, fmtTs, resBadge, toast, PAGE, state } from "./util.js";
-import { setupPager, openDrawer } from "./widgets.js";
+import { setupPager, openDrawer, openModal, closeModal } from "./widgets.js";
 
 export const CASES = {
   "job-cases": { title: "工作測試用例", system: "job",
@@ -38,7 +38,7 @@ function caseDetailHtml(d) {
       <p class="sub2">${esc(d.description || "")}</p></div>
     <div class="sec"><h4>任務流（${d.steps.length} 步）</h4>${stepList}</div>
     <div class="sec"><h4>最近執行結果</h4>
-      ${last ? `<div class="sub2" style="margin-bottom:8px">${resBadge(last.status)} ${fmtTs(last.started_at)}</div>${runResultHtml(last)}`
+      ${last ? `<div class="sub2" style="margin-bottom:8px">${resBadge(last.status)} ${fmtTs(last.started_at)}${last.run_id ? ` · <code>${esc(last.run_id)}</code>` : ""}</div>${runResultHtml(last)}`
         : `<div class="sub2">（尚無執行記錄）</div>`}</div>
     <div class="sec"><h4>YAML</h4><pre class="yaml">${esc(d.yaml)}</pre></div>`;
 }
@@ -81,6 +81,7 @@ export async function renderCases(key) {
 }
 
 async function loadCases(key) {
+  stepCache = {};  // 列表重載（含重跑後）→ 清掉步驟詳情快取，確保 modal 拿到最新結果
   const cfg = CASES[key], s = state[key];
   const params = new URLSearchParams({ system: cfg.system, q: s.q || "", limit: PAGE, offset: s.page * PAGE });
   if ($("rows")) $("rows").style.opacity = ".45";
@@ -98,10 +99,15 @@ function renderCaseRows(key, items) {
     tb.style.opacity = "1"; return;
   }
   tb.innerHTML = items.map((c) => {
-    const tflow = c.transitions.length
-      ? `<div class="tflow">${c.transitions.map((x) => `<span class="tchip">${esc(x.split("_")[0])}</span>`).join("")}</div>`
-      : `<span class="sub2">db / 混合</span>`;
     const lr = c.last_result;
+    // 每個 transition chip 依最近一次執行中對應步驟的結果著色（綠=通過 / 紅=失敗）
+    const tss = (lr && lr.transition_status) || [];
+    const tchipCls = (st) => st === "passed" ? "tchip-pass" : st === "failed" ? "tchip-fail"
+      : st === "skipped" ? "tchip-skip" : "";
+    const tflow = c.transitions.length
+      ? `<div class="tflow">${c.transitions.map((x, i) =>
+          `<span class="tchip clickable ${tchipCls(tss[i])}" data-cid="${esc(c.id)}" data-ti="${i}" title="點擊看詳情">${esc(x.split("_")[0])}</span>`).join("")}</div>`
+      : `<span class="sub2">db / 混合</span>`;
     const lrHtml = lr ? `${resBadge(lr.status)} <span class="sub2">${lr.passed}/${lr.total} · ${fmtTs(lr.started_at)}</span>`
       : `<span class="sub2">—</span>`;
     return `<tr>
@@ -119,6 +125,8 @@ function renderCaseRows(key, items) {
   tb.style.opacity = "1";
   tb.querySelectorAll(".view-btn").forEach((b) => b.onclick = () => openCaseDetail(b.dataset.id));
   tb.querySelectorAll(".run-btn").forEach((b) => b.onclick = () => runCase(key, b));
+  tb.querySelectorAll(".tchip.clickable").forEach((ch) =>
+    ch.onclick = () => openStepModal(ch.dataset.cid, Number(ch.dataset.ti)));
 }
 
 async function openCaseDetail(id) {
@@ -140,6 +148,70 @@ async function runCase(key, btn) {
     loadCases(key);
   } catch (e) { toast("執行失敗：" + e.message); }
   finally { btn.disabled = false; btn.textContent = old; }
+}
+
+// ── 任務流 chip → 步驟詳情 modal ────────────────────────────────────────────
+let stepCache = {};  // cid → steps[]（列表重載時清空）
+
+const stepStatusBadge = (st) => st === "passed" ? `<span class="badge b-done">通過</span>`
+  : st === "failed" ? `<span class="badge b-failed">失敗</span>`
+  : st === "skipped" ? `<span class="badge b-draft">略過</span>`
+  : `<span class="badge b-draft">未執行</span>`;
+
+const jsonBlock = (obj) => `<pre class="yaml">${esc(JSON.stringify(obj, null, 2))}</pre>`;
+
+function stepModalHtml(s, idx, total, runId) {
+  const cls = s.result ? (s.result.status === "passed" ? "tchip-pass"
+    : s.result.status === "failed" ? "tchip-fail" : "tchip-skip") : "";
+  const r = s.result;
+  const sec = (title, body) => body ? `<div class="sec"><h4>${title}</h4>${body}</div>` : "";
+  const obs = r && r.observations && Object.keys(r.observations).length ? jsonBlock(r.observations) : "";
+  const resultBody = r
+    ? `<div class="sub2" style="margin-bottom:8px">${stepStatusBadge(r.status)}
+         ${r.elapsed_ms != null ? `<span class="sub2">· ${r.elapsed_ms}ms</span>` : ""}</div>
+       ${r.error ? `<div class="err">${esc(r.error)}</div>` : ""}
+       ${obs ? `<div class="sub2" style="margin:6px 0 4px">observations</div>${obs}` : ""}`
+    : `<div class="sub2">（此用例尚無執行記錄，下面僅顯示規格）</div>`;
+  return `<div class="step-modal">
+    <div class="sm-head">
+      <div class="sm-nav">
+        <button class="btn ghost" id="step-prev" ${idx <= 0 ? "disabled" : ""}>‹ 上一步</button>
+        <span class="sub2">步驟 ${idx + 1} / ${total}${runId ? ` · <code>${esc(runId)}</code>` : ""}</span>
+        <button class="btn ghost" id="step-next" ${idx >= total - 1 ? "disabled" : ""}>下一步 ›</button>
+      </div>
+      <h3><span class="tchip ${cls}">${esc(s.short)}</span> ${esc(s.name)} ${r ? stepStatusBadge(r.status) : ""}</h3>
+      <p class="sub2">
+        ${s.method ? `<b>${esc(s.method)}</b> <code>${esc(s.endpoint || "")}</code>` : ""}
+        ${s.doc_id ? ` · 文件 ${esc(String(s.doc_id))}` : ""}
+        ${s.actor ? ` · 操作者 ${esc(s.actor)}` : ""}</p>
+      ${s.summary ? `<p class="sub2">${esc(s.summary)}</p>` : ""}
+    </div>
+    ${sec("執行結果", resultBody)}
+    ${sec("Request", s.request ? jsonBlock(s.request) : "")}
+    ${sec("預期（expect）", s.expect && Object.keys(s.expect).length ? jsonBlock(s.expect) : "")}
+    ${sec("DB 副作用（side_effects）", s.side_effects ? jsonBlock(s.side_effects) : "")}
+    ${sec("推播（push）", s.push ? jsonBlock(s.push) : "")}
+  </div>`;
+}
+
+function showStep(cid, data, idx) {
+  const steps = data.steps;
+  idx = Math.max(0, Math.min(idx, steps.length - 1));
+  openModal(stepModalHtml(steps[idx], idx, steps.length, data.run_id));
+  const p = $("step-prev"), n = $("step-next");
+  if (p) p.onclick = () => showStep(cid, data, idx - 1);
+  if (n) n.onclick = () => showStep(cid, data, idx + 1);
+}
+
+async function openStepModal(cid, idx) {
+  let data = stepCache[cid];
+  if (!data) {
+    openModal(`<div class="empty">載入中…</div>`);
+    const d = await api(`/api/cases/${encodeURIComponent(cid)}/steps`).catch((e) => (toast(e.message), null));
+    if (!d || !d.steps) { closeModal(); return; }
+    data = stepCache[cid] = d;
+  }
+  showStep(cid, data, idx);
 }
 
 async function doDecompose(key) {

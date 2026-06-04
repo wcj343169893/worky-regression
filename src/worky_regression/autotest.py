@@ -28,6 +28,7 @@ from .actor import Actor
 from .client import WorkyClient
 from .config import Settings
 from .planner import TaskPlan, build_path, decompose, plan_to_json
+from .qa_store import QAStore
 from .recorder import RecordingRunner
 from .verifier import DBVerifier
 
@@ -144,7 +145,9 @@ def main(argv: list[str] | None = None) -> int:
     # 3) 登入角色 + 執行 + 記錄（contract 與 job 在 dev 分庫，依系統選 DB）
     db = DBVerifier(s.for_system(system))
     actors = _actors_for(system, s)
-    result = RecordingRunner(db).run(spec, actors=actors)
+    qa = QAStore(s)
+    qa.migrate()
+    result = RecordingRunner(db, qa_store=qa, system=system).run(spec, actors=actors)
 
     print(f"\n{'='*60}")
     print(result.summary())

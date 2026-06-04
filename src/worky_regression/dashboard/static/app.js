@@ -2,7 +2,7 @@
 // 應用骨架：頂部選單、雜湊路由、整體初始化。各業務模塊各自一檔。
 
 import { $, api, pad } from "./util.js";
-import { closeDrawer } from "./widgets.js";
+import { closeDrawer, closeModal } from "./widgets.js";
 import { BOARDS, renderBoard } from "./boards.js";
 import { TABLES, renderTable } from "./tables.js";
 import { CASES, renderCases } from "./cases.js";
@@ -37,7 +37,7 @@ function init() {
   $("refresh-btn").onclick = route;
   $("drawer-close").onclick = closeDrawer;
   $("drawer-mask").onclick = closeDrawer;
-  document.addEventListener("keydown", (e) => { if (e.key === "Escape") closeDrawer(); });
+  document.addEventListener("keydown", (e) => { if (e.key === "Escape") { closeModal(); closeDrawer(); } });
   window.addEventListener("hashchange", route);
   const tick = () => { const d = new Date(); $("clock").textContent = `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`; };
   tick(); setInterval(tick, 1000);

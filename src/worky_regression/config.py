@@ -22,6 +22,8 @@ class Settings:
     # 承攬制資料所在 DB：dev 環境 contract 與 job 分庫（job 在 db_name=worky_next_v31x，
     # contract 由 API 寫到 worky_next_staging_v30x）。空字串→沿用 db_name。
     contract_db_name: str
+    # QA 看板資料庫：用例註冊 + 每次執行結果（與 worky 庫同 server，共用 host/port/user/pass）。
+    qa_db_name: str
 
     platform: str
     sdk_version: str
@@ -55,6 +57,7 @@ class Settings:
             db_pass=req("WORKY_DB_PASS"),
             db_name=req("WORKY_DB_NAME"),
             contract_db_name=os.environ.get("WORKY_CONTRACT_DB_NAME", ""),
+            qa_db_name=os.environ.get("WORKY_QA_DB_NAME", "worky_qa_dashboard"),
             platform=os.environ.get("WORKY_PLATFORM", "WebPC"),
             sdk_version=os.environ.get("WORKY_SDK_VERSION", "1.0.0"),
             device_name=os.environ.get("WORKY_DEVICE_NAME", "regression-runner"),

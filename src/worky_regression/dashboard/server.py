@@ -138,6 +138,13 @@ class Handler(BaseHTTPRequestHandler):
                     q=_one(query, "q", ""),
                     limit=_int(query, "limit", 20),
                     offset=_int(query, "offset", 0)))
+            elif path.startswith("/api/cases/") and path.endswith("/steps"):
+                cid = path[len("/api/cases/"):-len("/steps")]
+                data = _cases().case_steps(cid)
+                if data is None:
+                    self._send_json({"error": f"case {cid} not found"}, 404)
+                else:
+                    self._send_json(data)
             elif path.startswith("/api/cases/"):
                 cid = path[len("/api/cases/"):]
                 detail = _cases().case_detail(cid)
@@ -221,12 +228,15 @@ def serve(host: str = "127.0.0.1", port: int = 8765) -> None:
     # 啟動前先驗證 DB 連得上，早點失敗
     svc = _service()
     svc.db.max_notification_id()
+    # 確保 QA 看板庫 schema 到最新（alembic upgrade head；建庫 + 建/改表）
+    _cases().qa.migrate()
 
     httpd = ThreadingHTTPServer((host, port), Handler)
     url = f"http://{host}:{port}"
     print("=" * 56)
     print("  Worky 承攬制任務看板  ")
     print(f"  DB     : {svc.settings.db_name} @ {svc.settings.db_host}")
+    print(f"  QA DB  : {svc.settings.qa_db_name}")
     print(f"  開啟   : {url}")
     print("  停止   : Ctrl-C")
     print("=" * 56)
