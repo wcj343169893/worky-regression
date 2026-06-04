@@ -26,3 +26,15 @@ stats / 分布 / 清單 / 分頁全部在該同一集合上計算即天然一致
 ## 涉及檔案
 `dashboard/service/contract.py`（及 `jobs.py` 同類問題）、`dashboard/static/boards.js`。
 （在 Issue #1 之後驗證 / 收尾。）
+
+## 結案（2026-06-04，由 Issue #1 同源化解決）
+Issue #1 已把 `list_tasks`/`stats`（及 `list_jobs`/`job_stats`）改為共用同一個
+`_executed_*_rows()`，且 progress/category 篩選一律在「分頁前」套用 →
+total / 回傳列數 / 分布段數字天然一致。無需額外程式改動，僅驗證：
+
+- 任務看板：`list_tasks.total == stats.total`（=8）；`Σ by_progress.count == total`；
+  每個 progress 段 `list_tasks(progress=code).total == seg.count` ✅
+- 工作看板：`list_jobs.total == job_stats.total`（=50）；`Σ by_progress.count == total`；
+  每個 category 段 `list_jobs(category=cat).total == seg.count`
+  （matching=38 / recruited=11 / record_only=1，皆一致）✅
+- 分頁：50 筆 = 20 + 20 + 10，三頁列數與 total 一致 ✅
