@@ -27,6 +27,16 @@ receiver_backup:
     phone: "0900000001"
     is_profile_complete: 0    # profile 未填，部份 endpoint 可能擋
 
-# === 商家（未來 worky 平台 b2c 端點才會用到，目前承攬制流程用不到） ===
-# employer_audit_primary:
-#   id: 196, phone "0910000000", shop 131
+# === 商家（user_type=1）：「工作」系統用 ===
+# 工作系統雇主=商家(user_type=1)、勞工=打工夥伴(user_type=2)，與承攬制不同。
+# v31x 原本沒有任何雇主，此帳號由 scripts/bootstrap_job_env.py 從 v30x 複製而來
+# （雇主 129 + AUDIT_USER 角色 + 主店鋪 70）。重建請跑該腳本。
+employer_primary:
+  id: 129
+  phone: "0923113000"           # 與 receiver 276 同號但不同 user_type，互不衝突
+  username: "886923113000"
+  user_type: 1
+  shop_id: 70                    # 已驗證店鋪（validation_type=2）
+
+# 「工作」流程的打工夥伴沿用既有 audit labor：
+#   - 申請者用 publisher_primary(236) 或 receiver_primary(276) 皆可（都是 audit labor）

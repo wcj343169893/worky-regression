@@ -13,6 +13,13 @@ dependencies = [
     "pytest-html>=4.1",
 ]
 
+[project.optional-dependencies]
+# Layer ③ 用例分解器才需要；核心測試框架不依賴它。
+# DeepSeek 走 OpenAI 相容介面，用官方 openai SDK + base_url 指向 api.deepseek.com。
+ai = [
+    "openai>=1.40",
+]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src"]
@@ -20,6 +27,7 @@ addopts = "-v --tb=short --strict-markers"
 markers = [
     "smoke: 基礎連通性測試",
     "path: 完整審批流路徑測試",
+    "job: 工作系統審批流路徑測試",
 ]
 
 [build-system]

@@ -24,6 +24,11 @@ class Settings:
     sdk_version: str
     device_name: str
 
+    # DeepSeek API（用例分解器 Layer ③；OpenAI 相容介面。無 key 時分解器停用，其餘框架照常）
+    deepseek_api_key: str
+    deepseek_base_url: str
+    deepseek_model: str
+
     @classmethod
     def from_env(cls, env_file: Path | None = None) -> "Settings":
         if env_file is None:
@@ -49,4 +54,7 @@ class Settings:
             platform=os.environ.get("WORKY_PLATFORM", "WebPC"),
             sdk_version=os.environ.get("WORKY_SDK_VERSION", "1.0.0"),
             device_name=os.environ.get("WORKY_DEVICE_NAME", "regression-runner"),
+            deepseek_api_key=os.environ.get("DEEPSEEK_API_KEY", ""),
+            deepseek_base_url=os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com"),
+            deepseek_model=os.environ.get("DEEPSEEK_MODEL", "deepseek-chat"),
         )

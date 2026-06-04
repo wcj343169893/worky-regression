@@ -61,26 +61,98 @@ pytest tests/test_paths.py -v -k path-t1-publish-task
 
 ---
 
+## PC 任務看板（Dashboard）
+
+純檢視的 Web 管理界面，直接讀 `worky_next_v30x` DB，一眼看到每個承攬制任務的
+資訊與**當前進度**（媒合中 → 待付款 → 待開始 → 執行中 → 待確認 → 任務完成，
+以及駁回 / 失敗 / 取消等分支）。零額外依賴（Python stdlib）。
+
+```bash
+source .venv/bin/activate
+python -m worky_regression.dashboard          # 預設 http://127.0.0.1:8765
+python -m worky_regression.dashboard --port 9000 --host 0.0.0.0
+```
+
+開瀏覽器進 `http://127.0.0.1:8765`。功能：
+
+- **頂部統計**：總數 / 進行中 / 已完成 / 取消失敗，加一條進度分布長條。
+- **任務清單**：task_sn、進度膠囊 + 迷你 stepper、金額、招募人數、時段、發案者；
+  可搜尋（task_sn / 名稱）、依進度篩選、翻頁；可開「自動 15s 重新整理」。
+- **詳情抽屜**（點任一列）：大型進度 stepper、原始 status/pay_status、接案者任務、
+  申請媒合紀錄，以及由 `s_contract_task_change_logs` 串成的**進度時間軸**。
+  每一進度階段都標注對應的回歸 transition（如「執行中 ← T6 開始任務」），把看板綁回測試框架。
+
+> 進度碼邏輯移植自主倉 `common/base/Enums/Contract/PublisherTaskStatus.php`，
+> 若主倉的 enum 變動，需同步 `dashboard/status.py`（與 `transitions.py`、`push_type_ids.py` 同樣的規矩）。
+>
+> 看板**只讀**，不對主倉或 DB 寫入；`display_name` 在 DB 為加密欄位，故角色以 phone + id 呈現。
+
+---
+
+## AI 用例分解 / 自動測試管線
+
+把「手寫 YAML path」升級成**可由 AI 驅動**的測試編排，四層：
+
+| 層 | 元件 | 職責 |
+|----|------|------|
+| ① 介面定義 | `cases/_specs/endpoints.yaml` | **單一真實來源**：每個任務單元的 request / response / 前置 / DB 副作用（enum）/ push |
+| ② 任務單元 | `registry.py` | 從 endpoints.yaml 載入 → `Transition` registry + push type 全表 |
+| ③ 用例分解器 | `planner.py` + `autotest.py` | DeepSeek（OpenAI 相容）把自然語言用例分解成任務流；**驗證由 spec 自動推導**，不靠 LLM 寫 SQL |
+| ④ 結果記錄器 | `recorder.py` | 逐步執行並落地 `results/*.json`（失敗不中斷記錄） |
+
+```bash
+source .venv/bin/activate
+
+# 用自然語言用例（需在 .env 設 DEEPSEEK_API_KEY；pip install -e .[ai]）
+python -m worky_regression.autotest "商家發工作，夥伴申請後商家取消錄取"
+
+# 只分解不執行，看產生的任務流
+python -m worky_regression.autotest "..." --dry-run
+
+# 跳過分解，直接跑既有 path YAML（走記錄器）
+python -m worky_regression.autotest --path cases/job-happy-core.yaml
+```
+
+分解器只挑選 + 排序任務單元（必要時插 `db_exec` 時間/打卡碼橋接）；
+框架再依 endpoints.yaml 的 `side_effects` / `push` **自動補上 `expect` 驗證**。
+產出寫到 `cases/generated/<id>.yaml`（可檢視、編輯、移到 `cases/` 變正式用例）。
+
+> **單一真實來源**：加 transition / 改 enum / 改 push type_id 只動 `endpoints.yaml`。
+> 舊的 `transitions.py` / `push_type_ids.py` / `job_*` 已改為 re-export shim
+> （消除「改兩個檔」的同步負擔）。
+
+---
+
 ## 目錄結構
 
 ```
 src/worky_regression/
-  config.py        # .env 載入（Settings dataclass）
+  config.py        # .env 載入（Settings dataclass；含 DEEPSEEK_API_KEY）
   client.py        # WorkyClient — HTTP + 簽名 + headers
   actor.py         # Actor — 一個角色 = phone + user_id + 已登入的 client
-  transitions.py   # 10 個 PusherOfTask 對應的 Transition 定義
-  push_type_ids.py # PushNotification\\Type 常量 → 實際 type_id 映射
-  verifier.py      # DBVerifier — query s_notifications / 業務表
-  runner.py        # PathRunner — 讀 YAML → 執行 transitions → 驗證
+  registry.py      # ★ 從 endpoints.yaml 建 Transition registry + push 全表（單一真實來源）
+  transitions.py   # Transition dataclass（資料已移至 endpoints.yaml；其餘為相容 shim）
+  push_type_ids.py # 相容 shim → registry
+  verifier.py      # DBVerifier — query s_notifications / 業務表 / db_exec
+  runner.py        # PathRunner — 讀 path → 執行 transitions → 三層驗證
+  recorder.py      # ★ RecordingRunner — 逐步記錄結果 → results/*.json
+  planner.py       # ★ DeepSeek 用例分解器（lean plan + 自動推導 expect）
+  autotest.py      # ★ CLI：用例 → 任務流 → 執行 → 記錄
+  dashboard/       # PC 任務看板（純檢視，stdlib HTTP）
+    status.py / service.py / server.py / static/
 
 cases/
+  _specs/endpoints.yaml          # ★ 介面/任務單元單一真實來源
   _fixtures/test_accounts.yaml   # audit 帳號（id/phone/user_type）
-  path-*.yaml                    # 一個檔 = 一條審批流路徑
+  path-*.yaml / job-*.yaml       # 一個檔 = 一條審批流路徑
+  generated/                     # AI 分解器產出（gitignore；要保留就移上層）
 
 tests/
   test_smoke.py    # 環境連通性
   test_paths.py    # parametrize over cases/path-*.yaml
-conftest.py        # session-scoped fixtures（settings/db/publisher/receiver）
+  test_jobs.py     # parametrize over cases/job-*.yaml
+conftest.py        # session fixtures（settings/db/publisher/receiver/employer/labor）
+results/           # 執行結果記錄（gitignore）
 ```
 
 ---

@@ -11,3 +11,9 @@ dist/
 build/
 report.html
 .DS_Store
+
+# AI 自動測試的執行結果記錄（不提交）
+results/
+
+# AI 分解器產生的任務流（可檢視；要保留就移到 cases/）
+cases/generated/

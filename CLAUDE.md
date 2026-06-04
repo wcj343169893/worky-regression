@@ -31,13 +31,18 @@ Worky 承攬制審批流回歸測試框架（Python + pytest）。
 | `src/worky_regression/config.py` | `.env` → `Settings` dataclass |
 | `src/worky_regression/client.py` | `WorkyClient` HTTP + 簽名（md5 of `query+body+commonVars+token+secret`） |
 | `src/worky_regression/actor.py` | `Actor` 登入 + token 管理 |
-| `src/worky_regression/transitions.py` | 10 個 `Transition`（endpoint / event / push_type / body_template） |
-| `src/worky_regression/push_type_ids.py` | PushNotification Type 常量 → 數字 |
+| `cases/_specs/endpoints.yaml` | **單一真實來源**：每個任務單元的 request/response/前置/DB 副作用 enum/push（contract T* + job J*） |
+| `src/worky_regression/registry.py` | 從 endpoints.yaml 建 `Transition` registry + push type 全表 |
+| `src/worky_regression/transitions.py` | `Transition` dataclass（資料已移至 endpoints.yaml；`push_type_ids.py`/`job_*` 皆為相容 shim） |
 | `src/worky_regression/verifier.py` | `DBVerifier`：watermark、`assert_push`、`execute`、`flush_memcached` |
-| `src/worky_regression/runner.py` | `PathRunner` — 讀 YAML，展開 `{{state.xxx}}` / `{{publisher.user_id}}` |
-| `conftest.py` | session fixtures：`settings/db/publisher/receiver`；publisher 自動寫發票 |
-| `cases/path-*.yaml` | 一個檔 = 一條 path |
+| `src/worky_regression/runner.py` | `PathRunner` — 讀 path，展開 `{{state.xxx}}` / `{{publisher.user_id}}` |
+| `src/worky_regression/recorder.py` | `RecordingRunner` — 逐步記錄結果 → `results/*.json`（失敗不中斷記錄） |
+| `src/worky_regression/planner.py` | DeepSeek（OpenAI 相容）用例分解器（lean plan；expect 由 spec 自動推導，不靠 LLM 寫 SQL） |
+| `src/worky_regression/autotest.py` | CLI：用例 → 任務流 → 執行 → 記錄（`python -m worky_regression.autotest "<用例>"`） |
+| `conftest.py` | session fixtures：`settings/db/publisher/receiver/employer/labor`；publisher 自動寫發票 |
+| `cases/path-*.yaml` / `cases/job-*.yaml` | 一個檔 = 一條 path（承攬制 / 工作系統） |
 | `cases/_fixtures/test_accounts.yaml` | audit 帳號 |
+| `src/worky_regression/dashboard/` | PC 任務看板（純檢視 Web，stdlib HTTP）：`status.py` 進度碼移植 / `service.py` DB 查詢 / `server.py` 路由 / `static/` SPA。啟動：`python -m worky_regression.dashboard` |
 
 ## 開發/驗證流程
 
@@ -61,12 +66,32 @@ pytest tests/test_paths.py -v
   - `s_pay_user_invoice_info` (publisher 236)
   - `s_contract_pay_fun_point_credit_cards` (publisher 236)
 - **YAML path 步驟順序很重要**，狀態機不能跳關
-- 加新 transition / type_id 時，**同步更新** `transitions.py` 與 `push_type_ids.py`
+- 加新 transition / 改 enum / 改 push type_id：**只動 `cases/_specs/endpoints.yaml`**（單一真實來源；
+  `transitions.py` / `push_type_ids.py` 已是 shim，不要再往裡塞資料）
 - endpoint 路徑以 `/www/wwwroot/worky/documents/api/` 為準
 - push type_id 以 `/www/wwwroot/worky/common/components/PushNotification/Type.php` 為準
 - 提交時 commit message 格式：`<type>: <描述>(WKD-XXXXX)`（沿用 worky 慣例；若該變動有對應 Jira 單再帶）
 
 ## 已知陷阱（重要！）
+
+### 環境已切到 next-v31x（工作系統）
+
+`.env` 的 `WORKY_DB_NAME` 目前指向 **`worky_next_v31x`**（工作系統 job 流程在此庫驗證）；
+本檔上方歷史描述的 `worky_next_v30x` 是承攬制流程的舊庫。兩套流程角色不同
+（contract 雙方皆 Labor；job = employer user_type=1 + labor user_type=2）。
+
+### 承攬制發任務需「24 小時後」開始（dev 已漂移）
+
+T1 contract publish 現在回 `20006 只能發佈距離現在 24 小時以後開始的工作`，
+但 `runner.init_state` 注入的 `start_time = now + 900`（15 分）已過時。
+**現象**：`cases/path-*.yaml` 在 T1 即失敗。修法：把 runner 的 contract `start_time`
+拉到 `now + 86400 + buffer`（或在 path 用 db_exec 直接寫 `start_time`）。
+
+### v31x 後端 J2 labor-apply 壞了（回歸框架已抓到）
+
+J2（`/labor/job-match/job-apply`）回 `Setting unknown property:
+api\models\Labor\LaborMatchJob::is_hidden_by_user_status`——主倉 next-v31x 的 PHP 端 bug，
+J1 發佈正常但 J2 申請就炸。**這是被測對象的 regression，不要在框架側修**，回報主倉即可。
 
 ### PHP-FPM worker static 污染
 

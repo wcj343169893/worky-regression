@@ -80,3 +80,31 @@ def receiver(settings: Settings, accounts: dict) -> Actor:
                   user_id=cfg["id"], client=client)
     actor.login(audit_code=settings.audit_sms_code)
     return actor
+
+
+# ===== 「工作」系統角色：雇主(user_type=1) + 打工夥伴(user_type=2) =====
+
+@pytest.fixture(scope="session")
+def employer(settings: Settings, accounts: dict) -> Actor:
+    """工作系統的商家（user_type=1）。
+
+    v31x 原本無雇主，此帳號由 scripts/bootstrap_job_env.py 建立（複製自 v30x）。
+    若登入失敗，先跑：python scripts/bootstrap_job_env.py
+    """
+    cfg = accounts["employer_primary"]
+    client = WorkyClient(settings, user_type=cfg["user_type"])
+    actor = Actor(role="employer", user_type=cfg["user_type"], phone=cfg["phone"],
+                  user_id=cfg["id"], client=client, shop_id=cfg.get("shop_id"))
+    actor.login(audit_code=settings.audit_sms_code)
+    return actor
+
+
+@pytest.fixture(scope="session")
+def labor(settings: Settings, accounts: dict) -> Actor:
+    """工作系統的打工夥伴（user_type=2）。沿用既有 audit labor（publisher_primary）。"""
+    cfg = accounts["publisher_primary"]
+    client = WorkyClient(settings, user_type=cfg["user_type"])
+    actor = Actor(role="labor", user_type=cfg["user_type"], phone=cfg["phone"],
+                  user_id=cfg["id"], client=client)
+    actor.login(audit_code=settings.audit_sms_code)
+    return actor

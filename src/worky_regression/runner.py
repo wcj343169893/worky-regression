@@ -11,11 +11,26 @@ from typing import Any
 import yaml
 
 from .actor import Actor
-from .transitions import Transition, get as get_transition
+from .registry import PUSH_TYPE_IDS, get as get_transition
 from .verifier import DBVerifier
 
 
 VAR_PATTERN = re.compile(r"\{\{\s*([^}]+?)\s*\}\}")
+
+
+def _job_slot_vars(now: int) -> dict[str, Any]:
+    """為工作發佈算一組唯一的未來時段變數（避開時段衝突）。"""
+    # 限制：工作開始日期需在「今天 +14 天」內（MAX_WORK_INTERVAL_DAYS），
+    # 且需 > 今天 +約2天（recruit_deadline/min-publish-interval）。取 +3 ~ +13 天。
+    hour = 8 + (now // 60) % 9            # 08:00 ~ 16:00，每分鐘輪一格
+    day_off = 3 + (now // 1800) % 11      # +3 ~ +13 天，每 30 分鐘輪一天
+    base = now + day_off * 86400
+    return {
+        "job_start_date": int(time.strftime("%Y%m%d", time.localtime(base))),
+        "job_start_period": f"{hour:02d}:00",
+        "job_end_period": f"{hour + 2:02d}:00",   # 2 小時
+        "job_work_minutes": 120,
+    }
 
 
 @dataclass
@@ -27,10 +42,12 @@ class PathExecutionState:
     def resolve(self, raw: Any) -> Any:
         """遞迴展開 {{state.task_sn}} / {{publisher.shop_id}} 等變數。"""
         if isinstance(raw, str):
-            def repl(m: re.Match) -> str:
-                key = m.group(1)
-                return str(self._lookup(key))
-            return VAR_PATTERN.sub(repl, raw)
+            # 整個字串就是單一 {{...}} → 回傳原型別（int/list 等不被轉成字串），
+            # 例如 {{labor.user_id}} 保持 int、{{state.job_start_date}} 保持 int。
+            full = VAR_PATTERN.fullmatch(raw.strip())
+            if full:
+                return self._lookup(full.group(1))
+            return VAR_PATTERN.sub(lambda m: str(self._lookup(m.group(1))), raw)
         if isinstance(raw, dict):
             return {k: self.resolve(v) for k, v in raw.items()}
         if isinstance(raw, list):
@@ -59,32 +76,57 @@ class PathRunner:
     def __init__(self, db: DBVerifier):
         self.db = db
 
-    def run(self, path_file: Path, *, publisher: Actor, receiver: Actor) -> None:
+    def run(self, path_file: Path, *, publisher: Actor | None = None,
+            receiver: Actor | None = None, employer: Actor | None = None,
+            labor: Actor | None = None, actors: dict[str, Actor] | None = None) -> None:
+        """執行一條 path。
+
+        承攬制傳 publisher/receiver；工作系統傳 employer/labor。
+        也可直接給 actors dict（key = transition 的 actor_role / pushes_to）。
+        """
         with path_file.open() as f:
             spec = yaml.safe_load(f)
 
-        now = int(time.time())
-        state = PathExecutionState(
-            actors={"publisher": publisher, "receiver": receiver},
-            vars={
-                "run_id": uuid.uuid4().hex[:8],
-                # 任務時段條件：
-                # - start_time >= now + MIN_PUBLISH_INTERVAL_SECONDS（dev 配 720s ≈ 0.2h）
-                # - end_time - start_time >= 3600s
-                # taskStart/taskEnd service 內不檢查實際時間，只 stamp now，所以
-                # test 連續跑沒問題；只要 publish 一刻通過驗證即可
-                "start_time": now + 900,           # 15 分鐘後開始
-                "end_time": now + 900 + 3700,      # +1h1m
-            },
+        state = self.init_state(
+            actors=actors, publisher=publisher, receiver=receiver,
+            employer=employer, labor=labor,
         )
-
         for step in spec["path"]:
             if "db_exec" in step:
                 self._run_db_exec(step, state)
             else:
                 self._run_step(step, state)
 
-    def _run_db_exec(self, step: dict, state: PathExecutionState) -> None:
+    @staticmethod
+    def init_state(*, actors: dict[str, Actor] | None = None,
+                   publisher: Actor | None = None, receiver: Actor | None = None,
+                   employer: Actor | None = None, labor: Actor | None = None,
+                   ) -> PathExecutionState:
+        """建立一次 path 執行的初始 state（actor map + runtime 變數）。"""
+        actor_map: dict[str, Actor] = dict(actors or {})
+        for role, act in (("publisher", publisher), ("receiver", receiver),
+                          ("employer", employer), ("labor", labor)):
+            if act is not None:
+                actor_map[role] = act
+
+        now = int(time.time())
+        return PathExecutionState(
+            actors=actor_map,
+            vars={
+                "run_id": uuid.uuid4().hex[:8],
+                # --- 承攬制任務時段 ---
+                # start_time >= now + MIN_PUBLISH_INTERVAL（dev 720s）；end-start >= 3600s
+                "start_time": now + 900,           # 15 分鐘後開始
+                "end_time": now + 900 + 3700,      # +1h1m
+                # --- 工作系統發佈用 ---
+                # 每次跑用「不同的未來時段」，避免打工夥伴在同一時段重複被確認工作
+                # （30207「該時段已有確認工作」）。日期每 30 分鐘輪進、時段每分鐘輪進，
+                # 一個 session 內幾乎不會撞號。工時固定 120 分（start→end 差 2h、rest 0）。
+                **_job_slot_vars(now),
+            },
+        )
+
+    def _run_db_exec(self, step: dict, state: PathExecutionState) -> dict[str, Any]:
         """執行任意 SQL（用於模擬外部副作用，例如 ATM 付款完成）。
 
         Worky model 層有 memcached cache，UPDATE 後預設會 flush_all 失效快取。
@@ -102,8 +144,9 @@ class PathRunner:
                 )
         flushed = self.db.flush_memcached() if step.get("flush_cache", True) else False
         print(f"  [db_exec] {sql[:60]}... → affected={affected} cache_flushed={flushed}")
+        return {"sql": sql, "affected": affected, "cache_flushed": flushed}
 
-    def _run_step(self, step: dict, state: PathExecutionState) -> None:
+    def _run_step(self, step: dict, state: PathExecutionState) -> dict[str, Any]:
         transition = get_transition(step["transition"])
         actor = state.actors[transition.actor_role]
 
@@ -132,16 +175,28 @@ class PathRunner:
 
         data = payload.get("data") if isinstance(payload.get("data"), dict) else payload
 
+        obs: dict[str, Any] = {
+            "transition": transition.name,
+            "endpoint": transition.endpoint,
+            "http": resp.status_code,
+            "code": payload.get("code"),
+            "saved": {},
+            "checks": [],
+        }
+
         # 保存 response 中的欄位（例如 task_sn）到 state.vars
         save = step.get("save") or {}
         for var_name, json_path in save.items():
-            state.vars[var_name] = self._dig(data, json_path)
+            val = self._dig(data, json_path)
+            state.vars[var_name] = val
+            obs["saved"][var_name] = val
 
-        # 推播驗證
-        push_expect = step.get("expect", {}).get("push")
-        if push_expect and transition.pushes_to:
+        # 推播驗證：只要 step.expect 有 push 鍵（即使空）就驗證該類型推播是否落地；
+        # 空 push 只驗 type_id，帶 title_contains/body_contains 才額外比對文字。
+        expect = step.get("expect", {})
+        if "push" in expect and transition.pushes_to:
+            push_expect = expect["push"] or {}
             target_actor = state.actors[transition.pushes_to]
-            from .push_type_ids import PUSH_TYPE_IDS  # lazy import
             type_id = PUSH_TYPE_IDS[transition.push_type_id]
 
             push = self.db.assert_push(
@@ -152,6 +207,8 @@ class PathRunner:
                 title_contains=state.resolve(push_expect.get("title_contains")) if push_expect.get("title_contains") else None,
                 body_contains=state.resolve(push_expect.get("body_contains")) if push_expect.get("body_contains") else None,
             )
+            obs["checks"].append({"kind": "push", "type_id": type_id,
+                                  "to": transition.pushes_to, "push_id": push.id})
 
         # 業務狀態驗證（query DB）
         state_expect = step.get("expect", {}).get("state")
@@ -167,6 +224,9 @@ class PathRunner:
                     raise AssertionError(
                         f"[{transition.name}] state.{col}: expected {expected!r}, got {actual!r}"
                     )
+                obs["checks"].append({"kind": "state", "col": col, "value": actual})
+
+        return obs
 
     @staticmethod
     def _dig(data: dict, dotted: str) -> Any:

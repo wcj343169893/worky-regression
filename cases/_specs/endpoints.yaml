@@ -1,0 +1,503 @@
+# =============================================================================
+# endpoints.yaml — 介面 / 最小任務單元「單一真實來源」
+# =============================================================================
+# 本檔同時是三件事：
+#   ① 人讀的 endpoint 規格（request / response / 前置 / DB 副作用 / push）
+#   ② runner 的 transition registry 來源（registry.py 載入後建 Transition）
+#   ③ AI 分解器的「任務單元菜單」（decomposer 把用例拆成這些單元的序列）
+#
+# 取代舊的 transitions.py / job_transitions.py / push_type_ids.py / job_push_type_ids.py
+# （那些已改為從本檔 re-export，消除 CLAUDE.md 抱怨的「改兩個檔」同步負擔）。
+#
+# 維護規矩：
+#   - 加 transition / 改 enum，只動這一個檔。
+#   - endpoint 路徑以 /www/wwwroot/worky/documents/api/ 為準。
+#   - push type_id 以 worky common/components/PushNotification/Type.php 為準。
+#   - side_effects 的 enum 數值務必對齊主倉 model 常量（附常量名方便回查）。
+# =============================================================================
+version: 1
+
+# ----- 兩套狀態機 -----
+systems:
+  contract:
+    label: 承攬制審批流
+    note: 雙方皆 Labor（user_type=2），publisher 與 receiver 輪流推進。
+    roles:
+      publisher: 發案者（Labor user_type=2）
+      receiver: 接案者（Labor user_type=2）
+    key_var: task_sn
+  job:
+    label: 工作系統
+    note: 商家(employer user_type=1) 發佈工作，打工夥伴(labor user_type=2) 應徵。
+    roles:
+      employer: 商家（user_type=1）
+      labor: 打工夥伴（user_type=2）
+    key_var: job_sn
+
+# ----- 分解器可引用的 runtime 變數（runner 在每次跑 path 時注入 state.*） -----
+# body / sql / expect 內以 {{...}} 引用；單一 {{x}} 會保留原型別（int/list 不被轉字串）。
+runtime_vars:
+  "state.run_id": 本次執行短碼（8 hex）
+  "state.task_sn": 承攬制任務編號（T1 publish 後 save 進來）
+  "state.job_sn": 工作編號（J1 publish 後 save 進來）
+  "state.start_time": "承攬制任務開始 unix（now+900）"
+  "state.end_time": "承攬制任務結束 unix（now+4600）"
+  "state.job_start_date": 工作開始日 YYYYMMDD（int，未來 3~13 天輪播避免撞時段）
+  "state.job_start_period": "工作開始時段 HH:00"
+  "state.job_end_period": "工作結束時段 HH:00（+2h）"
+  "state.job_work_minutes": 工時分鐘（固定 120）
+  "<role>.user_id": actor 的 user_id（如 {{labor.user_id}}）
+  "<role>.shop_id": actor 的 shop_id（如 {{employer.shop_id}}）
+  "<role>.phone": actor 電話
+  "<role>.user_type": actor user_type（1/2）
+
+# ----- 推播 Type 全表（type 常量名 → 實際 type_id）-----
+# 對齊 worky common/components/PushNotification/Type.php。
+# 任務單元的 push.type 必須出現在這裡。
+push_types:
+  contract:
+    CONTRACT_RECEIVER_APPLY_TASK: 20038          # Type::CONTRACT_RECEIVER_APPLY
+    CONTRACT_RECEIVER_ACCEPT_INVITE: 20062       # Type::CONTRACT_PUBLISHER_INVITE_ACCEPTED
+    CONTRACT_PUBLISHER_ACCEPT_APPLY: 20051       # Type::CONTRACT_RECEIVER_APPLY_ACCEPTED
+    CONTRACT_PUBLISHER_DECLINE_APPLY: 20052      # Type::CONTRACT_RECEIVER_APPLY_REJECTED
+    CONTRACT_PUBLISHER_CANCEL_HIRE: 20053        # Type::CONTRACT_RECEIVER_TASK_CANCELED（命名不對稱，程式如此）
+    CONTRACT_RECEIVER_CANCEL_TASK: 20039         # Type::CONTRACT_RECEIVER_CANCEL_ACCEPTED（正常時段）
+    CONTRACT_RECEIVER_CANCEL_TASK_LAST_MINUTE: 20046  # Type::CONTRACT_CANCEL_LAST_MINUTE
+    CONTRACT_RECEIVER_START_TASK: 20048          # Type::CONTRACT_PUBLISHER_NOTIFY_TASK_START
+    CONTRACT_RECEIVER_END_TASK: 20049            # Type::CONTRACT_PUBLISHER_NOTIFY_TASK_END
+    CONTRACT_PUBLISHER_PASS_TASK: 20057          # Type::CONTRACT_RECEIVER_TASK_SUCCESS
+    CONTRACT_PUBLISHER_REJECT_TASK: 20058        # Type::CONTRACT_RECEIVER_TASK_FAIL
+  job:
+    # === 商家收（10xxx）===
+    FAVORITE_LABOR_ACCEPTED_TO_WORK: 10003       # 最愛夥伴同意上工
+    JOB_PAYMENT_COMPLETED: 10004                 # 工作費用支付完成
+    JOB_PAYMENT_FAILED: 10005                    # 工作費用支付失敗
+    JOB_RECRUITMENT_ENDING_SOON: 10006           # 招募結束前 30 分
+    LABOR_JOB_CANCELED: 10007                    # 打工夥伴取消工作（招募截止後）
+    EMPLOYER_JOB_STARTING_SOON: 10008            # 工作開始前 30 分
+    LABOR_CLOCK_IN: 10009                        # 打工夥伴上班打卡
+    JOB_END: 10010                               # 工作結束
+    LABOR_CLOCK_OUT: 10011                       # 打工夥伴下班打卡
+    LABOR_JOB_APPLY: 10021                       # 打工夥伴申請上工
+    LABOR_JOB_CANCELED_BEFORE_RECRUIT_DEADLINE: 10026  # 取消工作（招募截止前）
+    # === 打工夥伴收（20xxx）===
+    EMPLOYER_INVITED_TO_WORK: 20001              # 商家邀請工作
+    LABOR_JOB_STARTING_SOON: 20002               # 工作開始前 1 小時
+    JOB_CLOCK_IN_CODE: 20003                     # 商家發送上班打卡碼
+    JOB_CLOCK_OUT_CODE: 20004                    # 商家發送下班打卡碼
+    EMPLOYER_JOB_CANCELED: 20010                 # 商家取消工作
+    EMPLOYER_ACCEPT_APPLY: 20016                 # 商家同意申請上工
+    EMPLOYER_DECLINE_APPLY: 20017                # 商家婉拒申請上工
+    EMPLOYER_CANCEL_HIRE_APPLY: 20019            # 商家取消錄取
+
+# ----- 業務狀態 enum 速查（side_effects 的數值來源，回查主倉 model）-----
+enums:
+  # common/models/Labor/LaborMatchJob.php
+  s_labor_match_jobs.status:
+    STATUS_MATCHING: 1
+    STATUS_LABOR_ACCEPT: 2
+    STATUS_LABOR_DECLINE: 3
+    STATUS_LABOR_APPLY: 4
+    STATUS_LABOR_CANCEL_APPLICATION: 5
+    STATUS_EMPLOYER_ACCEPT: 6
+    STATUS_EMPLOYER_DECLINE: 7
+    STATUS_EMPLOYER_CANCEL: 8
+    STATUS_LABOR_CANCEL: 9
+    STATUS_EMPLOYER_CANCEL_HIRE: 10
+    STATUS_RECRUITMENT_END: 15
+    STATUS_BACKUP: 16
+  # common/models/Labor/LaborJob.php
+  s_labor_jobs.status:
+    STATUS_GO_TO_WORK: 1
+    STATUS_EMPLOYER_CANCEL: 8
+    STATUS_LABOR_CANCEL: 9
+    STATUS_EMPLOYER_CANCEL_HIRE: 10
+  # common/base/Enums/LaborJobStatus.php
+  s_labor_jobs.job_status:
+    STATUS_NONE: 0
+    STATUS_WAITING_FOR_WORK: 1
+    STATUS_WORKING: 2
+    STATUS_WORK_FINISHED: 3
+    STATUS_PAY_COMPLETED: 4
+    STATUS_APPLYING: 8
+    STATUS_CANCEL: 9
+
+# =============================================================================
+# 任務單元（最小可執行單位）
+#   name           : 唯一 ID（contract=T*, job=J*；不可重複）
+#   system         : contract | job
+#   summary        : 一句話描述（分解器用來挑單元）
+#   actor          : 觸發角色（須是該 system roles 之一）
+#   method/endpoint: HTTP；endpoint 相對 /v1
+#   doc_id         : worky documents/api 編號
+#   event          : 觸發的 PHP Event FQCN（無則 ""）
+#   request        : body 模板（runner 展開 {{...}}）
+#   saves          : {var: json_path} 從 response.data 取值存進 state
+#   push           : {to, type}（type 須在 push_types 內）；無推播則 null
+#   preconditions  : 呼叫前必須成立的狀態（人讀 + 分解器排序依據）
+#   side_effects   : 成功後的 DB 變化；verify 用 {table, key, become:{col:val}}
+#                    become 的值可用 {{enum.xxx}} 或直接數字
+# =============================================================================
+task_units:
+
+  # ===========================================================================
+  # 承攬制 contract（T1–T8b）
+  # ===========================================================================
+  T1_publisher_publish_task:
+    system: contract
+    summary: 發案者發佈一筆任務（FunPoint 信用卡）
+    actor: publisher
+    method: POST
+    endpoint: /contract/task/publish
+    doc_id: "402"
+    event: ""
+    request:
+      name: "regression {{state.run_id}}"
+      task_type_level1: 1
+      city_id: 19
+      district_id: 194
+      description: regression auto-task
+      start_time: "{{state.start_time}}"
+      end_time: "{{state.end_time}}"
+      recruit_count: 1
+      task_amount: 300
+      payment_method_id: 1
+      contact_name: regression
+      contact_phone: "0912345678"
+      show_to_taker: 0
+      photos: []
+      match_target_favor: 0
+    saves:
+      task_sn: task_sn
+    push: null
+    preconditions: []
+    side_effects:
+      - table: s_contract_tasks
+        key: "task_sn='{{state.task_sn}}'"
+        note: 建立任務（媒合中）
+
+  T2_receiver_apply:
+    system: contract
+    summary: 接案者申請任務
+    actor: receiver
+    method: POST
+    endpoint: /contract/receiver-match-task/task-apply
+    doc_id: 502-1
+    event: common\components\Contract\Event\AfterReceiverApplyTaskEvent
+    request: {task_sn: "{{state.task_sn}}"}
+    push: {to: publisher, type: CONTRACT_RECEIVER_APPLY_TASK}
+    preconditions: [任務存在且媒合中]
+    side_effects: []
+
+  T3_receiver_accept_invite:
+    system: contract
+    summary: 接案者接受發案者邀請
+    actor: receiver
+    method: POST
+    endpoint: /contract/receiver-match-task/task-accept
+    doc_id: 502-4
+    event: common\components\Contract\Event\AfterAcceptPublisherInviteEvent
+    request: {task_sn: "{{state.task_sn}}"}
+    push: {to: publisher, type: CONTRACT_RECEIVER_ACCEPT_INVITE}
+    preconditions: [發案者已邀請該接案者]
+    side_effects: []
+
+  T3a_publisher_accept_apply:
+    system: contract
+    summary: 發案者同意接案者申請（錄取）
+    actor: publisher
+    method: POST
+    endpoint: /contract/task-match/accept
+    doc_id: 407-1
+    event: common\components\Contract\Event\AfterAcceptReceiverApplyEvent
+    request: {task_sn: "{{state.task_sn}}", receiver_id: "{{receiver.user_id}}"}
+    push: {to: receiver, type: CONTRACT_PUBLISHER_ACCEPT_APPLY}
+    preconditions: [接案者已申請（T2）]
+    side_effects: []
+
+  T3b_publisher_decline_apply:
+    system: contract
+    summary: 發案者婉拒接案者申請
+    actor: publisher
+    method: POST
+    endpoint: /contract/task-match/decline
+    doc_id: 407-2
+    event: common\components\Contract\Event\AfterDeclineReceiverApplyEvent
+    request: {task_sn: "{{state.task_sn}}", receiver_id: "{{receiver.user_id}}"}
+    push: {to: receiver, type: CONTRACT_PUBLISHER_DECLINE_APPLY}
+    preconditions: [接案者已申請（T2）]
+    side_effects: []
+
+  T4_publisher_cancel_hire:
+    system: contract
+    summary: 發案者取消錄取
+    actor: publisher
+    method: POST
+    endpoint: /contract/task-match/cancel-hire
+    doc_id: 407-4
+    event: common\components\Contract\Event\AfterCancelHireReceiverApplyEvent
+    request: {task_sn: "{{state.task_sn}}", receiver_id: "{{receiver.user_id}}"}
+    push: {to: receiver, type: CONTRACT_PUBLISHER_CANCEL_HIRE}
+    preconditions: [已錄取接案者（T3a）]
+    side_effects: []
+
+  T5_receiver_cancel_task:
+    system: contract
+    summary: 接案者取消任務
+    actor: receiver
+    method: POST
+    endpoint: /contract/receiver-task/task-cancel
+    doc_id: "505"
+    event: common\components\Contract\Event\AfterReceiverCancelTaskEvent
+    request: {task_sn: "{{state.task_sn}}", canceled_reason_id: 1}
+    push: {to: publisher, type: CONTRACT_RECEIVER_CANCEL_TASK}
+    preconditions: [接案者已被錄取且任務尚未開始]
+    side_effects: []
+    notes: handler 依時段切換 push type；last-minute 改 CONTRACT_RECEIVER_CANCEL_TASK_LAST_MINUTE(20046)。
+
+  T6_receiver_start_task:
+    system: contract
+    summary: 接案者開始任務
+    actor: receiver
+    method: POST
+    endpoint: /contract/receiver-task/task-start
+    doc_id: 506-1
+    event: common\components\Contract\Event\AfterReceiverStartTaskEvent
+    request: {task_sn: "{{state.task_sn}}"}
+    push: {to: publisher, type: CONTRACT_RECEIVER_START_TASK}
+    preconditions: [任務已付款（pay_status=102）且已到開始時間]
+    side_effects: []
+
+  T7_receiver_end_task:
+    system: contract
+    summary: 接案者結束任務
+    actor: receiver
+    method: POST
+    endpoint: /contract/receiver-task/task-end
+    doc_id: 506-2
+    event: common\components\Contract\Event\AfterReceiverEndTaskEvent
+    request: {task_sn: "{{state.task_sn}}"}
+    push: {to: publisher, type: CONTRACT_RECEIVER_END_TASK}
+    preconditions: [任務執行中（T6 後）]
+    side_effects: []
+
+  T8_publisher_pass_task:
+    system: contract
+    summary: 發案者通過任務完成
+    actor: publisher
+    method: POST
+    endpoint: /contract/publisher/pass-receiver-task
+    doc_id: 408-2
+    event: common\components\Contract\Event\AfterPassReceiverTaskEvent
+    request: {task_sn: "{{state.task_sn}}", receiver_id: "{{receiver.user_id}}"}
+    push: {to: receiver, type: CONTRACT_PUBLISHER_PASS_TASK}
+    preconditions: [接案者已回報結束（T7）]
+    side_effects: []
+
+  T8b_publisher_reject_task:
+    system: contract
+    summary: 發案者駁回任務完成
+    actor: publisher
+    method: POST
+    endpoint: /contract/publisher/reject-receiver-task
+    doc_id: 408-3
+    event: common\components\Contract\Event\AfterRejectReceiverTaskEvent
+    request: {task_sn: "{{state.task_sn}}", receiver_id: "{{receiver.user_id}}"}
+    push: {to: receiver, type: CONTRACT_PUBLISHER_REJECT_TASK}
+    preconditions: [接案者已回報結束（T7）]
+    side_effects: []
+
+  # ===========================================================================
+  # 工作系統 job（J1–J7）— enum 已對源碼確認（next-v31x）
+  # ===========================================================================
+  J1_employer_publish_job:
+    system: job
+    summary: 商家發佈工作
+    actor: employer
+    method: POST
+    endpoint: /employer/shop/job/publish
+    doc_id: 109-1
+    event: ""
+    request:
+      shop_id: "{{employer.shop_id}}"
+      job_sn: ""
+      job_type_level1: 23
+      job_type_level2: 24
+      job_type_level3: 25
+      start_date_list: ["{{state.job_start_date}}"]
+      start_time_period: "{{state.job_start_period}}"
+      end_time_period: "{{state.job_end_period}}"
+      work_minutes: "{{state.job_work_minutes}}"   # 必須 == (end-start)-rest，否則 20030
+      rest_minutes: 0
+      recruit_count: 1
+      match_target_favor: 0
+      hourly_wage: 250                              # 不可低於 230（20011）
+      city_id: 19
+      district_id: 193
+      address: "回歸測試地址 {{state.run_id}}"
+      labor_insurance_deduction_type: 1
+      cover_photo: ""
+      photos: []
+      description: "regression job {{state.run_id}}"
+      remarks: ""
+      workflow: ""
+      teaching: ""
+      emergency_contact_phone: ""
+      contact_time: ""
+      payment_method_id: 1                          # 信用卡（dev 不真扣款）
+      custom_name: 回歸測試工作
+      confirm_item: []
+      skill_tags: []
+      benefit_tags: []
+    saves:
+      job_sn: job_sn_list.0
+    push: null
+    preconditions: [雇主已登入且店鋪已驗證]
+    side_effects:
+      - table: s_jobs
+        key: "job_sn='{{state.job_sn}}'"
+        become: {status: 1}                         # JobStatus 媒合中
+        note: 建立工作
+
+  J2_labor_apply:
+    system: job
+    summary: 打工夥伴申請上工
+    actor: labor
+    method: POST
+    endpoint: /labor/job-match/job-apply
+    doc_id: 210-1
+    event: common\components\Event\Events\LaborJobApplyFinishedEvent
+    request: {job_sn: "{{state.job_sn}}"}
+    push: {to: employer, type: LABOR_JOB_APPLY}
+    preconditions: [工作媒合中（J1）]
+    side_effects:
+      - table: s_labor_match_jobs
+        key: "job_id=(SELECT id FROM s_jobs WHERE job_sn='{{state.job_sn}}') AND labor_id={{labor.user_id}}"
+        become: {status: 4}                         # STATUS_LABOR_APPLY
+
+  J2b_labor_cancel_apply:
+    system: job
+    summary: 打工夥伴取消申請
+    actor: labor
+    method: POST
+    endpoint: /labor/job-match/job-apply/cancel
+    doc_id: 210-2
+    event: ""
+    request: {job_sn: "{{state.job_sn}}"}
+    push: null
+    preconditions: [已申請（J2，status=4）或備取中（16）]
+    side_effects:
+      - table: s_labor_match_jobs
+        key: "job_id=(SELECT id FROM s_jobs WHERE job_sn='{{state.job_sn}}') AND labor_id={{labor.user_id}}"
+        become: {status: 5}                         # STATUS_LABOR_CANCEL_APPLICATION
+
+  J3_employer_accept:
+    system: job
+    summary: 商家同意上工（錄取）
+    actor: employer
+    method: POST
+    endpoint: /employer/shop/job-match/accept
+    doc_id: 120-1
+    event: common\components\Event\Events\AfterEmployerJobMatchAcceptEvent
+    request: {job_sn: "{{state.job_sn}}", labor_id: "{{labor.user_id}}"}
+    push: {to: labor, type: EMPLOYER_ACCEPT_APPLY}
+    preconditions: [打工夥伴已申請（J2，status=4）]
+    side_effects:
+      - table: s_labor_jobs
+        key: "job_id=(SELECT id FROM s_jobs WHERE job_sn='{{state.job_sn}}') AND labor_id={{labor.user_id}}"
+        become: {status: 1, job_status: 1}          # 上工 / 待上工（建立 s_labor_jobs）
+        note: 招募額滿時 s_jobs.status→15（招募結束）
+
+  J3b_employer_decline:
+    system: job
+    summary: 商家婉拒上工
+    actor: employer
+    method: POST
+    endpoint: /employer/shop/job-match/decline
+    doc_id: 120-2
+    event: ""
+    request: {job_sn: "{{state.job_sn}}", labor_id: "{{labor.user_id}}"}
+    push: {to: labor, type: EMPLOYER_DECLINE_APPLY}
+    preconditions: [打工夥伴已申請（J2，status=4）或備取（16）]
+    side_effects:
+      - table: s_labor_match_jobs
+        key: "job_id=(SELECT id FROM s_jobs WHERE job_sn='{{state.job_sn}}') AND labor_id={{labor.user_id}}"
+        become: {status: 7}                         # STATUS_EMPLOYER_DECLINE
+
+  J4_employer_cancel_hire:
+    system: job
+    summary: 商家取消錄取
+    actor: employer
+    method: POST
+    endpoint: /employer/shop/job-match/cancel-hire
+    doc_id: 120-3
+    event: ""
+    request: {job_sn: "{{state.job_sn}}", labor_id: "{{labor.user_id}}", canceled_reason_id: 1}
+    push: {to: labor, type: EMPLOYER_CANCEL_HIRE_APPLY}
+    preconditions: [已錄取（J3，s_labor_jobs.status=1）]
+    side_effects:
+      - table: s_labor_match_jobs
+        key: "job_id=(SELECT id FROM s_jobs WHERE job_sn='{{state.job_sn}}') AND labor_id={{labor.user_id}}"
+        become: {status: 10}                        # STATUS_EMPLOYER_CANCEL_HIRE
+      - table: s_labor_jobs
+        key: "job_id=(SELECT id FROM s_jobs WHERE job_sn='{{state.job_sn}}') AND labor_id={{labor.user_id}}"
+        become: {status: 10}                        # STATUS_EMPLOYER_CANCEL_HIRE；s_jobs.recruited_count-1
+
+  J5_labor_clock_in:
+    system: job
+    summary: 打工夥伴上班打卡
+    actor: labor
+    method: POST
+    endpoint: /labor/job/clock-in
+    doc_id: "213"
+    event: ""
+    request: {job_sn: "{{state.job_sn}}", code: "{{state.start_code}}"}
+    push: {to: employer, type: LABOR_CLOCK_IN}
+    preconditions:
+      - 已錄取（J3，s_labor_jobs.job_status=1 待上工、actual_clock_in_at 空）
+      - "打卡碼 code 須等於 s_labor_jobs.start_code（測試用 db_exec 塞碼）"
+      - "現在須在 end_at-24h 之後（測試用 db_exec 把 end_at 拉近）"
+    side_effects:
+      - table: s_labor_jobs
+        key: "job_id=(SELECT id FROM s_jobs WHERE job_sn='{{state.job_sn}}') AND labor_id={{labor.user_id}}"
+        become: {job_status: 2}                     # STATUS_WORKING；寫 actual_clock_in_at
+
+  J6_labor_clock_out:
+    system: job
+    summary: 打工夥伴下班打卡
+    actor: labor
+    method: POST
+    endpoint: /labor/job/clock-out
+    doc_id: "214"
+    event: ""
+    request: {job_sn: "{{state.job_sn}}", code: "{{state.end_code}}"}
+    push: {to: employer, type: LABOR_CLOCK_OUT}
+    preconditions:
+      - 已上班打卡（J5，job_status=2、actual_clock_out_at 空）
+      - "打卡碼 code 須等於 s_labor_jobs.end_code"
+    side_effects:
+      - table: s_labor_jobs
+        key: "job_id=(SELECT id FROM s_jobs WHERE job_sn='{{state.job_sn}}') AND labor_id={{labor.user_id}}"
+        become: {job_status: 3}                     # STATUS_WORK_FINISHED；寫 actual_clock_out_at
+
+  J7_labor_cancel_job:
+    system: job
+    summary: 打工夥伴取消工作
+    actor: labor
+    method: POST
+    endpoint: /labor/job/cancel
+    doc_id: "209"
+    event: ""
+    request: {job_sn: "{{state.job_sn}}", canceled_reason_id: 1}
+    push: {to: employer, type: LABOR_JOB_CANCELED}
+    preconditions:
+      - 已錄取（J3，s_labor_jobs.status=1 上工）
+      - "現在須早於 s_jobs.start_at（工作開始前才可取消）"
+    side_effects:
+      - table: s_labor_jobs
+        key: "job_id=(SELECT id FROM s_jobs WHERE job_sn='{{state.job_sn}}') AND labor_id={{labor.user_id}}"
+        become: {status: 9}                         # STATUS_LABOR_CANCEL
+      - table: s_labor_match_jobs
+        key: "job_id=(SELECT id FROM s_jobs WHERE job_sn='{{state.job_sn}}') AND labor_id={{labor.user_id}}"
+        become: {status: 9}                         # STATUS_LABOR_CANCEL；s_jobs.recruited_count-1
+    notes: 招募截止前的 push 改 LABOR_JOB_CANCELED_BEFORE_RECRUIT_DEADLINE(10026)。

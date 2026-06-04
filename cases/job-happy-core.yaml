@@ -1,0 +1,47 @@
+id: job-happy-core
+description: >
+  「工作」系統核心 happy path：商家發佈工作 → 打工夥伴申請上工 → 商家同意上工。
+  三層驗證 HTTP / 推播 / DB 副作用。打卡與結算（J5/J6）因需時間與打卡碼操作，
+  之後另開 path（會用 db_exec 把 start_at 拉到當下並寫 start_code）。
+
+path:
+  # J1 商家發佈工作（status=1 媒合中），存下 job_sn
+  - transition: J1_employer_publish_job
+    save:
+      job_sn: job_sn_list.0
+    expect:
+      http: 200
+      state:
+        sql: "SELECT status FROM s_jobs WHERE job_sn='{{state.job_sn}}'"
+        equals:
+          status: 1                      # Task/JobStatus MATCHING
+
+  # J2 打工夥伴申請上工 → 商家收 LABOR_JOB_APPLY(10021)，媒合列 status=4
+  - transition: J2_labor_apply
+    expect:
+      http: 200
+      push:
+        # 推播給 employer（pushes_to=employer）
+      state:
+        sql: >
+          SELECT status FROM s_labor_match_jobs
+          WHERE job_id=(SELECT id FROM s_jobs WHERE job_sn='{{state.job_sn}}')
+            AND labor_id={{labor.user_id}}
+        equals:
+          status: 4                      # LaborMatchJob STATUS_LABOR_APPLY
+
+  # J3 商家同意上工 → 打工夥伴收 EMPLOYER_ACCEPT_APPLY(20016)
+  # 副作用：建立 s_labor_jobs（status=1 上工, job_status=1 待上工）
+  - transition: J3_employer_accept
+    expect:
+      http: 200
+      push:
+        # 推播給 labor（pushes_to=labor）
+      state:
+        sql: >
+          SELECT status, job_status FROM s_labor_jobs
+          WHERE job_id=(SELECT id FROM s_jobs WHERE job_sn='{{state.job_sn}}')
+            AND labor_id={{labor.user_id}}
+        equals:
+          status: 1                      # LaborJob STATUS_GO_TO_WORK
+          job_status: 1                  # LaborJobStatus WAITING_FOR_WORK
