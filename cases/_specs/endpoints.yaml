@@ -441,7 +441,7 @@ task_units:
         expect_fail: {code: 30301}                  # LABOR_DENIED_DUE_TO_BLOCKLIST
         arrange: {note: "需商家把該夥伴加入黑名單"}
       - when: 重複申請（已申請過）
-        expect_fail: {message_contains: "工作已申請成功"}
+        expect_fail: {message_contains: "已在申請中"}
         arrange: {by: [J2_labor_apply]}
       - when: 招募人數已滿
         expect_fail: {message_contains: "招募人數已滿"}
@@ -503,13 +503,13 @@ task_units:
         arrange: {db_exec: "UPDATE s_jobs SET recruit_deadline=UNIX_TIMESTAMP()-1 WHERE job_sn='{{state.job_sn}}'"}
       - when: 該夥伴已取消申請
         expect_fail: {code: 20309}                  # ACCEPT_AUDIT_STATUS_LABOR_CANCEL
-        arrange: {by: [J2_labor_apply, J2b_labor_cancel_apply]}
+        arrange: {by: [J2b_labor_cancel_apply]}
       - when: 該夥伴已被錄取（重複錄取）
         expect_fail: {code: 20310}                  # ACCEPT_AUDIT_STATUS_EMPLOYER_ACCEPT
-        arrange: {by: [J2_labor_apply, J3_employer_accept]}
+        arrange: {by: [J3_employer_accept]}
       - when: 該夥伴已被婉拒
         expect_fail: {code: 20311}                  # ACCEPT_AUDIT_STATUS_EMPLOYER_DECLINE
-        arrange: {by: [J2_labor_apply, J3b_employer_decline]}
+        arrange: {by: [J3b_employer_decline]}
       - when: 被錄取夥伴當日在該店已有工作
         expect_fail: {code: 30213}                  # LABOR_HAS_JOB_ON_THE_SAME_DAY_AT_THE_SHOP
         arrange: {note: "同店同日先讓該夥伴錄取另一份"}
@@ -538,10 +538,10 @@ task_units:
     branches:
       - when: 該夥伴已被婉拒（重複婉拒）
         expect_fail: {code: 20311}                  # ACCEPT_AUDIT_STATUS_EMPLOYER_DECLINE
-        arrange: {by: [J2_labor_apply, J3b_employer_decline]}
+        arrange: {by: [J3b_employer_decline]}
       - when: 該夥伴已取消申請
         expect_fail: {code: 20309}                  # ACCEPT_AUDIT_STATUS_LABOR_CANCEL
-        arrange: {by: [J2_labor_apply, J2b_labor_cancel_apply]}
+        arrange: {by: [J2b_labor_cancel_apply]}
     side_effects:
       - table: s_labor_match_jobs
         key: "job_id=(SELECT id FROM s_jobs WHERE job_sn='{{state.job_sn}}') AND labor_id={{labor.user_id}}"
