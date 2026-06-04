@@ -168,6 +168,12 @@ class QAStore:
                 "started_at": run["started_at"], "failed_at": run["failed_at"], "steps": steps,
             }
 
+    def case_seq(self, case_id: str) -> int | None:
+        """用例的數字序號（並存於 slug id 之外，僅顯示用）。"""
+        with self._engine.connect() as conn:
+            v = conn.execute(text("SELECT seq FROM qa_cases WHERE id=:c"), {"c": case_id}).scalar()
+            return int(v) if v is not None else None
+
     def case_id_exists(self, case_id: str) -> bool:
         with self._engine.connect() as conn:
             return conn.execute(text(

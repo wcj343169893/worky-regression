@@ -41,6 +41,8 @@ class QACase(Base):
     __tablename__ = "qa_cases"
 
     id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    # 人類可讀的 slug 主鍵之外，並存一個自動遞增數字序號（顯示用 #1 #2…；run_id 仍用 slug）
+    seq: Mapped[int] = mapped_column(BigInteger, autoincrement=True, unique=True, nullable=False)
     file: Mapped[str] = mapped_column(String(255), nullable=False, server_default="")
     system: Mapped[str] = mapped_column(String(16), nullable=False, server_default="")
     source: Mapped[str] = mapped_column(String(16), nullable=False, server_default="builtin")
