@@ -1,0 +1,39 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Worky 後台</title>
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+  <div class="aurora"></div>
+
+  <header class="topbar">
+    <div class="brand">
+      <div class="logo">W</div>
+      <div class="brand-text">
+        <h1>Worky 後台</h1>
+        <p class="sub" id="db-sub">—</p>
+      </div>
+    </div>
+    <nav class="nav" id="nav"></nav>
+    <div class="topbar-actions">
+      <span class="clock" id="clock">--:--:--</span>
+      <button class="btn ghost" id="refresh-btn" title="重新整理">⟳</button>
+    </div>
+  </header>
+
+  <main class="content" id="view"></main>
+
+  <!-- 詳情彈窗（預設隱藏，點清單列才滑出）-->
+  <div class="drawer-mask" id="drawer-mask"></div>
+  <aside class="drawer" id="drawer" role="dialog" aria-modal="true">
+    <button class="btn ghost icon drawer-close" id="drawer-close" title="關閉 (Esc)">✕</button>
+    <div class="drawer-body" id="drawer-body"></div>
+  </aside>
+
+  <div class="toast" id="toast" hidden></div>
+  <script src="/static/app.js"></script>
+</body>
+</html>
