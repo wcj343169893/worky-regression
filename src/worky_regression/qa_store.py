@@ -13,7 +13,7 @@ import json
 import secrets
 from typing import Any
 
-from sqlalchemy import text
+from sqlalchemy import bindparam, text
 
 from .config import Settings
 from . import qa_models
@@ -53,16 +53,17 @@ class QAStore:
                 "source": c.get("source", "builtin"), "description": c.get("description", ""),
                 "step_count": int(c.get("step_count", 0)), "yaml": c.get("yaml", ""),
                 "created_at": int(c.get("created_at", 0)),
+                "parent_id": c.get("parent_id"),   # 頂層用例為 None
             })
         if not rows:
             return
         sql = text("""
-            INSERT INTO qa_cases (id, file, `system`, source, description, step_count, yaml, created_at)
-            VALUES (:id, :file, :system, :source, :description, :step_count, :yaml, :created_at)
+            INSERT INTO qa_cases (id, file, `system`, source, description, step_count, yaml, created_at, parent_id)
+            VALUES (:id, :file, :system, :source, :description, :step_count, :yaml, :created_at, :parent_id)
             ON DUPLICATE KEY UPDATE
               file=VALUES(file), `system`=VALUES(`system`), source=VALUES(source),
               description=VALUES(description), step_count=VALUES(step_count),
-              yaml=VALUES(yaml), created_at=VALUES(created_at)
+              yaml=VALUES(yaml), created_at=VALUES(created_at), parent_id=VALUES(parent_id)
         """)
         with self._engine.begin() as conn:
             conn.execute(sql, rows)
@@ -178,3 +179,22 @@ class QAStore:
         with self._engine.connect() as conn:
             return conn.execute(text(
                 "SELECT 1 FROM qa_cases WHERE id=:c LIMIT 1"), {"c": case_id}).first() is not None
+
+    # ── 子用例（主任務/子任務下鑽）─────────────────────────────────────────────
+    def child_count(self, parent_id: str) -> int:
+        """指定父用例的直接子用例數（parent_id 非保留字，不需反引號）。"""
+        with self._engine.connect() as conn:
+            return int(conn.execute(text(
+                "SELECT COUNT(*) FROM qa_cases WHERE parent_id=:p"), {"p": parent_id}).scalar() or 0)
+
+    def child_counts(self, ids: list[str]) -> dict[str, int]:
+        """批次查多個父用例的子用例數（避免清單 N+1）；回傳 {parent_id: count}。"""
+        ids = [i for i in ids if i]
+        if not ids:
+            return {}
+        with self._engine.connect() as conn:
+            rows = conn.execute(text(
+                "SELECT parent_id, COUNT(*) AS n FROM qa_cases "
+                "WHERE parent_id IN :ids GROUP BY parent_id"
+            ).bindparams(bindparam("ids", expanding=True)), {"ids": ids}).all()
+            return {r[0]: int(r[1]) for r in rows}

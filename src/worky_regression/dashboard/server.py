@@ -137,7 +137,8 @@ class Handler(BaseHTTPRequestHandler):
                     system=_one(query, "system", "") or None,
                     q=_one(query, "q", ""),
                     limit=_int(query, "limit", 20),
-                    offset=_int(query, "offset", 0)))
+                    offset=_int(query, "offset", 0),
+                    parent_id=_one(query, "parent_id", "__root__")))
             elif path.startswith("/api/cases/") and path.endswith("/steps"):
                 cid = path[len("/api/cases/"):-len("/steps")]
                 data = _cases().case_steps(cid)

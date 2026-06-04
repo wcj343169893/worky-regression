@@ -100,6 +100,18 @@ textarea:focus{outline:none;border-color:var(--accent)}
 .cases-page .ai-panel{flex:none;margin-bottom:0}
 .cases-list{flex:1;min-height:0;display:flex;flex-direction:column}
 .cases-list .table-wrap{max-height:none;flex:1}
+/* 主任務/子任務下鑽：麵包屑（頂層不渲染）。可點層為 button，當前層為弱化文字 */
+.crumbs{display:flex;align-items:center;flex-wrap:wrap;gap:6px;
+  padding:10px 14px 0;font-size:13px}
+.crumbs:empty{display:none}
+.crumb{appearance:none;cursor:pointer;border:0;background:transparent;
+  color:var(--accent);font-size:13px;font-weight:600;padding:0}
+.crumb:hover{text-decoration:underline}
+.crumb.cur{color:var(--txt);cursor:default;font-weight:700}
+.crumb-sep{color:var(--muted)}
+/* 「子任務(n)」按鈕：沿用 .btn，小尺寸、用 accent2 點綴與查看/執行區分 */
+.sub-btn{padding:5px 9px;font-size:12px}
+.sub-btn:hover{background:var(--accent2);border-color:var(--accent2);color:#fff}
 /* AI 分解領域 tab 列：沿用 .nav button / .pill 視覺語彙，active 態用 accent 漸層 */
 .dc-tabs{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:12px}
 .dc-tab{appearance:none;cursor:pointer;display:inline-flex;align-items:center;gap:6px;

@@ -60,6 +60,8 @@ def _case_record(path: Path, source: str, spec: dict) -> dict:
         created = int(path.stat().st_mtime)
     except OSError:
         created = 0
+    # 父用例 id 來自 spec 的 parent 欄；無則頂層（None）
+    parent = spec.get("parent")
     return {
         "id": _case_id(spec, path),
         "file": path.name,
@@ -69,6 +71,7 @@ def _case_record(path: Path, source: str, spec: dict) -> dict:
         "step_count": len(spec.get("path", [])),
         "yaml": path.read_text(encoding="utf-8"),
         "created_at": created,
+        "parent_id": str(parent) if parent else None,
     }
 
 
@@ -79,17 +82,36 @@ class CaseStore:
 
     # ── 清單 ─────────────────────────────────────────────────────────────────
     def list_cases(self, system: str | None = None, q: str = "",
-                   limit: int = 20, offset: int = 0) -> dict:
+                   limit: int = 20, offset: int = 0,
+                   parent_id: str = "__root__") -> dict:
+        """列用例。
+
+        parent_id：
+          - "__root__"（預設）→ 只回頂層用例（parent_id 為空者）。
+          - 具體 id → 只回該父用例的直接子用例。
+        每筆 item 附 parent_id 與 child_count，供前端決定是否顯示「子任務」按鈕。
+        """
         ql = q.lower().strip()
         records: list[tuple[dict, dict]] = []   # (case_record, spec)
+        child_counts: dict[str, int] = {}        # parent_id → 直接子用例數（依 YAML 全集計）
         for path, source in _case_files():
             spec = _load_yaml(path)
             if spec is None:
                 continue
             rec = _case_record(path, source, spec)
+            # 子用例數以 YAML 全集為準（不受 system/q/parent 過濾影響），避免「子用例尚未
+            # 入庫 → child_count 為 0 → 按鈕不出現 → 無法下鑽 → 永不入庫」的死結
+            if rec["parent_id"]:
+                child_counts[rec["parent_id"]] = child_counts.get(rec["parent_id"], 0) + 1
             if system and rec["system"] != system:
                 continue
             if ql and ql not in (rec["id"] + " " + rec["description"]).lower():
+                continue
+            # parent 過濾在記憶體做（與 system/q 同層）：頂層只看 parent 為空者，否則看指定父
+            if parent_id == "__root__":
+                if rec["parent_id"]:
+                    continue
+            elif rec["parent_id"] != parent_id:
                 continue
             records.append((rec, spec))
         # 用例註冊：把（過濾後）用例 upsert 進 qa_cases，保證每筆用例都有 id
@@ -103,6 +125,7 @@ class CaseStore:
             "source": rec["source"],
             "created_at": rec["created_at"],
             "step_count": rec["step_count"],
+            "parent_id": rec["parent_id"],
             "transitions": _transitions(spec),
         } for rec, spec in records]
         # 依建立時間（檔案 mtime）倒序；同時間以 id 穩定排序
@@ -115,6 +138,7 @@ class CaseStore:
             it["seq"] = self.qa.case_seq(it["id"])
             it["last_result"] = self.qa.latest_summary(it["id"])
             it["run_count"] = self.qa.run_count(it["id"])
+            it["child_count"] = child_counts.get(it["id"], 0)
         return {"items": page, "total": total}
 
     # ── 詳情 ─────────────────────────────────────────────────────────────────

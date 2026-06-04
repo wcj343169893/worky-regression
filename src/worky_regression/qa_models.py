@@ -50,8 +50,12 @@ class QACase(Base):
     step_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
     yaml: Mapped[str | None] = mapped_column(LONGTEXT)
     created_at: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    # 父用例 id（主任務/子任務下鑽用）；頂層用例為 NULL
+    parent_id: Mapped[str | None] = mapped_column(String(128))
     updated_at: Mapped[datetime] = mapped_column(
         server_default=func.current_timestamp(), onupdate=func.current_timestamp())
+
+    __table_args__ = (Index("idx_parent", "parent_id"),)
 
 
 class QARun(Base):

@@ -65,8 +65,11 @@ function caseDetailHtml(d) {
 export async function renderCases(key) {
   const cfg = CASES[key];
   // system 為頁內狀態（"" = 全部），由 AI 分解 tab 控制；tab 記住當前選中的領域 key
-  const s = state[key] || (state[key] = { q: "", page: 0, system: "", tab: "all" });
+  // stack/parentId：主任務→子任務下鑽用的麵包屑堆疊與當前層父 id（頂層為 null）
+  const s = state[key] || (state[key] = { q: "", page: 0, system: "", tab: "all", stack: [], parentId: null });
   if (s.tab == null) s.tab = "all";
+  if (s.stack == null) s.stack = [];
+  if (s.parentId === undefined) s.parentId = null;
   const cur = tabByKey(s.tab);
   const tabsHtml = DECOMPOSE_TABS.map((t) =>
     `<button class="dc-tab${t.key === cur.key ? " active" : ""}" data-tab="${esc(t.key)}">${esc(t.label)}${t.planned ? `<span class="dc-soon">規劃中</span>` : ""}</button>`
@@ -86,6 +89,7 @@ export async function renderCases(key) {
         </div>
       </div>
       <div class="card cases-list">
+        <div class="crumbs" id="crumbs"></div>
         <div class="panel-head"><h3>用例清單</h3>
           <input type="search" id="q" placeholder="搜尋 名稱 / 描述…" value="${esc(s.q)}" /></div>
         <div class="table-wrap"><table>
@@ -101,14 +105,15 @@ export async function renderCases(key) {
         </div>
       </div>
     </div>`;
-  let t; $("q").oninput = (e) => { clearTimeout(t); s.q = e.target.value; t = setTimeout(() => { s.page = 0; loadCases(key); }, 300); };
+  // 搜尋：回首頁並回到頂層（清空下鑽堆疊），讓搜尋語意一致
+  let t; $("q").oninput = (e) => { clearTimeout(t); s.q = e.target.value; t = setTimeout(() => { resetToRoot(s); loadCases(key); }, 300); };
   $("uc-go").onclick = () => doDecompose(key);
-  // 切 tab：①切換目標 system + placeholder ②回首頁重載清單 ③更新 active 樣式
+  // 切 tab：①切換目標 system + placeholder ②回頂層 + 首頁重載清單 ③更新 active 樣式
   $("view").querySelectorAll(".dc-tab").forEach((b) => b.onclick = () => {
     const t2 = tabByKey(b.dataset.tab);
     s.tab = t2.key;
     s.system = t2.system;            // all → ""，loadCases 空 system 即不帶篩選
-    s.page = 0;
+    resetToRoot(s);                  // 切 tab 回頂層，篩選語意一致
     const ucEl = $("uc"); if (ucEl) ucEl.placeholder = t2.ph;
     $("view").querySelectorAll(".dc-tab").forEach((x) =>
       x.classList.toggle("active", x.dataset.tab === t2.key));
@@ -117,11 +122,55 @@ export async function renderCases(key) {
   loadCases(key);
 }
 
+// ── 主任務/子任務下鑽：堆疊 + 麵包屑 ────────────────────────────────────────
+// 回到頂層：清空下鑽堆疊與當前父 id，並回到第一頁
+function resetToRoot(s) { s.stack = []; s.parentId = null; s.page = 0; }
+
+// 下鑽進某用例的子清單：把當前層 push 進堆疊，切到該用例為新父層，回第一頁
+function drillInto(key, c) {
+  const s = state[key];
+  s.stack.push({ id: c.id, label: c.id });
+  s.parentId = c.id;
+  s.page = 0;
+  loadCases(key);
+}
+
+// 麵包屑點某層：pop 到該層（idx = -1 代表回頂層「測試用例」）
+function popTo(key, idx) {
+  const s = state[key];
+  s.stack = s.stack.slice(0, idx + 1);
+  s.parentId = s.stack.length ? s.stack[s.stack.length - 1].id : null;
+  s.page = 0;
+  loadCases(key);
+}
+
+// 渲染麵包屑：頂層只顯示「測試用例」（不可點）；下鑽後逐層可點返回
+function renderCrumbs(key) {
+  const el = $("crumbs");
+  if (!el) return;
+  const s = state[key];
+  if (!s.stack.length) { el.innerHTML = ""; return; }   // 頂層不顯示麵包屑
+  const parts = [`<button class="crumb" data-idx="-1">測試用例</button>`];
+  s.stack.forEach((node, i) => {
+    parts.push(`<span class="crumb-sep">/</span>`);
+    const last = i === s.stack.length - 1;
+    parts.push(last
+      ? `<span class="crumb cur">${esc(node.label)}</span>`
+      : `<button class="crumb" data-idx="${i}">${esc(node.label)}</button>`);
+  });
+  el.innerHTML = parts.join("");
+  el.querySelectorAll(".crumb[data-idx]").forEach((b) =>
+    b.onclick = () => popTo(key, Number(b.dataset.idx)));
+}
+
 async function loadCases(key) {
   stepCache = {};  // 列表重載（含重跑後）→ 清掉步驟詳情快取，確保 modal 拿到最新結果
   const cfg = CASES[key], s = state[key];
   const params = new URLSearchParams({ q: s.q || "", limit: PAGE, offset: s.page * PAGE });
   if (s.system) params.set("system", s.system);  // 空 = 全部，不帶 system（後端支援 system=None）
+  // 下鑽時帶當前層父 id；頂層帶 __root__（後端預設只回頂層用例）
+  params.set("parent_id", s.parentId || "__root__");
+  renderCrumbs(key);
   if ($("rows")) $("rows").style.opacity = ".45";
   const data = await api("/api/cases?" + params).catch((e) => (toast(e.message), null));
   if (!data || !$("rows")) return;
@@ -158,11 +207,14 @@ function renderCaseRows(key, items) {
       <td class="act">
         <button class="btn view-btn" data-id="${esc(c.id)}">查看</button>
         <button class="btn run-btn" data-id="${esc(c.id)}">執行</button>
+        ${c.child_count > 0 ? `<button class="btn sub-btn" data-id="${esc(c.id)}">子任務(${c.child_count})</button>` : ""}
       </td></tr>`;
   }).join("");
   tb.style.opacity = "1";
   tb.querySelectorAll(".view-btn").forEach((b) => b.onclick = () => openCaseDetail(b.dataset.id));
   tb.querySelectorAll(".run-btn").forEach((b) => b.onclick = () => runCase(key, b));
+  // 子任務：下鑽到該用例的子清單（遞迴天然成立——子層列同樣會帶 child_count）
+  tb.querySelectorAll(".sub-btn").forEach((b) => b.onclick = () => drillInto(key, { id: b.dataset.id }));
   tb.querySelectorAll(".tchip.clickable").forEach((ch) =>
     ch.onclick = () => openStepModal(ch.dataset.cid, Number(ch.dataset.ti)));
 }
