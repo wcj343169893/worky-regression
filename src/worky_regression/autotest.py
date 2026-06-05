@@ -82,17 +82,24 @@ def ensure_publisher_invoice(actor: Actor) -> None:
         )
 
 
-def _actors_for(system: str, s: Settings) -> dict[str, Actor]:
-    """依系統登入對應角色（承攬制 publisher 會做發票 preflight）。"""
+def _actors_for(system: str, s: Settings,
+                exclude: dict[str, list[str]] | None = None) -> dict[str, Actor]:
+    """依系統登入對應角色（承攬制 publisher 會做發票 preflight）。
+
+    exclude：{role: [account_id,...]}，配發時跳過這些帳號（「換一個號」用，
+    只對池配發的 job/activity 角色有效；contract 為固定 audit 帳號不受影響）。
+    """
     accounts = yaml.safe_load(ACCOUNTS.read_text(encoding="utf-8"))
+    exclude = exclude or {}
     if system == "job":
         # 從帳號池按「能力」配發，不再寫死 id：labor1/2/3 為三個合格夥伴（bind 切換身份），
         # employer 為已驗證店鋪商家。執行期只讀 qa_accounts，不直連工作庫挖帳號。
         pool = AccountPool(s)
         labor_caps = ["verified", "profile_complete", "audit_role", "active", "clean"]
-        labors = pool.acquire("labor", labor_caps, 2, owner="job-actors", lease=False)
+        labors = pool.acquire("labor", labor_caps, 2, owner="job-actors", lease=False,
+                              exclude=exclude.get("labor"))
         emp = pool.acquire("employer", ["active", "verified_shop"], 1,
-                           owner="job-actors", lease=False)[0]
+                           owner="job-actors", lease=False, exclude=exclude.get("employer"))[0]
         la = [_actor_from_pool(s, pa, "labor") for pa in labors]
         actors = {
             "employer": _actor_from_pool(s, emp, "employer"),
@@ -120,12 +127,12 @@ def _actors_for(system: str, s: Settings) -> dict[str, Actor]:
         # 營運活動（Activity API）唯讀查詢：打工端用 labor token、商家端用 employer token。
         pool = AccountPool(s)
         labor = pool.acquire("labor", ["audit_role", "active"], 1,
-                             owner="activity-actors", lease=False)[0]
+                             owner="activity-actors", lease=False, exclude=exclude.get("labor"))[0]
         actors = {"labor": _actor_from_pool(s, labor, "labor")}
         # 商家端活動端點（/employer/...）需要 employer；池中有就配發，沒有則略過該角色
         try:
             emp = pool.acquire("employer", ["active", "verified_shop"], 1,
-                               owner="activity-actors", lease=False)[0]
+                               owner="activity-actors", lease=False, exclude=exclude.get("employer"))[0]
             actors["employer"] = _actor_from_pool(s, emp, "employer")
         except Exception:  # noqa: BLE001 — 無合格商家帳號時，僅打工端活動可測
             pass

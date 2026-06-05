@@ -152,7 +152,7 @@ textarea:focus{outline:none;border-color:var(--accent)}
   display:none;align-items:center;justify-content:center;padding:24px}
 .modal-mask.open{display:flex;animation:fade .15s ease}
 .modal-box{position:relative;background:var(--panel);border:1px solid var(--line);
-  border-radius:var(--radius);box-shadow:var(--shadow);width:min(620px,94vw);
+  border-radius:var(--radius);box-shadow:var(--shadow);width:min(1240px,94vw);
   max-height:88vh;display:flex;flex-direction:column}
 .modal-close{position:absolute;top:12px;right:14px;z-index:2}
 .modal-body{padding:20px 22px 26px;overflow:auto}
@@ -161,6 +161,16 @@ textarea:focus{outline:none;border-color:var(--accent)}
 .sm-nav{display:flex;align-items:center;gap:12px;margin-bottom:10px}
 .sm-nav .sub2{margin-left:auto;margin-right:auto}
 .step-modal .sec code{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px;color:var(--accent)}
+/* 失敗步驟的「分析 / 重試 / 換一個號」工具列 + AI 診斷面板 */
+.sm-actions{border:1px solid var(--line);border-radius:10px;padding:12px 14px;background:rgba(255,107,107,.05)}
+.sm-act-row{display:flex;gap:8px;flex-wrap:wrap}
+.sm-act-row .btn:hover{border-color:var(--warn);color:#fff}
+.sm-fix{margin-top:10px}
+.sm-fix:empty{display:none}
+.ai-analysis{border:1px solid var(--line);border-radius:10px;padding:10px 12px;background:var(--panel2)}
+.ai-analysis .aa-cause{font-size:13px;margin-bottom:6px}
+.ai-analysis p{margin:4px 0}
+.ai-analysis .aa-action{margin-top:8px}
 .cstep{display:flex;align-items:center;gap:8px;padding:5px 0;flex-wrap:wrap}
 .cstep .ci{width:20px;text-align:right;color:var(--muted);font-size:12px}
 .cstep code{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px;color:var(--muted);word-break:break-all}

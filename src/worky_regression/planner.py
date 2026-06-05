@@ -300,6 +300,65 @@ def suggest_tab(description: str, settings: Settings | None = None) -> dict[str,
     return _suggest_tab_heuristic(desc)
 
 
+# ── AI 失敗分析（step modal 失敗時的「分析」按鈕）────────────────────────────
+_ANALYZE_SYSTEM_PROMPT = """你是 Worky 承攬制/工作系統回歸測試的失敗診斷助理。\
+使用者會給你一個「失敗步驟」的結構化情境（被測端點、預期、實際 error、observations、\
+HTTP 狀態、操作者角色等）。請判斷最可能的失敗原因並給出可執行建議，只輸出 JSON：
+{
+  "cause": "<一句話點出最可能的根因，繁體中文>",
+  "detail": "<2-4 句說明你的推理：對齊 error / observations / expect 哪裡不符>",
+  "suggestion": "<建議下一步，繁體中文>",
+  "recommended_action": "<retry|swap|inspect|report>"
+}
+recommended_action 對映：
+- retry：疑似環境/時序/快取污染等暫時性問題（如 PHP-FPM static 污染、receiver 過快、memcached），重跑可能就過。
+- swap：疑似帳號硬狀態問題（停權、能力不符、該帳號殘留資料），換一個同能力帳號重跑。
+- inspect：需人工看 YAML / 端點規格 / DB，無法靠重跑或換號解決。
+- report：疑似被測對象（worky 主倉）的 bug，應回報主倉而非在框架側處理。
+只輸出 JSON，不要任何解釋或 markdown 圍欄。"""
+
+
+def analyze_failure(context: dict[str, Any], settings: Settings | None = None) -> dict[str, Any]:
+    """把失敗步驟情境餵給 DeepSeek，回傳 {cause, detail, suggestion, recommended_action}。
+
+    需要 DEEPSEEK_API_KEY；無 key 直接拋 RuntimeError（由 server 轉成可讀錯誤）。
+    """
+    s = settings or Settings.from_env()
+    if not s.deepseek_api_key:
+        raise RuntimeError("未設定 DEEPSEEK_API_KEY（分析器停用）。請在 .env 加 DEEPSEEK_API_KEY=...")
+    try:
+        from openai import OpenAI
+    except ModuleNotFoundError as e:
+        raise RuntimeError("未安裝 openai SDK，請 `pip install -e .[ai]`") from e
+
+    client = OpenAI(api_key=s.deepseek_api_key, base_url=s.deepseek_base_url)
+    resp = client.chat.completions.create(
+        model=s.deepseek_model,
+        messages=[
+            {"role": "system", "content": _ANALYZE_SYSTEM_PROMPT},
+            {"role": "user", "content": "失敗步驟情境：\n" + json.dumps(context, ensure_ascii=False, indent=2)
+             + "\n\n只輸出符合上述格式的 JSON。"},
+        ],
+        response_format={"type": "json_object"},
+        temperature=0,
+        stream=False,
+    )
+    text = resp.choices[0].message.content or "{}"
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError as e:
+        raise RuntimeError(f"分析器回傳非合法 JSON：{e}\n原文：{text[:300]}") from e
+    action = str(data.get("recommended_action") or "inspect").strip().lower()
+    if action not in ("retry", "swap", "inspect", "report"):
+        action = "inspect"
+    return {
+        "cause": str(data.get("cause") or "").strip() or "（模型未給出明確根因）",
+        "detail": str(data.get("detail") or "").strip(),
+        "suggestion": str(data.get("suggestion") or "").strip(),
+        "recommended_action": action,
+    }
+
+
 def _expect_from_unit(name: str) -> dict[str, Any]:
     """從 spec 的 push / side_effects 自動推導一個 transition 步驟的 expect。"""
     u = unit_spec(name)

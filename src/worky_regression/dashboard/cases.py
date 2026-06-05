@@ -225,7 +225,8 @@ class CaseStore:
         }
 
     # ── 執行 / 分解（會真的打被測 API）────────────────────────────────────────
-    def _run_spec(self, spec: dict, *, source: str = "builtin", file: str = "") -> dict:
+    def _run_spec(self, spec: dict, *, source: str = "builtin", file: str = "",
+                  actors: dict | None = None) -> dict:
         from ..autotest import _actors_for
         from ..recorder import RecordingRunner
         from ..verifier import DBVerifier
@@ -240,7 +241,9 @@ class CaseStore:
             "created_at": 0,
         }])
         db = DBVerifier(self.settings.for_system(system))   # contract/job dev 分庫
-        actors = _actors_for(system, self.settings)
+        # actors 可由呼叫端覆蓋（換號時帶入「已排除原帳號」的 actors）；否則照常配發
+        if actors is None:
+            actors = _actors_for(system, self.settings)
         return RecordingRunner(db, qa_store=self.qa, system=system).run(spec, actors=actors).to_dict()
 
     def run_case(self, case_id: str) -> dict:
@@ -249,6 +252,102 @@ class CaseStore:
             raise ValueError(f"找不到用例 {case_id}")
         path, source, spec = found
         return self._run_spec(spec, source=source, file=path.name)
+
+    # ── 失敗步驟的 AI 分析 / 換號重跑（step modal「分析 / 重試 / 換一個號」）──────
+    def _failed_step(self, case_id: str, step_index: int) -> tuple[dict, dict]:
+        """回傳 (該步詳情, 整支 steps 資料)；step_index 越界則拋錯。"""
+        data = self.case_steps(case_id)
+        if data is None:
+            raise ValueError(f"找不到用例 {case_id}")
+        steps = data.get("steps") or []
+        if not (0 <= step_index < len(steps)):
+            raise ValueError(f"步驟序號 {step_index} 超出範圍（共 {len(steps)} 步）")
+        return steps[step_index], data
+
+    def analyze_failure(self, case_id: str, step_index: int) -> dict:
+        """把失敗步驟的情境餵給 AI，回傳診斷 + 建議（不自動採取行動）。"""
+        from ..planner import analyze_failure as _analyze
+
+        found = self._find(case_id)
+        if found is None:
+            raise ValueError(f"找不到用例 {case_id}")
+        _, _, spec = found
+        step, data = self._failed_step(case_id, step_index)
+        res = step.get("result") or {}
+        context = {
+            "case_id": case_id,
+            "system": data.get("system"),
+            "case_description": str(spec.get("description", "")).strip(),
+            "step_index": step_index,
+            "transition": step.get("name"),
+            "actor": step.get("actor"),
+            "method": step.get("method"),
+            "endpoint": step.get("endpoint"),
+            "doc_id": step.get("doc_id"),
+            "expect": step.get("expect"),
+            "status": res.get("status"),
+            "error": res.get("error"),
+            "observations": res.get("observations"),
+        }
+        out = _analyze(context, self.settings)
+        out["step_index"] = step_index
+        out["transition"] = step.get("name")
+        return out
+
+    @staticmethod
+    def _pool_role(actor_name: str) -> str | None:
+        """把 actor 名對映到帳號池 role；非池角色（publisher/receiver 等）回 None。"""
+        a = (actor_name or "").lower()
+        if a.startswith("labor"):
+            return "labor"
+        if a.startswith("employer"):
+            return "employer"
+        return None
+
+    def swap_account(self, case_id: str, step_index: int) -> dict:
+        """排除失敗步驟 actor 目前用的帳號，配池中另一個同能力號，整支重跑。"""
+        from ..autotest import _actors_for
+        from ..qa_accounts import PoolShortage
+
+        found = self._find(case_id)
+        if found is None:
+            raise ValueError(f"找不到用例 {case_id}")
+        path, source, spec = found
+        system = _detect_system(spec)
+        step, _ = self._failed_step(case_id, step_index)
+        actor_name = step.get("actor") or ""
+        role = self._pool_role(actor_name)
+        if system not in ("job", "activity") or role is None:
+            raise ValueError(
+                f"步驟 actor「{actor_name or '未知'}」非帳號池角色（{system} 系統），不支援換號；"
+                "contract 的 publisher/receiver 為固定 audit 帳號，請改用『重試』或回報主倉。")
+        # 先以正常配發讀出「目前會用到」的帳號（acquire 對 role 的首選），再排除它重配
+        before = _actors_for(system, self.settings)
+        cur = before.get(actor_name) or before.get(role)
+        cur_id = getattr(cur, "user_id", None)
+        if cur_id is None:
+            raise ValueError(f"無法判定 actor「{actor_name}」目前使用的帳號")
+        try:
+            swapped = _actors_for(system, self.settings, exclude={role: [str(cur_id)]})
+        except PoolShortage as e:
+            # 排除目前帳號後湊不齊本用例所需的合格帳號 —— 通常是合格號已全用於本用例、池無多餘替補。
+            # 不把原始候選清單直接丟給使用者，改回可行動的指引。
+            raise ValueError(
+                f"帳號池沒有可替換的 {role}：排除目前帳號 {cur_id} 後，剩餘符合能力的帳號不足本用例所需。\n"
+                f"通常是合格帳號已全部用於本用例、池中無多餘替補。建議：\n"
+                f"① 若疑似時序/快取污染 → 改用『重試』；\n"
+                f"② 用 provision() 補一個合格 {role} 帳號到池後再換號；\n"
+                f"③ 若疑似被測對象 bug → 回報主倉。\n"
+                f"（池配發明細：{e}）"
+            ) from e
+        new = swapped.get(actor_name) or swapped.get(role)
+        new_id = getattr(new, "user_id", None)
+        result = self._run_spec(spec, source=source, file=path.name, actors=swapped)
+        return {
+            "result": result,
+            "swapped": {"actor": actor_name, "role": role,
+                        "from": str(cur_id), "to": str(new_id) if new_id is not None else None},
+        }
 
     def _unique_case_id(self, base: str) -> str:
         """AI 產生用例時防撞號：已存在（qa_cases 或 generated/ 檔）就加 -2/-3…後綴。"""

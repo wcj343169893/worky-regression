@@ -172,6 +172,17 @@ class Handler(BaseHTTPRequestHandler):
                     self._send_json({"error": "缺少 id"}, 400)
                 else:
                     self._send_json(_cases().run_case(cid))
+            elif path in ("/api/cases/analyze", "/api/cases/swap-account"):
+                # analyze：失敗步驟的 AI 診斷（只回建議，不自動執行）
+                # swap-account：排除失敗 actor 目前帳號，配池中另一個同能力號整支重跑
+                cid = (body or {}).get("id")
+                si = _step_index(body)
+                if not cid or si is None:
+                    self._send_json({"error": "缺少 id / step_index"}, 400)
+                elif path.endswith("/analyze"):
+                    self._send_json(_cases().analyze_failure(cid, si))
+                else:
+                    self._send_json(_cases().swap_account(cid, si))
             elif path == "/api/cases/tab":
                 # 依自然語言描述，AI 產生一個分解 tab 設定（label/system/query/placeholder）
                 desc = str((body or {}).get("description", "")).strip()
@@ -223,6 +234,15 @@ _RESERVED = {"q", "limit", "offset", "category", "progress", "publisher_id"}
 def _filters(q: dict) -> dict:
     """收集非保留的 query 參數當篩選條件（service 端再以白名單過濾）。"""
     return {k: v[0] for k, v in q.items() if k not in _RESERVED and v and v[0] != ""}
+
+
+def _step_index(body: dict):
+    """從 POST body 取 step_index（int），缺失/非數字回 None。"""
+    v = (body or {}).get("step_index")
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return None
 
 
 def _int_or_none(q: dict, key: str):

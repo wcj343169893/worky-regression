@@ -93,7 +93,7 @@ function caseDetailHtml(d) {
     <div class="sec"><h4>YAML</h4><pre class="yaml">${esc(d.yaml)}</pre></div>`;
 }
 
-export async function renderCases(key) {
+export async function renderCases(key, tabKey) {
   const cfg = CASES[key];
   // system 為頁內狀態（"" = 全部），由 AI 分解 tab 控制；tab 記住當前選中的領域 key
   // stack/parentId：主任務→子任務下鑽用的麵包屑堆疊與當前層父 id（頂層為 null）
@@ -101,6 +101,10 @@ export async function renderCases(key) {
   if (s.tab == null) s.tab = "all";
   if (s.stack == null) s.stack = [];
   if (s.parentId === undefined) s.parentId = null;
+  // 由雜湊（#cases/<tabKey>）定位領域 tab：缺省視為「全部」。與當前不同才套用，
+  // 避免重新整理按鈕重渲染時誤清掉使用者正在「全部」分頁打的搜尋字。
+  const want = tabKey || "all";
+  if (want !== s.tab) applyTab(s, want);
   const cur = tabByKey(s.tab);
   // 內建 + 自訂 tab 依序渲染；自訂 tab 帶可移除的 ✕；末尾再接「＋新增」按鈕
   const tabsHtml = allTabs().map((t) =>
@@ -154,24 +158,37 @@ export async function renderCases(key) {
     e.stopPropagation();
     const dk = x.dataset.del;
     removeCustomTab(dk);
-    if (s.tab === dk) { s.tab = "all"; s.system = ""; s.q = ""; }
-    renderCases(key);
+    // 移除的若是當前 tab → 回「全部」（並同步雜湊）；否則僅重渲染 tab 列
+    if (s.tab === dk) selectTab(key, "all");
+    else renderCases(key, s.tab);
   });
   loadCases(key);
 }
 
-// 切到某 tab：套用篩選 + placeholder，回頂層後整頁重渲染。
+// 套用某 tab 的篩選到頁內狀態（不負責渲染）。
 // 篩選優先以 system 為主（結構性、可靠）；只有「無 system」的 tab 才退而用 query 文字搜尋。
 // 否則 system + query 兩個條件 AND 起來，常因 query 文字未出現在用例描述而把清單濾成空的。
-function selectTab(key, tabKey) {
-  const s = state[key], t2 = tabByKey(tabKey);
+function applyTab(s, tabKey) {
+  const t2 = tabByKey(tabKey);
   s.tab = t2.key;
   s.system = t2.system;          // all / 未判定 → ""
   // 有 system → 只用 system 篩（清空搜尋字，避免 query 再把該領域用例濾光）；
   // 無 system → query 是唯一可用的篩選依據，套用為搜尋字。
   s.q = t2.system ? "" : (t2.query || "");
   resetToRoot(s);                // 回頂層 + 首頁
-  renderCases(key);              // 重渲染：active、placeholder、搜尋框、清單一次到位
+}
+
+// 點 tab：寫入雜湊（#cases/<tabKey>，全部用乾淨的 #cases）讓網址同步、可刷新還原。
+// 雜湊變更 → hashchange → route → renderCases 自動套用；雜湊未變（重複點同 tab）則手動補渲染。
+function selectTab(key, tabKey) {
+  const t2 = tabByKey(tabKey);
+  const newHash = t2.key === "all" ? key : `${key}/${t2.key}`;
+  if (location.hash.replace("#", "") === newHash) {
+    applyTab(state[key], t2.key);
+    renderCases(key, t2.key);
+  } else {
+    location.hash = newHash;
+  }
 }
 
 // 「＋新增」彈窗：輸入描述 → POST /api/cases/tab → AI 產生 tab → 落地並切過去
@@ -299,7 +316,7 @@ function renderCaseRows(key, items) {
   // 子任務：下鑽到該用例的子清單（遞迴天然成立——子層列同樣會帶 child_count）
   tb.querySelectorAll(".sub-btn").forEach((b) => b.onclick = () => drillInto(key, { id: b.dataset.id }));
   tb.querySelectorAll(".tchip.clickable").forEach((ch) =>
-    ch.onclick = () => openStepModal(ch.dataset.cid, Number(ch.dataset.ti)));
+    ch.onclick = () => openStepModal(key, ch.dataset.cid, Number(ch.dataset.ti)));
 }
 
 async function openCaseDetail(id) {
@@ -360,6 +377,15 @@ function stepModalHtml(s, idx, total, runId) {
       ${s.summary ? `<p class="sub2">${esc(s.summary)}</p>` : ""}
     </div>
     ${sec("執行結果", resultBody)}
+    ${r && r.status === "failed" ? `<div class="sec sm-actions">
+      <h4>失敗處理（AI 協助）</h4>
+      <div class="sm-act-row">
+        <button class="btn" id="sm-analyze">🔍 分析</button>
+        <button class="btn" id="sm-retry">↻ 重試</button>
+        <button class="btn" id="sm-swap">⇄ 換一個號</button>
+      </div>
+      <div class="sm-fix" id="sm-fix"></div>
+    </div>` : ""}
     ${sec("Request", s.request ? jsonBlock(s.request) : "")}
     ${sec("預期（expect）", s.expect && Object.keys(s.expect).length ? jsonBlock(s.expect) : "")}
     ${sec("DB 副作用（side_effects）", s.side_effects ? jsonBlock(s.side_effects) : "")}
@@ -367,16 +393,61 @@ function stepModalHtml(s, idx, total, runId) {
   </div>`;
 }
 
-function showStep(cid, data, idx) {
+function showStep(key, cid, data, idx) {
   const steps = data.steps;
   idx = Math.max(0, Math.min(idx, steps.length - 1));
   openModal(stepModalHtml(steps[idx], idx, steps.length, data.run_id));
   const p = $("step-prev"), n = $("step-next");
-  if (p) p.onclick = () => showStep(cid, data, idx - 1);
-  if (n) n.onclick = () => showStep(cid, data, idx + 1);
+  if (p) p.onclick = () => showStep(key, cid, data, idx - 1);
+  if (n) n.onclick = () => showStep(key, cid, data, idx + 1);
+  // 失敗步驟才有的三顆按鈕：分析（AI 診斷，不自動執行）/ 重試（整支重跑）/ 換一個號（換池中同能力帳號重跑）
+  const aBtn = $("sm-analyze");
+  if (aBtn) aBtn.onclick = async () => {
+    const fix = $("sm-fix"); fix.innerHTML = `<div class="sub2">AI 分析中…</div>`;
+    aBtn.disabled = true;
+    try { fix.innerHTML = analysisHtml(await apiPost("/api/cases/analyze", { id: cid, step_index: idx })); }
+    catch (e) { fix.innerHTML = `<div class="err">分析失敗：${esc(e.message)}</div>`; }
+    finally { aBtn.disabled = false; }
+  };
+  const rBtn = $("sm-retry");
+  if (rBtn) rBtn.onclick = () => rerunStep(key, cid, idx, "/api/cases/run", { id: cid }, "重試");
+  const sBtn = $("sm-swap");
+  if (sBtn) sBtn.onclick = () => rerunStep(key, cid, idx, "/api/cases/swap-account", { id: cid, step_index: idx }, "換號");
 }
 
-async function openStepModal(cid, idx) {
+// AI 診斷結果渲染：根因 + 推理 + 建議 + 建議動作標籤（純顯示，不自動觸發）
+function analysisHtml(d) {
+  const actLabel = { retry: "建議：重試", swap: "建議：換一個號", inspect: "建議：人工檢查", report: "疑似主倉 bug，建議回報" };
+  return `<div class="ai-analysis">
+    <div class="aa-cause">🔍 <b>${esc(d.cause || "")}</b></div>
+    ${d.detail ? `<p class="sub2">${esc(d.detail)}</p>` : ""}
+    ${d.suggestion ? `<p class="sub2">💡 ${esc(d.suggestion)}</p>` : ""}
+    <div class="aa-action"><span class="pill">${esc(actLabel[d.recommended_action] || d.recommended_action || "")}</span></div>
+  </div>`;
+}
+
+// 重試 / 換號：真打被測 API + 寫 DB（整支重跑），完成後清快取、刷新清單、重開同一步顯示新結果
+async function rerunStep(key, cid, idx, url, body, label) {
+  const fix = $("sm-fix");
+  if (fix) fix.innerHTML = `<div class="sub2">${label}中：登入 + 呼叫被測 API，請稍候…</div>`;
+  toast(`${label}中：${cid}`);
+  try {
+    const res = await apiPost(url, body);
+    const run = res.result || res;   // swap 回 {result, swapped}；run 直接回 RunResult
+    const steps = run.steps || [];
+    const pass = steps.filter((x) => x.status === "passed").length;
+    if (res.swapped) toast(`已換號 ${res.swapped.actor}：${res.swapped.from} → ${res.swapped.to || "（無可用替補）"}`);
+    toast(`${label}結果：${run.status === "passed" ? "通過" : "失敗"}（${pass}/${steps.length}）`);
+    delete stepCache[cid];               // 清快取 → 重新抓最新步驟結果
+    if (key) loadCases(key);             // 同步刷新清單列的最近結果
+    await openStepModal(key, cid, idx);  // 重開同一步，顯示重跑後的結果
+  } catch (e) {
+    if (fix) fix.innerHTML = `<div class="err">${label}失敗：${esc(e.message)}</div>`;
+    else toast(`${label}失敗：` + e.message);
+  }
+}
+
+async function openStepModal(key, cid, idx) {
   let data = stepCache[cid];
   if (!data) {
     openModal(`<div class="empty">載入中…</div>`);
@@ -384,7 +455,7 @@ async function openStepModal(cid, idx) {
     if (!d || !d.steps) { closeModal(); return; }
     data = stepCache[cid] = d;
   }
-  showStep(cid, data, idx);
+  showStep(key, cid, data, idx);
 }
 
 async function doDecompose(key) {

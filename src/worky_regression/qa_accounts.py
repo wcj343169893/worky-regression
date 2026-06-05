@@ -71,14 +71,17 @@ class AccountPool:
 
     # ── 執行期：配發 / 歸還（只讀寫 QA 庫）──────────────────────────────────────
     def acquire(self, role: str, caps_required: list[str], n: int, *,
-                owner: str, lease_secs: int = 900, lease: bool = True) -> list[PooledAccount]:
+                owner: str, lease_secs: int = 900, lease: bool = True,
+                exclude: list[str] | None = None) -> list[PooledAccount]:
         """配發 n 個 role 帳號，需具備 caps_required 全部能力；不足則 PoolShortage。
 
         lease=True：加軟租約（available 或租約過期者可被借，借走標 leased + 到期）。
         lease=False：純選取不上鎖（同步循序執行時用，避免反覆 run 互卡）。
+        exclude：要跳過的 account_id 清單（「換一個號」用——排除目前出問題的帳號）。
         """
         now = int(time.time())
         want = set(caps_required)
+        skip = {str(x) for x in (exclude or [])}
         with self._qa_engine.begin() as conn:
             rows = conn.execute(text("""
                 SELECT id, account_id, role, user_type, phone, username, shop_id, caps, note
@@ -93,6 +96,8 @@ class AccountPool:
 
             chosen = []
             for r in rows:
+                if str(r.account_id) in skip:
+                    continue
                 if want <= set(_caps(r)):
                     chosen.append(r)
                 if len(chosen) >= n:
