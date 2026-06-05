@@ -18,6 +18,49 @@ from .verifier import DBVerifier
 VAR_PATTERN = re.compile(r"\{\{\s*([^}]+?)\s*\}\}")
 
 
+# staging 的 min_publish_interval_seconds / recruit_deadline_offset_seconds 約 600s，
+# 即工作開始時間只需比現在晚約 10 分鐘。這裡 buffer 取 900s（含請求延遲與 Python/PHP 時鐘飄移裕度）：
+# 「今天該時刻」距現在不足這個值就順延隔天，避免被後端 START_AT_IS_LESS_THAN_LIMIT 擋下。
+_TODAY_SLOT_LEAD_BUFFER = 900
+
+
+def _anchor_today_slot(now: int, hhmm: str, work_minutes: int) -> dict[str, Any]:
+    """把工作時段錨定在「今天 hhmm」；今天該時刻距現在不足 buffer 秒則順延隔天 hhmm。
+
+    用例以 ``vars: {job_start_time_of_day: "15:30"}`` opt-in；回傳會覆寫 _job_slot_vars
+    的 job_start_date / job_start_period / job_end_period / job_work_minutes。
+    """
+    h, m = (int(x) for x in hhmm.split(":"))
+    lt = time.localtime(now)
+    start = int(time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday, h, m, 0, 0, 0, -1)))
+    if start - now < _TODAY_SLOT_LEAD_BUFFER:
+        start += 86400                       # 來不及發今天 → 順延隔天同一時刻
+    end_total = h * 60 + m + work_minutes
+    return {
+        "job_start_date": int(time.strftime("%Y%m%d", time.localtime(start))),
+        "job_start_period": f"{h:02d}:{m:02d}",
+        "job_end_period": f"{(end_total // 60) % 24:02d}:{end_total % 60:02d}",
+        "job_work_minutes": work_minutes,
+    }
+
+
+def _relative_slot(now: int, after_minutes: int, work_minutes: int) -> dict[str, Any]:
+    """把工作開始時間錨定在「現在 + after_minutes 分鐘」（相對偏移，永遠在未來）。
+
+    用例以 ``vars: {job_start_after_minutes: 60}`` opt-in（例：發一則 1 小時後的工作）。
+    後端由 start_date + start_time_period(HH:MM) 推 start_at（分鐘精度），end 由 work_minutes 推；
+    跨午夜由 localtime 自然處理。staging min_publish_interval≈600s，偏移 ≥ ~11 分即可發佈。
+    """
+    start = now + after_minutes * 60
+    end = start + work_minutes * 60
+    return {
+        "job_start_date": int(time.strftime("%Y%m%d", time.localtime(start))),
+        "job_start_period": time.strftime("%H:%M", time.localtime(start)),
+        "job_end_period": time.strftime("%H:%M", time.localtime(end)),
+        "job_work_minutes": work_minutes,
+    }
+
+
 def _job_slot_vars(now: int) -> dict[str, Any]:
     """為工作發佈算一組唯一的未來時段變數（避開時段衝突）。"""
     # 限制：工作開始日期需在「今天 +14 天」內（MAX_WORK_INTERVAL_DAYS），
@@ -143,6 +186,16 @@ class PathRunner:
         )
         if extra_vars:
             state.vars.update(extra_vars)
+        # 用例可用兩種 opt-in 覆寫上面 _job_slot_vars 的未來輪轉時段（after_minutes 優先）：
+        #   vars: {job_start_after_minutes: 60}   → 現在 + N 分鐘（例：1 小時後的工作）
+        #   vars: {job_start_time_of_day: "15:30"} → 今天該時刻（過當日時限自動順延隔天）
+        wm = int(state.vars.get("job_work_minutes", 120))
+        after = state.vars.get("job_start_after_minutes")
+        tod = state.vars.get("job_start_time_of_day")
+        if after is not None:
+            state.vars.update(_relative_slot(now, int(after), wm))
+        elif tod:
+            state.vars.update(_anchor_today_slot(now, str(tod), wm))
         return state
 
     def _run_db_exec(self, step: dict, state: PathExecutionState) -> dict[str, Any]:

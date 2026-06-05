@@ -1,0 +1,15 @@
+id: job-publish
+description: 商家發佈今天 15:30 的一筆工作（過當日發佈時限則自動順延隔天 15:30）
+vars:
+  job_start_time_of_day: '15:30'
+  job_work_minutes: 120
+path:
+- transition: J1_employer_publish_job
+  save:
+    job_sn: job_sn_list.0
+  expect:
+    http: 200
+    state:
+      sql: SELECT status FROM s_jobs WHERE job_sn='{{state.job_sn}}'
+      equals:
+        status: 1

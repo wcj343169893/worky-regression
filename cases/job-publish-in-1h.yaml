@@ -1,0 +1,15 @@
+id: job-publish-in-1h
+description: 商家發佈一則 1 小時後的工作（開始時間＝當前時間 + 1 小時）
+vars:
+  job_start_after_minutes: 60
+  job_work_minutes: 120
+path:
+- transition: J1_employer_publish_job
+  save:
+    job_sn: job_sn_list.0
+  expect:
+    http: 200
+    state:
+      sql: SELECT status FROM s_jobs WHERE job_sn='{{state.job_sn}}'
+      equals:
+        status: 1
