@@ -7,6 +7,7 @@
 """
 from __future__ import annotations
 
+import copy
 from pathlib import Path
 
 import yaml
@@ -359,6 +360,25 @@ class CaseStore:
         while taken(f"{base}-{n}"):
             n += 1
         return f"{base}-{n}"
+
+    def copy_case(self, case_id: str) -> dict:
+        """以既有用例的 spec 為範本快速再建一條新用例。
+
+        只複製 spec（YAML 內容），**不複製執行歷史**：
+        執行歷史是 qa_runs，本來就以 case_id 區分；新用例拿到全新的 id（天然無歷史），
+        全程不碰 qa_runs，故新用例從零開始。
+        以來源 id 為基底取防撞號（`<源id>-copy`），深拷貝來源 spec 再改 id，
+        避免改到 _find 回傳的來源 spec 物件；落地直接複用 decompose_commit（防撞 + 寫檔 + sync_cases）。
+        """
+        found = self._find(case_id)
+        if found is None:
+            raise ValueError(f"找不到用例 {case_id}")
+        _, source, spec = found
+        spec_copy = copy.deepcopy(spec)              # 深拷貝，絕不動到來源 spec 物件
+        spec_copy["id"] = self._unique_case_id(f"{case_id}-copy")
+        out = self.decompose_commit(spec_copy, run=False)   # 落地（再防撞 + 寫檔 + 不執行）
+        return {"id": out["spec"]["id"], "saved": out["saved"],
+                "system": out["system"], "source": source}
 
     def suggest_tab(self, description: str) -> dict:
         """依描述產生一個 AI 分解 tab 設定（label/system/query/placeholder）。"""

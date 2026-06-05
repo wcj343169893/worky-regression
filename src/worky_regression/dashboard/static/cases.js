@@ -307,12 +307,14 @@ function renderCaseRows(key, items) {
       <td class="act">
         <button class="btn view-btn" data-id="${esc(c.id)}">查看</button>
         <button class="btn run-btn" data-id="${esc(c.id)}">執行</button>
+        <button class="btn copy-btn" data-id="${esc(c.id)}">複製</button>
         ${c.child_count > 0 ? `<button class="btn sub-btn" data-id="${esc(c.id)}">子任務(${c.child_count})</button>` : ""}
       </td></tr>`;
   }).join("");
   tb.style.opacity = "1";
   tb.querySelectorAll(".view-btn").forEach((b) => b.onclick = () => openCaseDetail(b.dataset.id));
   tb.querySelectorAll(".run-btn").forEach((b) => b.onclick = () => runCase(key, b));
+  tb.querySelectorAll(".copy-btn").forEach((b) => b.onclick = () => copyCase(key, b));
   // 子任務：下鑽到該用例的子清單（遞迴天然成立——子層列同樣會帶 child_count）
   tb.querySelectorAll(".sub-btn").forEach((b) => b.onclick = () => drillInto(key, { id: b.dataset.id }));
   tb.querySelectorAll(".tchip.clickable").forEach((ch) =>
@@ -337,6 +339,18 @@ async function runCase(key, btn) {
       <div class="sec">${runResultHtml(res)}</div>`);
     loadCases(key);
   } catch (e) { toast("執行失敗：" + e.message); }
+  finally { btn.disabled = false; btn.textContent = old; }
+}
+
+// 以既有用例 spec 為範本快速再建一條新用例（不含執行歷史），刷新後新列因 mtime 最新排到最前
+async function copyCase(key, btn) {
+  const id = btn.dataset.id, old = btn.textContent;
+  btn.disabled = true; btn.textContent = "複製中…";
+  try {
+    const res = await apiPost("/api/cases/copy", { id });
+    toast(`已複製為 ${res.id}`);
+    loadCases(key);
+  } catch (e) { toast("複製失敗：" + e.message); }
   finally { btn.disabled = false; btn.textContent = old; }
 }
 
