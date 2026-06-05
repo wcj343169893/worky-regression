@@ -40,6 +40,9 @@ class Transition:
     body_template: dict = field(default_factory=dict)
     """request body 模板（runner 會替換 {{...}} 變數）"""
 
+    api_group: str = "main"
+    """API base 群組：main → settings.api_base（/v1）；activity → settings.activity_api_base（/activity）"""
+
 
 def __getattr__(name: str):
     """向後相容：TRANSITIONS / get 委派給 registry（延遲匯入避開 circular）。"""

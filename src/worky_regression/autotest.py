@@ -116,6 +116,12 @@ def _actors_for(system: str, s: Settings) -> dict[str, Actor]:
             except Exception:  # noqa: BLE001 — 池中無此缺能力帳號就不提供，產生器會跳過對應分支
                 pass
         return actors
+    if system == "activity":
+        # 營運活動（Activity API）唯讀查詢，只需一個可登入的打工夥伴 token。
+        pool = AccountPool(s)
+        labor = pool.acquire("labor", ["audit_role", "active"], 1,
+                             owner="activity-actors", lease=False)[0]
+        return {"labor": _actor_from_pool(s, labor, "labor")}
     publisher = _build_actor(s, accounts, "publisher", "publisher_primary", 2)
     ensure_publisher_invoice(publisher)
     return {

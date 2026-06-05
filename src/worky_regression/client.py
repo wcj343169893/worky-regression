@@ -58,8 +58,9 @@ class WorkyClient:
         return md5(query_string + body_str + common_vars + self.access_token + self.settings.api_secret)
 
     def request(self, method: str, path: str, *, params: dict | None = None,
-                body: dict | None = None) -> requests.Response:
-        url = self.settings.api_base + path
+                body: dict | None = None, base: str | None = None) -> requests.Response:
+        # base 可覆寫 API base（如營運活動走 /activity；不傳則用主 API /v1）
+        url = (base or self.settings.api_base) + path
 
         # GET query string: 參數名稱正序排列
         if method.upper() == "GET" and params:

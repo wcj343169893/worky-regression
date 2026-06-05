@@ -51,6 +51,7 @@ def _build_transitions(spec: dict[str, Any]) -> dict[str, Transition]:
             push_type_id=push.get("type", "") or "",
             doc_id=str(u.get("doc_id", "")),
             body_template=u.get("request") or {},
+            api_group=u.get("api", "main"),
         )
     return out
 

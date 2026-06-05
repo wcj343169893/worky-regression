@@ -11,6 +11,9 @@ from dotenv import load_dotenv
 @dataclass(frozen=True)
 class Settings:
     api_base: str
+    # 營運活動 Activity API base（/activity，與主 API 的 /v1 不同 base）。
+    # 預設由 api_base 的 host 推導；可用 WORKY_ACTIVITY_API_BASE 覆寫。
+    activity_api_base: str
     api_secret: str
     audit_sms_code: str
 
@@ -47,8 +50,16 @@ class Settings:
                 raise RuntimeError(f"missing required env: {key}")
             return val
 
+        api_base = req("WORKY_API_BASE").rstrip("/")
+        # 預設 Activity base：取 api_base 的 scheme://host，接 /activity（與 /v1 同 host 不同前綴）
+        from urllib.parse import urlsplit
+        _p = urlsplit(api_base)
+        default_activity = (f"{_p.scheme}://{_p.netloc}/activity"
+                            if _p.scheme and _p.netloc else api_base + "/activity")
+
         return cls(
-            api_base=req("WORKY_API_BASE").rstrip("/"),
+            api_base=api_base,
+            activity_api_base=os.environ.get("WORKY_ACTIVITY_API_BASE", default_activity).rstrip("/"),
             api_secret=req("WORKY_API_SECRET"),
             audit_sms_code=req("WORKY_AUDIT_SMS_CODE"),
             db_host=req("WORKY_DB_HOST"),

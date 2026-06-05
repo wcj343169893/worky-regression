@@ -20,13 +20,15 @@ GENERATED_DIR = CASES_DIR / "generated"
 
 
 def _detect_system(spec: dict) -> str:
-    """以第一個 transition 前綴判系統：J* → job，T* → contract。"""
+    """以第一個 transition 前綴判系統：J* → job，T* → contract，A* → activity。"""
     for st in spec.get("path", []):
         t = str(st.get("transition", ""))
         if t[:1] == "J":
             return "job"
         if t[:1] == "T":
             return "contract"
+        if t[:1] == "A":
+            return "activity"
     return "contract"
 
 

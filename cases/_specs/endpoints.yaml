@@ -33,6 +33,15 @@ systems:
       employer: 商家（user_type=1）
       labor: 打工夥伴（user_type=2）
     key_var: job_sn
+  activity:
+    label: 營運活動（Activity API）
+    note: |
+      行銷/營運活動介面，走獨立的 Activity API base（/activity，非主 API 的 /v1）。
+      端點以 /www/wwwroot/worky/documents/activity-api/ 為準。多為唯讀查詢（無 DB 副作用 / 無 push）。
+      單元以 api: activity 標記，runner 改用 settings.activity_api_base 發請求。
+    roles:
+      labor: 打工夥伴（user_type=2）
+    key_var: ""
 
 # ----- 分解器可引用的 runtime 變數（runner 在每次跑 path 時注入 state.*） -----
 # body / sql / expect 內以 {{...}} 引用；單一 {{x}} 會保留原型別（int/list 不被轉字串）。
@@ -649,3 +658,57 @@ task_units:
         key: "job_id=(SELECT id FROM s_jobs WHERE job_sn='{{state.job_sn}}') AND labor_id={{labor.user_id}}"
         become: {status: 9}                         # STATUS_LABOR_CANCEL；s_jobs.recruited_count-1
     notes: 招募截止前的 push 改 LABOR_JOB_CANCELED_BEFORE_RECRUIT_DEADLINE(10026)。
+
+  # ===== 營運活動：點石成金爭奪戰（Activity API，唯讀查詢）=====
+  A1_labor_ranking_init:
+    system: activity
+    summary: 點石成金爭奪戰 — 取得排行榜初始化資訊（當前活動 + top100 + 特別獎）
+    actor: labor
+    api: activity                                   # 走 /activity base（非 /v1）
+    method: GET
+    endpoint: /labor/ranking-list/init-data
+    doc_id: 2103-1
+    event: ""
+    # alias 選填，不傳即查「當前正在進行的活動」（happy path 用此）
+    request: {}
+    push: null
+    guards:
+      - need: 打工夥伴已登入（labor token）
+        satisfy: {caps: [active]}
+      - need: 有正在進行中的活動（無活動時 data 為 null，仍 success）
+        satisfy: {note: "happy 僅驗 API 成功；活動內容依環境而定"}
+    side_effects: []                                # 唯讀，無 DB 變更
+    notes: 回傳 activity / top_ranking_list / special_prize_list / other_activities。
+
+  A2_labor_ranking_search:
+    system: activity
+    summary: 點石成金爭奪戰 — 搜尋某夥伴的排名 / 是否中獎
+    actor: labor
+    api: activity
+    method: POST
+    endpoint: /labor/ranking-list/search
+    doc_id: 2103-2
+    event: ""
+    request:
+      alias: labor_ranking_list                     # 活動別名（必填；happy 用文件預設別名）
+      phone: "0912345678"                            # 查詢用電話（須合法手機格式；非參與者回 status=0 仍 success）
+      id_number: A123456789                          # 身份證號（格式合法即可；非參與者回未中獎）
+      type: 1                                        # 1 排行榜 / 2 特別獎
+    push: null
+    guards:
+      - need: 打工夥伴已登入
+        satisfy: {caps: [active]}
+      - need: alias 對應的活動存在且已開始
+        satisfy: {note: "happy 用進行中活動別名；不存在/未開始見 branches"}
+    branches:
+      - when: 電話號碼格式不正確
+        expect_fail: {code: 9002, message_contains: "電話"}
+        arrange: {note: "request.phone 給非法格式"}
+      - when: 活動別名不存在
+        expect_fail: {code: 9002, message_contains: "活動不存在"}
+        arrange: {note: "request.alias 給不存在的別名"}
+      - when: 活動未開始
+        expect_fail: {code: 9002, message_contains: "活動未開始"}
+        arrange: {note: "alias 指向尚未開始的活動"}
+    side_effects: []                                # 唯讀，無 DB 變更
+    notes: data.status=1 中獎/有排名，0 未中獎/無排名；type=2 不回 level/minutes。

@@ -210,8 +210,18 @@ class PathRunner:
 
         body = state.resolve(transition.body_template)
 
+        # 營運活動單元走獨立的 Activity API base（/activity，非主 API /v1）
+        base = (actor.client.settings.activity_api_base
+                if getattr(transition, "api_group", "main") == "activity" else None)
+
         watermark = self.db.max_notification_id()
-        resp = actor.client.request(transition.method, transition.endpoint, body=body)
+        # GET 走 query string（params），其餘走 body
+        if transition.method.upper() == "GET":
+            resp = actor.client.request(transition.method, transition.endpoint,
+                                        params=body or None, base=base)
+        else:
+            resp = actor.client.request(transition.method, transition.endpoint,
+                                        body=body, base=base)
 
         expected_http = step.get("expect", {}).get("http", 200)
         if resp.status_code != expected_http:

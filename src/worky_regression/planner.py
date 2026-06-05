@@ -28,7 +28,7 @@ PLAN_SCHEMA: dict[str, Any] = {
     "properties": {
         "path_id": {"type": "string", "description": "kebab-case 短名，如 job-cancel-hire"},
         "description": {"type": "string", "description": "這條 path 在測什麼（繁中一兩句）"},
-        "system": {"type": "string", "enum": ["contract", "job"]},
+        "system": {"type": "string", "enum": ["contract", "job", "activity"]},
         "steps": {
             "type": "array",
             "items": {
@@ -127,8 +127,8 @@ def _validate_plan(data: dict[str, Any]) -> None:
     for key in ("path_id", "description", "system", "steps"):
         if key not in data:
             raise RuntimeError(f"分解器輸出缺少欄位 {key!r}：{data}")
-    if data["system"] not in ("contract", "job"):
-        raise RuntimeError(f"system 必須是 contract/job，得到 {data['system']!r}")
+    if data["system"] not in ("contract", "job", "activity"):
+        raise RuntimeError(f"system 必須是 contract/job/activity，得到 {data['system']!r}")
     units = SPEC["task_units"]
     for i, st in enumerate(data["steps"]):
         kind = st.get("kind")
@@ -144,7 +144,7 @@ def _validate_plan(data: dict[str, Any]) -> None:
 
 
 # planner 目前實際支援分解的 system（其餘領域先標「規劃中」，由前端友善降級）
-SUPPORTED_SYSTEMS = ("contract", "job")
+SUPPORTED_SYSTEMS = ("contract", "job", "activity")
 
 
 def decompose(use_case: str, settings: Settings | None = None,
@@ -217,18 +217,19 @@ def decompose(use_case: str, settings: Settings | None = None,
 # ── AI 建立分解 tab（依自然語言描述產生一個領域 tab 的設定）──────────────────
 # tab.system 允許的值：job/contract（可分解）、labor/employer（帳號生命週期，分解規劃中）、
 # ""（全部，不指定系統）。其餘一律正規化為 ""。
-TAB_SYSTEMS = ("job", "contract", "labor", "employer", "")
+TAB_SYSTEMS = ("job", "contract", "activity", "labor", "employer", "")
 
 _TAB_SYSTEM_PROMPT = """你是 Worky 回歸測試看板的助理。使用者用一句話描述他想針對哪一類功能\
 建立「AI 用例分解 tab」。請把它歸類並產生 tab 設定，只輸出 JSON：
 {
   "label": "<簡短中文 tab 名，2-6 字>",
-  "system": "<job|contract|labor|employer 或空字串>",
+  "system": "<job|contract|activity|labor|employer 或空字串>",
   "query": "<過濾既有用例清單的關鍵字，取描述中最具辨識度的詞，1-6 字>",
   "placeholder": "<切到此 tab 時輸入框的提示語，引導使用者描述該領域用例>"
 }
-system 對映：工作流程=job；承攬任務流程=contract；打工夥伴帳號（註冊/審核等）=labor；\
-商家/店鋪=employer；無法判定填空字串。只輸出 JSON，不要任何解釋。"""
+system 對映：工作流程=job；承攬任務流程=contract；營運/行銷活動（點石成金、排行榜、MGM、\
+加薪任務、活動橫幅等）=activity；打工夥伴帳號（註冊/審核等）=labor；商家/店鋪=employer；\
+無法判定填空字串。只輸出 JSON，不要任何解釋。"""
 
 
 def _normalize_tab(data: dict[str, Any], desc: str) -> dict[str, Any]:
@@ -253,6 +254,7 @@ def _suggest_tab_heuristic(desc: str) -> dict[str, Any]:
     kw = {
         "contract": ["任務", "承攬", "接案", "發案", "驗收", "派工"],
         "job": ["工作", "時薪", "招募", "上工", "打卡", "排班"],
+        "activity": ["活動", "營運", "點石成金", "排行榜", "排名", "中獎", "獎金", "MGM", "加薪任務"],
         "labor": ["夥伴", "註冊", "實名", "帳號", "個資", "登入"],
         "employer": ["商家", "店鋪", "門市", "開店", "分店", "店家"],
     }
