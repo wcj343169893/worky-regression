@@ -410,6 +410,57 @@ class CaseStore:
         from ..planner import suggest_tab as _suggest_tab
         return _suggest_tab(description, self.settings)
 
+    # 子用例自動分析上限：避免單一主用例衍生過多子用例淹沒看板（被截斷時會明示截斷數）
+    _MAX_CHILDREN = 12
+
+    def _derive_children(self, main_spec: dict) -> dict:
+        """從主 spec 確定性地推導子用例（分支 / 邊界 / 負向情境）。
+
+        策略：
+          - 掃主 spec path 內所有 transition 步驟，挑出「endpoints.yaml 有定義 branches」的
+            target（用 unit_spec(name).get("branches") 判斷；無 branch 者沒有可衍生的負向情境）。
+          - 對每個 target 呼叫 case_gen.generate(target, "L1")，**只取 L1 negative**——
+            丟掉 `gen-{target}-happy`（主用例本身即 happy 流，留著只會重複）。
+          - 依 id 去重（同一 target 不會掃兩次，但仍保險去重）。
+          - 對總數做合理上限（_MAX_CHILDREN）；被截斷時不靜默丟棄，回 truncated 計數讓前端標示。
+          - 此處**不**綁 parent / 不改 id：最終 id 與 parent 在 commit 時才綁（主 id 可能因防撞而變）。
+
+        回傳 {children: [...spec dict], analyzed: 分析總數, truncated: 被截掉的數量}。
+        """
+        from ..case_gen import generate
+        from ..registry import unit_spec
+
+        targets: list[str] = []
+        seen_targets: set[str] = set()
+        for st in main_spec.get("path", []):
+            name = st.get("transition")
+            if not name or name in seen_targets:
+                continue
+            seen_targets.add(name)
+            try:
+                has_branches = bool(unit_spec(name).get("branches"))
+            except Exception:  # noqa: BLE001 — 找不到單元規格者視為無 branch
+                has_branches = False
+            if has_branches:
+                targets.append(name)
+
+        children: list[dict] = []
+        seen_ids: set[str] = set()
+        for target in targets:
+            for c in generate(target, "L1"):
+                cid = c.get("id", "")
+                # 丟掉 happy（主用例就是 happy 流）；依 id 去重
+                if cid.endswith("-happy") or cid in seen_ids:
+                    continue
+                seen_ids.add(cid)
+                children.append(c)
+
+        analyzed = len(children)
+        truncated = max(0, analyzed - self._MAX_CHILDREN)
+        if truncated:
+            children = children[:self._MAX_CHILDREN]
+        return {"children": children, "analyzed": analyzed, "truncated": truncated}
+
     def decompose_preview(self, use_case: str, system: str | None = None) -> dict:
         """分解第一段：呼叫 LLM 產 plan + 展開 spec，算好防撞 id，但**不落地**。
 
@@ -426,16 +477,37 @@ class CaseStore:
         spec = build_path(plan)
         spec["id"] = self._unique_case_id(str(spec.get("id") or "ai-case"))  # 預先算好防撞號
         spec_yaml = yaml.safe_dump(spec, allow_unicode=True, sort_keys=False)
+        # 一併分析可能的子用例（分支 / 邊界 / 負向）——同樣只算不落地，供前端彈窗勾選
+        derived = self._derive_children(spec)
+        children = [{
+            "id": c.get("id", ""),
+            "description": str(c.get("description", "")).strip(),
+            "skip": bool(c.get("skip")),
+            "skip_reason": c.get("skip_reason", ""),
+            "spec_yaml": yaml.safe_dump(c, allow_unicode=True, sort_keys=False),
+        } for c in derived["children"]]
         return {"plan": plan.raw, "spec": spec, "spec_yaml": spec_yaml,
-                "proposed_id": spec["id"], "system": plan.system}
+                "proposed_id": spec["id"], "system": plan.system,
+                "children": children,
+                "children_analyzed": derived["analyzed"],
+                "children_truncated": derived["truncated"]}
 
-    def decompose_commit(self, spec: dict | str, run: bool = False) -> dict:
+    def decompose_commit(self, spec: dict | str, run: bool = False,
+                         children: list[dict | str] | None = None) -> dict:
         """分解第二段：把（可能經前端校正過的）spec 真正落地。
 
         spec 可為 dict 或 YAML 字串（前端送 textarea 內容時為字串）。
         落地流程：解析 → 對最終 id 再做一次 _unique_case_id 防撞（preview→commit
         之間可能有人佔號）→ mkdir + write_text + sync_cases；run 為真才 _run_spec。
-        回傳形狀與舊 decompose 相容：{plan?, spec, saved, system, result?}。
+
+        children（可選，預設 None）：使用者在彈窗勾選保留的子用例（dict 或 YAML 字串）。
+          預設 None 時整段不執行——確保 copy_case / republish_case 等既有呼叫行為完全不變。
+          有帶時：先落地主 spec 取得主用例**最終 id**，再對每條子用例綁 parent=主最終 id、
+          取防撞 id、寫檔 + sync_cases（**不執行**子用例，run 只作用於主用例）。
+          子用例若帶 skip=True 仍照樣落地成記錄（讓覆蓋缺口可見），它本就標記不可跑。
+
+        回傳形狀與舊 decompose 相容：{plan?, spec, saved, system, result?}；
+        有帶 children 時多回 children: [{id, saved, system, skip}]。
         """
         if isinstance(spec, str):
             parsed = yaml.safe_load(spec)
@@ -461,7 +533,42 @@ class CaseStore:
                 "yaml": yaml.safe_dump(spec, allow_unicode=True, sort_keys=False),
                 "created_at": 0,
             }])
+        # 子用例：在主用例落地、拿到最終 id 之後才綁 parent 與防撞 id（主 id 可能因防撞而變）
+        if children:
+            payload["children"] = self._commit_children(children, spec["id"])
         return payload
+
+    def _commit_children(self, children: list[dict | str], parent_id: str) -> list[dict]:
+        """把使用者勾選保留的子用例綁到主用例最終 id 後落地（不執行）。
+
+        每條 child：解析（dict 或 YAML 字串）→ 設 parent=parent_id →
+        以原 id（或 ai-subcase 基底）取防撞 id → 寫 generated/{id}.yaml + sync_cases。
+        子用例不執行（run 只作用於主用例）；之後可由使用者自行執行 / 重新發佈。
+        """
+        GENERATED_DIR.mkdir(parents=True, exist_ok=True)
+        out_list: list[dict] = []
+        for child in children:
+            if isinstance(child, str):
+                parsed = yaml.safe_load(child)
+                if not isinstance(parsed, dict) or "path" not in parsed:
+                    raise ValueError("子用例 spec YAML 格式不正確（需為含 path 的物件）")
+                child = parsed
+            child["parent"] = parent_id                               # 綁到主用例最終 id
+            child["id"] = self._unique_case_id(str(child.get("id") or "ai-subcase"))
+            csys = _detect_system(child)
+            cpath = GENERATED_DIR / f"{child['id']}.yaml"
+            cyaml = yaml.safe_dump(child, allow_unicode=True, sort_keys=False)
+            cpath.write_text(cyaml, encoding="utf-8")
+            # 註冊進 qa_cases（帶 parent_id），主列才會即時長出「子任務(n)」入口
+            self.qa.sync_cases([{
+                "id": child["id"], "file": cpath.name, "system": csys, "source": "generated",
+                "description": str(child.get("description", "")).strip(),
+                "step_count": len(child.get("path", [])),
+                "yaml": cyaml, "created_at": 0, "parent_id": parent_id,
+            }])
+            out_list.append({"id": child["id"], "saved": cpath.name,
+                             "system": csys, "skip": bool(child.get("skip"))})
+        return out_list
 
     def decompose(self, use_case: str, run: bool = False,
                   system: str | None = None) -> dict:

@@ -527,12 +527,41 @@ function showDecomposeResult(d, plan, run) {
       <h3>${esc((plan && plan.path_id) || d.spec.id || "")} <span class="pill">AI 產生</span></h3>
       <p class="sub2">${esc((plan && plan.description) || d.spec.description || "")}</p></div>
     <div class="sec"><h4>任務流</h4>${plan ? decomposeStepsHtml(plan) : ""}</div>
-    ${d.result ? `<div class="sec"><h4>執行結果 ${resBadge(d.result.status)}</h4>${runResultHtml(d.result)}</div>` : ""}`);
-  toast(run ? `已建立並執行：${d.result ? (d.result.status === "passed" ? "通過" : "失敗") : ""}`
-    : "已建立，存入 generated/");
+    ${d.result ? `<div class="sec"><h4>執行結果 ${resBadge(d.result.status)}</h4>${runResultHtml(d.result)}</div>` : ""}
+    ${(d.children && d.children.length) ? `<div class="sec"><h4>子用例（${d.children.length} 條）</h4>
+      ${d.children.map((c) => `<div class="cstep"><code>${esc(c.id)}</code>${c.skip ? ` <span class="pill">skip</span>` : ""}</div>`).join("")}</div>` : ""}`);
+  // 子用例數量附在 toast 尾（k 條子用例已掛在主用例底下，主列會自動顯示「子任務(k)」）
+  const kids = (d.children && d.children.length) ? `（+ ${d.children.length} 條子用例）` : "";
+  toast((run ? `已建立並執行：${d.result ? (d.result.status === "passed" ? "通過" : "失敗") : ""}`
+    : "已建立，存入 generated/") + kids);
 }
 
-// 確認彈窗：展示 preview 出的關鍵參數 + 時間提示 + 可編輯 spec YAML，
+// 子用例區塊：列出 preview 分析出的子用例（分支 / 邊界 / 負向），可逐條勾選一併建立。
+// 非 skip 者預設勾選；skip 者顯示其 skip_reason 並預設不勾（作為可見的覆蓋缺口，仍可手動勾）。
+// children 為空時回空字串（彈窗不顯示此區塊，行為與 #1 完全一致，不退化）。
+function childrenSectionHtml(pv) {
+  const children = pv.children || [];
+  if (!children.length) return "";
+  // 被截斷時明示「已分析 N 條，顯示前 M 條」，呼應「不要靜默截斷」原則
+  const trunc = pv.children_truncated
+    ? `<span class="sub2">（已分析 ${pv.children_analyzed} 條，顯示前 ${children.length} 條）</span>` : "";
+  const rows = children.map((c, i) => {
+    const checked = c.skip ? "" : "checked";
+    const reason = c.skip
+      ? `<div class="sub2 dc-child-skip">⚠ 暫無法自動化：${esc(c.skip_reason || "")}（仍可勾選一併建立，作為可見的覆蓋缺口）</div>` : "";
+    return `<label class="dc-child">
+      <input type="checkbox" class="dc-child-ck" data-i="${i}" ${checked} />
+      <span class="dc-child-body">
+        <code>${esc(c.id || "")}</code>${c.skip ? ` <span class="pill">skip</span>` : ""}
+        <div class="sub2">${esc(c.description || "")}</div>${reason}
+      </span></label>`;
+  }).join("");
+  return `<div class="sec"><h4>子用例（將一併建立）${trunc}</h4>
+    <p class="sub2">AI 分析主流程中有分支的步驟，衍生出以下負向 / 邊界子用例（掛在主用例底下，預設不執行）。</p>
+    <div class="dc-children">${rows}</div></div>`;
+}
+
+// 確認彈窗：展示 preview 出的關鍵參數 + 時間提示 + 可編輯 spec YAML + 子用例勾選，
 // 「確定建立」才送 commit；「取消」直接關閉、不留任何記錄。
 function openConfirmModal(key, pv, run) {
   const plan = pv.plan || {};
@@ -547,6 +576,7 @@ function openConfirmModal(key, pv, run) {
       <div id="dc-hints">${timeHintsHtml(pv.spec_yaml)}</div></div>
     <div class="sec"><h4>spec YAML（可編輯校正）</h4>
       <textarea id="dc-yaml" class="dc-yaml" rows="16" spellcheck="false">${esc(pv.spec_yaml || "")}</textarea></div>
+    ${childrenSectionHtml(pv)}
     <label class="ck"><input type="checkbox" id="dc-run" ${run ? "checked" : ""} /> 建立後立即執行</label>
     <div class="dc-confirm-actions">
       <button class="btn ghost" id="dc-cancel">取消</button>
@@ -557,14 +587,21 @@ function openConfirmModal(key, pv, run) {
   const ta = $("dc-yaml");
   if (ta) ta.oninput = () => { const h = $("dc-hints"); if (h) h.innerHTML = timeHintsHtml(ta.value); };
   $("dc-cancel").onclick = closeModal;  // 取消：不送任何東西、不留記錄
+  const children = pv.children || [];
   const ok = $("dc-ok");
   ok.onclick = async () => {
     const specYaml = $("dc-yaml").value;
     const doRun = $("dc-run").checked;  // checkbox 語意：建立後立即執行（只在 commit 帶上）
+    // 收集「勾選保留」的子用例 spec_yaml（只送勾選的；未勾選的不落地）
+    const picked = [];
+    document.querySelectorAll(".dc-child-ck").forEach((ck) => {
+      if (ck.checked) { const c = children[Number(ck.dataset.i)]; if (c) picked.push(c.spec_yaml); }
+    });
     const oldTxt = ok.textContent; ok.disabled = true;
     ok.textContent = doRun ? "建立 + 執行中…" : "建立中…";
     try {
-      const d = await apiPost("/api/cases/decompose/commit", { spec_yaml: specYaml, run: doRun });
+      const d = await apiPost("/api/cases/decompose/commit",
+        { spec_yaml: specYaml, run: doRun, children: picked });
       closeModal();
       showDecomposeResult(d, plan, doRun);
       loadCases(key);

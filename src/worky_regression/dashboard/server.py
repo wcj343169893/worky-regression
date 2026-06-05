@@ -219,8 +219,11 @@ class Handler(BaseHTTPRequestHandler):
                 if not spec:
                     self._send_json({"error": "缺少 spec_yaml / spec"}, 400)
                 else:
+                    # children（可選）：前端送「使用者勾選保留」的子用例 spec_yaml 陣列，
+                    # 透傳給 decompose_commit 一併落地（綁 parent=主最終 id，不執行）
+                    children = (body or {}).get("children") or None
                     self._send_json(_cases().decompose_commit(
-                        spec, run=bool((body or {}).get("run"))))
+                        spec, run=bool((body or {}).get("run")), children=children))
             elif path == "/api/cases/decompose":
                 # 舊一步到位路由：保留向後相容（CLI / 既有呼叫端）
                 uc = str((body or {}).get("use_case", "")).strip()
