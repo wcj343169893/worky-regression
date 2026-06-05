@@ -11,7 +11,7 @@ from typing import Any
 import yaml
 
 from .actor import Actor
-from .registry import PUSH_TYPE_IDS, get as get_transition
+from .registry import PUSH_TYPE_IDS, get as get_transition, query_unit
 from .verifier import DBVerifier
 
 
@@ -361,7 +361,13 @@ class PathRunner:
             obs["checks"].append({"kind": "push", "type_id": type_id,
                                   "to": transition.pushes_to, "push_id": push.id})
 
-        # 業務狀態驗證（query DB）
+        # 業務狀態驗證（首選）：打對應查詢接口比對回應，驗的是對外行為而非 DB 長相。
+        api_expect = expect.get("api")
+        if api_expect:
+            for one in (api_expect if isinstance(api_expect, list) else [api_expect]):
+                obs["checks"].append(self._verify_api(one, state))
+
+        # 業務狀態驗證（過渡相容）：expect.state(sql) 直接讀 DB；新用例改用 expect.api。
         state_expect = step.get("expect", {}).get("state")
         if state_expect:
             sql = state.resolve(state_expect["sql"])
@@ -378,6 +384,47 @@ class PathRunner:
                 obs["checks"].append({"kind": "state", "col": col, "value": actual})
 
         return obs
+
+    def _verify_api(self, api: dict, state: PathExecutionState) -> dict[str, Any]:
+        """打對應查詢接口比對回應欄位（取代 SELECT 驗 DB）。
+
+        api: {query: <query_unit 名>, actor?: <覆寫呼叫者>, args?: {覆寫/補查詢參數},
+              http?: 預期狀態碼(預設 200), equals: {回應 data 內欄位路徑: 期望值}}
+        """
+        q = query_unit(api["query"])
+        actor_role = api.get("actor") or q["actor"]
+        if actor_role not in state.actors:
+            raise KeyError(f"[expect.api {api['query']}] 未知 actor {actor_role!r}（可用：{sorted(state.actors)}）")
+        actor = state.actors[actor_role]
+        req = {**(q.get("request") or {}), **(api.get("args") or {})}
+        body = state.resolve(req)
+        base = (actor.client.settings.activity_api_base
+                if q.get("api_group", "main") == "activity" else None)
+        method = str(q.get("method", "GET")).upper()
+        if method == "GET":
+            resp = actor.client.request(method, q["endpoint"], params=body or None, base=base)
+        else:
+            resp = actor.client.request(method, q["endpoint"], body=body, base=base)
+        exp_http = api.get("http", 200)
+        if resp.status_code != exp_http:
+            raise AssertionError(
+                f"[expect.api {api['query']}] HTTP {resp.status_code} != {exp_http}; body={resp.text[:300]}")
+        payload = resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {}
+        if payload.get("success") is False:
+            raise AssertionError(
+                f"[expect.api {api['query']}] 查詢失敗 code={payload.get('code')} message={payload.get('message')!r}")
+        data = payload.get("data") if isinstance(payload.get("data"), dict) else payload
+        checked: dict[str, Any] = {}
+        for path, expected in (api.get("equals") or {}).items():
+            expected = state.resolve(expected)
+            actual = self._dig(data, path)
+            if str(actual) != str(expected):
+                raise AssertionError(
+                    f"[expect.api {api['query']}] {path}: expected {expected!r}, got {actual!r}")
+            checked[path] = actual
+        print(f"  [expect.api] {api['query']} {q['endpoint']} as {actor_role} → {checked}")
+        return {"kind": "api", "query": api["query"], "endpoint": q["endpoint"],
+                "actor": actor_role, "equals": checked}
 
     @staticmethod
     def _dig(data: dict, dotted: str) -> Any:

@@ -73,3 +73,11 @@ def unit_spec(name: str) -> dict[str, Any]:
     if name not in units:
         raise KeyError(f"unknown task unit: {name}")
     return units[name]
+
+
+def query_unit(name: str) -> dict[str, Any]:
+    """回傳查詢單元規格（expect.api 驗證用）。與 task_units 分開，不進分解器菜單。"""
+    units = SPEC.get("query_units", {})
+    if name not in units:
+        raise KeyError(f"unknown query unit: {name}. available: {sorted(units)}")
+    return units[name]

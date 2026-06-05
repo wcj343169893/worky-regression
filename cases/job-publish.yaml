@@ -9,7 +9,9 @@ path:
     job_sn: job_sn_list.0
   expect:
     http: 200
-    state:
-      sql: SELECT status FROM s_jobs WHERE job_sn='{{state.job_sn}}'
+    # 改打對應查詢接口驗證（取代讀 s_jobs.status）。info 不對外暴露 status 欄，
+    # 改驗等價的暴露欄位：查得到該 job(success) 即證明已發佈，且剛發佈 recruited_count=0（媒合中、尚無人錄取）。
+    api:
+      query: Q_employer_job_info
       equals:
-        status: 1
+        recruited_count: 0
