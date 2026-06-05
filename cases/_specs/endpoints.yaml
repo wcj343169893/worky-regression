@@ -182,6 +182,19 @@ query_units:
     note: |
       回應 data.publisher_task_status.code 為發案者端對外任務狀態（PublisherTaskStatus）：
       1=媒合中(MATCHING)、7=任務完成…（對應 DB s_contract_tasks.status 經正規化）。
+  Q_labor_job_matches:
+    system: job
+    summary: 打工夥伴查自己的工作媒合清單（驗證申請/錄取狀態用）
+    actor: labor
+    method: GET
+    endpoint: /labor/job-match/list
+    doc_id: '108'
+    request:
+      type: 3                       # TYPE_FILTER_JOB：夥伴主動申請特定工作的媒合
+    note: |
+      回應 data.matching[] 為進行中的媒合，每筆含 job_sn + status（LaborMatchJob 狀態，與 DB 同值）：
+      4=打工夥伴申請(STATUS_LABOR_APPLY)、6=商家錄取(STATUS_EMPLOYER_ACCEPT)、16=備取(STATUS_BACKUP)…
+      用 expect.api / assert_api 的 find:{in: matching, where:{job_sn: ...}} 取單筆再驗 status。
 
 task_units:
 

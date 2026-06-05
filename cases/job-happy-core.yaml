@@ -23,32 +23,28 @@ path:
       WHERE labor_id = {{labor.user_id}} AND status = 1 AND end_at > UNIX_TIMESTAMP()
     expect_min_affected: 0
 
-  # J2 打工夥伴申請上工 → 商家收 LABOR_JOB_APPLY_V2(10025)，媒合列 status=4
+  # J2 打工夥伴申請上工 → 商家收 LABOR_JOB_APPLY_V2(10025)；夥伴媒合清單該 job status=4
   - transition: J2_labor_apply
     expect:
       http: 200
       push:
         # 推播給 employer（pushes_to=employer）
-      state:
-        sql: >
-          SELECT status FROM s_labor_match_jobs
-          WHERE job_id=(SELECT id FROM s_jobs WHERE job_sn='{{state.job_sn}}')
-            AND labor_id={{labor.user_id}}
+      # 改打夥伴媒合清單接口驗證（取代讀 s_labor_match_jobs）：找到該 job 的媒合，status=4=申請
+      api:
+        query: Q_labor_job_matches
+        find: {in: matching, where: {job_sn: '{{state.job_sn}}'}}
         equals:
-          status: 4                      # LaborMatchJob STATUS_LABOR_APPLY
+          status: 4                      # STATUS_LABOR_APPLY（夥伴已申請）
 
-  # J3 商家同意上工 → 打工夥伴收 EMPLOYER_ACCEPT_APPLY(20016)
-  # 副作用：建立 s_labor_jobs（status=1 上工, job_status=1 待上工）
+  # J3 商家同意上工 → 打工夥伴收 EMPLOYER_ACCEPT_APPLY(20016)；夥伴媒合清單該 job status=6
   - transition: J3_employer_accept
     expect:
       http: 200
       push:
         # 推播給 labor（pushes_to=labor）
-      state:
-        sql: >
-          SELECT status, job_status FROM s_labor_jobs
-          WHERE job_id=(SELECT id FROM s_jobs WHERE job_sn='{{state.job_sn}}')
-            AND labor_id={{labor.user_id}}
+      # 改打夥伴媒合清單接口驗證（取代讀 s_labor_jobs）：被錄取 → 媒合 status=6=商家錄取
+      api:
+        query: Q_labor_job_matches
+        find: {in: matching, where: {job_sn: '{{state.job_sn}}'}}
         equals:
-          status: 1                      # LaborJob STATUS_GO_TO_WORK
-          job_status: 1                  # LaborJobStatus WAITING_FOR_WORK
+          status: 6                      # STATUS_EMPLOYER_ACCEPT（商家已錄取＝上工）

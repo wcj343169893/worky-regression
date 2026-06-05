@@ -139,6 +139,8 @@ class PathRunner:
                 self._run_db_exec(step, state)
             elif "assert_state" in step:
                 self._run_assert(step, state)
+            elif "assert_api" in step:
+                self._run_assert_api(step, state)
             elif "sleep" in step:
                 self._run_sleep(step, state)
             else:
@@ -414,6 +416,19 @@ class PathRunner:
             raise AssertionError(
                 f"[expect.api {api['query']}] 查詢失敗 code={payload.get('code')} message={payload.get('message')!r}")
         data = payload.get("data") if isinstance(payload.get("data"), dict) else payload
+        # find：先在某清單路徑找出符合 where 的單筆，再對它比對 equals（清單型回應用）。
+        found_where = None
+        find = api.get("find")
+        if find:
+            lst = self._dig(data, find["in"]) if find.get("in") else data
+            if not isinstance(lst, list):
+                raise AssertionError(f"[expect.api {api['query']}] find.in={find.get('in')!r} 不是清單")
+            where = {k: state.resolve(v) for k, v in (find.get("where") or {}).items()}
+            match = next((it for it in lst if all(str(it.get(k)) == str(v) for k, v in where.items())), None)
+            if match is None:
+                raise AssertionError(
+                    f"[expect.api {api['query']}] 清單 {find.get('in')!r} 找不到符合 {where} 的項目（共 {len(lst)} 筆）")
+            data, found_where = match, where
         checked: dict[str, Any] = {}
         for path, expected in (api.get("equals") or {}).items():
             expected = state.resolve(expected)
@@ -422,9 +437,15 @@ class PathRunner:
                 raise AssertionError(
                     f"[expect.api {api['query']}] {path}: expected {expected!r}, got {actual!r}")
             checked[path] = actual
-        print(f"  [expect.api] {api['query']} {q['endpoint']} as {actor_role} → {checked}")
+        print(f"  [expect.api] {api['query']} {q['endpoint']} as {actor_role}"
+              + (f" find={found_where}" if found_where else "") + f" → {checked}")
         return {"kind": "api", "query": api["query"], "endpoint": q["endpoint"],
-                "actor": actor_role, "equals": checked}
+                "actor": actor_role, "find": found_where, "equals": checked}
+
+    def _run_assert_api(self, step: dict, state: PathExecutionState) -> dict[str, Any]:
+        """獨立的接口斷言步驟（不綁 transition）：直接打查詢接口比對，取代 assert_state(SQL)。
+        需在 step 內指定 actor（無 transition 上下文可繼承）。"""
+        return self._verify_api(step["assert_api"], state)
 
     @staticmethod
     def _dig(data: dict, dotted: str) -> Any:

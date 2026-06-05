@@ -36,24 +36,27 @@ path:
   expect_min_affected: 0
 
 # ── Phase 1 動作：兩位夥伴各自申請（bind 切換身份；商家收 10025）──────────────
+# bind 讓 query 單元的 actor=labor 解析到該步綁定的夥伴；驗各自媒合清單該 job 的 status
 - transition: J2_labor_apply
   bind: {labor: labor1}
   expect:
     http: 200
     push: {}
-    state:
-      sql: "SELECT status FROM s_labor_match_jobs WHERE job_id=(SELECT id FROM s_jobs WHERE job_sn='{{state.job_sn}}') AND labor_id={{labor.user_id}}"
+    api:
+      query: Q_labor_job_matches
+      find: {in: matching, where: {job_sn: '{{state.job_sn}}'}}
       equals:
-        status: 4                       # STATUS_LABOR_APPLY
+        status: 4                       # STATUS_LABOR_APPLY（labor1 已申請）
 - transition: J2_labor_apply
   bind: {labor: labor2}
   expect:
     http: 200
     push: {}
-    state:
-      sql: "SELECT status FROM s_labor_match_jobs WHERE job_id=(SELECT id FROM s_jobs WHERE job_sn='{{state.job_sn}}') AND labor_id={{labor.user_id}}"
+    api:
+      query: Q_labor_job_matches
+      find: {in: matching, where: {job_sn: '{{state.job_sn}}'}}
       equals:
-        status: 4
+        status: 4                       # STATUS_LABOR_APPLY（labor2 已申請）
 
 # ── Phase 2 動作：商家錄取其中一位（labor1；收 EMPLOYER_ACCEPT_APPLY）──────────
 - transition: J3_employer_accept
@@ -61,14 +64,18 @@ path:
   expect:
     http: 200
     push: {}
-    state:
-      sql: "SELECT status, job_status FROM s_labor_jobs WHERE job_id=(SELECT id FROM s_jobs WHERE job_sn='{{state.job_sn}}') AND labor_id={{labor.user_id}}"
+    # 改打 labor1 媒合清單驗錄取（取代讀 s_labor_jobs）：被錄取 → status=6
+    api:
+      query: Q_labor_job_matches
+      find: {in: matching, where: {job_sn: '{{state.job_sn}}'}}
       equals:
-        status: 1                       # 上工
-        job_status: 1                   # 待上工
+        status: 6                       # STATUS_EMPLOYER_ACCEPT（商家已錄取＝上工）
 
-# ── Phase 2 斷言：第二位未被錄取（s_labor_jobs 無其紀錄）────────────────────────
-- assert_state:
-    sql: "SELECT COUNT(*) AS cnt FROM s_labor_jobs WHERE job_id=(SELECT id FROM s_jobs WHERE job_sn='{{state.job_sn}}') AND labor_id={{labor2.user_id}}"
+# ── Phase 2 斷言：第二位未被錄取（等價：labor2 媒合為備取 16，而非錄取 6）──────────
+# 原以 SQL 驗 s_labor_jobs 無紀錄；改打 labor2 自己的媒合清單，確認其狀態為備取(BACKUP=16)。
+- assert_api:
+    query: Q_labor_job_matches
+    actor: labor2
+    find: {in: matching, where: {job_sn: '{{state.job_sn}}'}}
     equals:
-      cnt: 0
+      status: 16                        # STATUS_BACKUP（申請成功但未獲錄取）
