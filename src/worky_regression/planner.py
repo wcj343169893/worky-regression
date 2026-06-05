@@ -202,6 +202,14 @@ def decompose(use_case: str, settings: Settings | None = None,
     if sysname:
         data["system"] = sysname
     _validate_plan(data)
+    # 空任務流：LLM 在 endpoints.yaml 菜單裡找不到對應單元（例如測的介面尚未建模）。
+    # 不要靜默存一支 path:[] 的空用例——明確報錯，讓使用者知道「為何沒分解成功」。
+    if not data["steps"]:
+        raise RuntimeError(
+            f"找不到對應的任務單元，無法分解「{use_case[:30]}」。"
+            "目前 endpoints.yaml 只建模了承攬制（T*）與工作系統（J*）的端點；"
+            "若要測試此介面，需先把它的端點加進 cases/_specs/endpoints.yaml。"
+        )
     return TaskPlan(path_id=data["path_id"], description=data["description"],
                     system=data["system"], steps=data["steps"], raw=data)
 
