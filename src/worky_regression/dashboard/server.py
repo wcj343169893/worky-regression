@@ -172,6 +172,13 @@ class Handler(BaseHTTPRequestHandler):
                     self._send_json({"error": "缺少 id"}, 400)
                 else:
                     self._send_json(_cases().run_case(cid))
+            elif path == "/api/cases/tab":
+                # 依自然語言描述，AI 產生一個分解 tab 設定（label/system/query/placeholder）
+                desc = str((body or {}).get("description", "")).strip()
+                if not desc:
+                    self._send_json({"error": "缺少 description"}, 400)
+                else:
+                    self._send_json(_cases().suggest_tab(desc))
             elif path == "/api/cases/decompose":
                 uc = str((body or {}).get("use_case", "")).strip()
                 if not uc:

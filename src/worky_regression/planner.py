@@ -206,6 +206,90 @@ def decompose(use_case: str, settings: Settings | None = None,
                     system=data["system"], steps=data["steps"], raw=data)
 
 
+# ── AI 建立分解 tab（依自然語言描述產生一個領域 tab 的設定）──────────────────
+# tab.system 允許的值：job/contract（可分解）、labor/employer（帳號生命週期，分解規劃中）、
+# ""（全部，不指定系統）。其餘一律正規化為 ""。
+TAB_SYSTEMS = ("job", "contract", "labor", "employer", "")
+
+_TAB_SYSTEM_PROMPT = """你是 Worky 回歸測試看板的助理。使用者用一句話描述他想針對哪一類功能\
+建立「AI 用例分解 tab」。請把它歸類並產生 tab 設定，只輸出 JSON：
+{
+  "label": "<簡短中文 tab 名，2-6 字>",
+  "system": "<job|contract|labor|employer 或空字串>",
+  "query": "<過濾既有用例清單的關鍵字，取描述中最具辨識度的詞，1-6 字>",
+  "placeholder": "<切到此 tab 時輸入框的提示語，引導使用者描述該領域用例>"
+}
+system 對映：工作流程=job；承攬任務流程=contract；打工夥伴帳號（註冊/審核等）=labor；\
+商家/店鋪=employer；無法判定填空字串。只輸出 JSON，不要任何解釋。"""
+
+
+def _normalize_tab(data: dict[str, Any], desc: str) -> dict[str, Any]:
+    """把 LLM / 啟發式產出的 tab 設定正規化成穩定形狀（防缺欄、限制 system 值）。"""
+    system = str(data.get("system") or "").strip().lower()
+    if system not in TAB_SYSTEMS:
+        system = ""
+    label = (str(data.get("label") or "").strip() or desc[:6]) or "自訂"
+    query = str(data.get("query") or "").strip() or desc[:12]
+    placeholder = (str(data.get("placeholder") or "").strip()
+                   or f"描述「{label}」相關的測試用例…")
+    return {"label": label[:16], "system": system,
+            "query": query[:24], "placeholder": placeholder[:80]}
+
+
+def _suggest_tab_heuristic(desc: str) -> dict[str, Any]:
+    """無 API key / 呼叫失敗時的關鍵字啟發式（盡量別讓功能整個失效）。
+
+    用「命中數計分取最高」而非「首個命中」，避免泛詞（如「打工」「審核」）造成誤判；
+    全部 0 分則回 ""（全部）。關鍵字刻意避開跨領域歧義詞。
+    """
+    kw = {
+        "contract": ["任務", "承攬", "接案", "發案", "驗收", "派工"],
+        "job": ["工作", "時薪", "招募", "上工", "打卡", "排班"],
+        "labor": ["夥伴", "註冊", "實名", "帳號", "個資", "登入"],
+        "employer": ["商家", "店鋪", "門市", "開店", "分店", "店家"],
+    }
+    scores = {sys_name: sum(w in desc for w in words) for sys_name, words in kw.items()}
+    best = max(scores, key=lambda k: scores[k])
+    system = best if scores[best] > 0 else ""
+    return _normalize_tab({"system": system}, desc)
+
+
+def _suggest_tab_ai(desc: str, s: Settings) -> dict[str, Any]:
+    from openai import OpenAI
+
+    client = OpenAI(api_key=s.deepseek_api_key, base_url=s.deepseek_base_url)
+    resp = client.chat.completions.create(
+        model=s.deepseek_model,
+        messages=[
+            {"role": "system", "content": _TAB_SYSTEM_PROMPT},
+            {"role": "user", "content": f"描述：{desc}\n\n只輸出符合上述格式的 JSON。"},
+        ],
+        response_format={"type": "json_object"},
+        temperature=0,
+        stream=False,
+    )
+    data = json.loads(resp.choices[0].message.content or "{}")
+    return _normalize_tab(data if isinstance(data, dict) else {}, desc)
+
+
+def suggest_tab(description: str, settings: Settings | None = None) -> dict[str, Any]:
+    """依自然語言描述產生一個 AI 用例分解 tab 的設定。
+
+    回傳 ``{label, system, query, placeholder}``。有 DEEPSEEK_API_KEY 時走 LLM 歸類，
+    失敗或無 key 時退回關鍵字啟發式（不丟例外，盡量讓「新增 tab」可用）。
+    """
+    desc = (description or "").strip()
+    if not desc:
+        raise RuntimeError("描述不可為空")
+    s = settings or Settings.from_env()
+    if s.deepseek_api_key:
+        try:
+            return _suggest_tab_ai(desc, s)
+        except Exception:  # noqa: BLE001 — LLM 失敗退回啟發式，不讓功能整個壞掉
+            pass
+    return _suggest_tab_heuristic(desc)
+
+
 def _expect_from_unit(name: str) -> dict[str, Any]:
     """從 spec 的 push / side_effects 自動推導一個 transition 步驟的 expect。"""
     u = unit_spec(name)

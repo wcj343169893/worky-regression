@@ -28,7 +28,38 @@ const DECOMPOSE_TABS = [
     ph: "商家建立店鋪 / 審核等流程 — 規劃中，暫不支援分解" },
 ];
 
-const tabByKey = (key) => DECOMPOSE_TABS.find((t) => t.key === key) || DECOMPOSE_TABS[0];
+// 使用者自訂 tab（透過「＋新增」由 AI 產生）持久化在 localStorage，跨重整保留。
+const CUSTOM_TABS_LS = "wky_decompose_tabs";
+function loadCustomTabs() {
+  try { const v = JSON.parse(localStorage.getItem(CUSTOM_TABS_LS) || "[]"); return Array.isArray(v) ? v : []; }
+  catch { return []; }
+}
+function saveCustomTabs(tabs) {
+  try { localStorage.setItem(CUSTOM_TABS_LS, JSON.stringify(tabs)); } catch { /* 容量/隱私模式忽略 */ }
+}
+// 把 AI 回傳的 tab 設定落地成一個自訂 tab（產生唯一 key、補預設、判 planned）
+function addCustomTab(t) {
+  const tabs = loadCustomTabs();
+  const tab = {
+    key: "custom-" + Date.now(),
+    label: t.label || "自訂",
+    system: t.system || "",
+    ph: t.placeholder || `描述「${t.label || "自訂"}」相關的測試用例…`,
+    query: t.query || "",
+    // labor/employer 領域 planner 尚不支援分解 → 標規劃中（與內建一致），仍可作清單篩選
+    planned: t.system === "labor" || t.system === "employer",
+    custom: true,
+  };
+  tabs.push(tab); saveCustomTabs(tabs);
+  return tab;
+}
+function removeCustomTab(keyName) {
+  saveCustomTabs(loadCustomTabs().filter((t) => t.key !== keyName));
+}
+
+// 內建 + 自訂 tab 合集；tabByKey 兩邊都找得到
+const allTabs = () => DECOMPOSE_TABS.concat(loadCustomTabs());
+const tabByKey = (key) => allTabs().find((t) => t.key === key) || DECOMPOSE_TABS[0];
 
 const stepMark = { passed: "✓", failed: "✗", skipped: "·" };
 
@@ -71,9 +102,13 @@ export async function renderCases(key) {
   if (s.stack == null) s.stack = [];
   if (s.parentId === undefined) s.parentId = null;
   const cur = tabByKey(s.tab);
-  const tabsHtml = DECOMPOSE_TABS.map((t) =>
-    `<button class="dc-tab${t.key === cur.key ? " active" : ""}" data-tab="${esc(t.key)}">${esc(t.label)}${t.planned ? `<span class="dc-soon">規劃中</span>` : ""}</button>`
-  ).join("");
+  // 內建 + 自訂 tab 依序渲染；自訂 tab 帶可移除的 ✕；末尾再接「＋新增」按鈕
+  const tabsHtml = allTabs().map((t) =>
+    `<button class="dc-tab${t.key === cur.key ? " active" : ""}" data-tab="${esc(t.key)}">${esc(t.label)}` +
+    `${t.planned ? `<span class="dc-soon">規劃中</span>` : ""}` +
+    `${t.custom ? `<span class="dc-del" data-del="${esc(t.key)}" title="移除此領域">✕</span>` : ""}</button>`
+  ).join("") +
+    `<button class="dc-tab dc-add" id="dc-add" title="用一句話描述，AI 自動建立領域 tab">＋ 新增</button>`;
   $("view").innerHTML = `
     <div class="cases-page">
       <div class="view-head"><h2>${esc(cfg.title)}</h2>
@@ -108,18 +143,63 @@ export async function renderCases(key) {
   // 搜尋：回首頁並回到頂層（清空下鑽堆疊），讓搜尋語意一致
   let t; $("q").oninput = (e) => { clearTimeout(t); s.q = e.target.value; t = setTimeout(() => { resetToRoot(s); loadCases(key); }, 300); };
   $("uc-go").onclick = () => doDecompose(key);
-  // 切 tab：①切換目標 system + placeholder ②回頂層 + 首頁重載清單 ③更新 active 樣式
-  $("view").querySelectorAll(".dc-tab").forEach((b) => b.onclick = () => {
-    const t2 = tabByKey(b.dataset.tab);
-    s.tab = t2.key;
-    s.system = t2.system;            // all → ""，loadCases 空 system 即不帶篩選
-    resetToRoot(s);                  // 切 tab 回頂層，篩選語意一致
-    const ucEl = $("uc"); if (ucEl) ucEl.placeholder = t2.ph;
-    $("view").querySelectorAll(".dc-tab").forEach((x) =>
-      x.classList.toggle("active", x.dataset.tab === t2.key));
-    loadCases(key);
+  // 切 tab（內建或自訂）：整頁重渲染，套用該 tab 的 system / 查詢內容 / placeholder
+  $("view").querySelectorAll(".dc-tab[data-tab]").forEach((b) =>
+    b.onclick = () => selectTab(key, b.dataset.tab));
+  // 「＋新增」：彈出描述輸入框，AI 產生新領域 tab
+  const addBtn = $("dc-add");
+  if (addBtn) addBtn.onclick = () => openAddTabModal(key);
+  // 移除自訂 tab（✕）：停止冒泡避免觸發切 tab；移除的若是當前 tab 則回「全部」
+  $("view").querySelectorAll(".dc-del").forEach((x) => x.onclick = (e) => {
+    e.stopPropagation();
+    const dk = x.dataset.del;
+    removeCustomTab(dk);
+    if (s.tab === dk) { s.tab = "all"; s.system = ""; s.q = ""; }
+    renderCases(key);
   });
   loadCases(key);
+}
+
+// 切到某 tab：套用 system + 查詢內容(query) + placeholder，回頂層後整頁重渲染。
+// 自訂 tab 帶 query → 同時設定清單搜尋字；內建 tab 無 query → 清空搜尋，語意一致。
+function selectTab(key, tabKey) {
+  const s = state[key], t2 = tabByKey(tabKey);
+  s.tab = t2.key;
+  s.system = t2.system;          // all / 未判定 → ""
+  s.q = t2.query || "";          // 自訂 tab 的查詢內容；內建 tab 無 query 即清空
+  resetToRoot(s);                // 回頂層 + 首頁
+  renderCases(key);              // 重渲染：active、placeholder、搜尋框、清單一次到位
+}
+
+// 「＋新增」彈窗：輸入描述 → POST /api/cases/tab → AI 產生 tab → 落地並切過去
+function openAddTabModal(key) {
+  openModal(`<div class="add-tab">
+    <h3>新增分解領域</h3>
+    <p class="sub2">用一句話描述要測試的功能領域，AI 會自動建立對應 tab 與查詢內容。</p>
+    <textarea id="nt-desc" rows="3" placeholder="例：打工夥伴註冊與實名審核流程"></textarea>
+    <div class="add-tab-actions">
+      <button class="btn ghost" id="nt-cancel">取消</button>
+      <button class="btn primary" id="nt-ok">確定</button>
+    </div>
+  </div>`);
+  const ok = $("nt-ok");
+  $("nt-cancel").onclick = closeModal;
+  ok.onclick = async () => {
+    const desc = $("nt-desc").value.trim();
+    if (!desc) { toast("請先輸入描述"); return; }
+    const old = ok.textContent; ok.disabled = true; ok.textContent = "建立中…";
+    try {
+      const t = await apiPost("/api/cases/tab", { description: desc });
+      const tab = addCustomTab(t);   // 產生 key、存 localStorage
+      closeModal();
+      selectTab(key, tab.key);       // 切到新 tab 並重渲染（自動套用查詢內容）
+      toast(`已新增領域「${tab.label}」`);
+    } catch (e) {
+      toast("新增失敗：" + e.message);
+      ok.disabled = false; ok.textContent = old;
+    }
+  };
+  const ta = $("nt-desc"); if (ta) ta.focus();
 }
 
 // ── 主任務/子任務下鑽：堆疊 + 麵包屑 ────────────────────────────────────────

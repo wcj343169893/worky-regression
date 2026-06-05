@@ -259,6 +259,11 @@ class CaseStore:
             n += 1
         return f"{base}-{n}"
 
+    def suggest_tab(self, description: str) -> dict:
+        """依描述產生一個 AI 分解 tab 設定（label/system/query/placeholder）。"""
+        from ..planner import suggest_tab as _suggest_tab
+        return _suggest_tab(description, self.settings)
+
     def decompose(self, use_case: str, run: bool = False,
                   system: str | None = None) -> dict:
         from ..planner import build_path

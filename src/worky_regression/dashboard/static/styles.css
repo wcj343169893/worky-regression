@@ -124,6 +124,17 @@ textarea:focus{outline:none;border-color:var(--accent)}
 .dc-soon{font-size:10px;font-weight:600;padding:1px 5px;border-radius:5px;
   background:var(--panel);border:1px solid var(--line);color:var(--muted)}
 .dc-tab.active .dc-soon{color:#fff;border-color:rgba(255,255,255,.45);background:transparent}
+/* 自訂 tab 的移除鈕（✕）：弱化，hover 才明顯 */
+.dc-del{font-size:11px;line-height:1;color:var(--muted);opacity:.6;padding:0 1px;border-radius:4px}
+.dc-del:hover{opacity:1;color:#fff;background:rgba(255,255,255,.18)}
+.dc-tab.active .dc-del{color:#fff;opacity:.8}
+/* 「＋新增」按鈕：虛線框，與一般 tab 區隔 */
+.dc-add{border-style:dashed;color:var(--accent)}
+.dc-add:hover{color:#fff;border-color:var(--accent);background:var(--panel)}
+/* 新增領域彈窗表單 */
+.add-tab h3{margin:0 0 6px}
+.add-tab textarea{width:100%;margin-top:10px;min-height:72px;resize:vertical}
+.add-tab-actions{display:flex;justify-content:flex-end;gap:10px;margin-top:14px}
 .ai-form{display:flex;align-items:center;gap:12px;flex-wrap:wrap}
 .ai-form textarea{flex:1;min-width:280px}
 .ck{display:flex;align-items:center;gap:6px;color:var(--muted);font-size:13px;white-space:nowrap;cursor:pointer}
