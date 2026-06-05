@@ -117,11 +117,19 @@ def _actors_for(system: str, s: Settings) -> dict[str, Actor]:
                 pass
         return actors
     if system == "activity":
-        # 營運活動（Activity API）唯讀查詢，只需一個可登入的打工夥伴 token。
+        # 營運活動（Activity API）唯讀查詢：打工端用 labor token、商家端用 employer token。
         pool = AccountPool(s)
         labor = pool.acquire("labor", ["audit_role", "active"], 1,
                              owner="activity-actors", lease=False)[0]
-        return {"labor": _actor_from_pool(s, labor, "labor")}
+        actors = {"labor": _actor_from_pool(s, labor, "labor")}
+        # 商家端活動端點（/employer/...）需要 employer；池中有就配發，沒有則略過該角色
+        try:
+            emp = pool.acquire("employer", ["active", "verified_shop"], 1,
+                               owner="activity-actors", lease=False)[0]
+            actors["employer"] = _actor_from_pool(s, emp, "employer")
+        except Exception:  # noqa: BLE001 — 無合格商家帳號時，僅打工端活動可測
+            pass
+        return actors
     publisher = _build_actor(s, accounts, "publisher", "publisher_primary", 2)
     ensure_publisher_invoice(publisher)
     return {

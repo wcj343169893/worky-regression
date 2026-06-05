@@ -712,3 +712,166 @@ task_units:
         arrange: {note: "alias 指向尚未開始的活動"}
     side_effects: []                                # 唯讀，無 DB 變更
     notes: data.status=1 中獎/有排名，0 未中獎/無排名；type=2 不回 level/minutes。
+
+  # ----- 全民 MGM 活動（邀請商家）-----
+  A3_labor_mgm_info:
+    system: activity
+    summary: 打工端 — 全民 MGM 活動，取得活動資訊（邀請碼 / 分享內容 / 獎金）
+    actor: labor
+    api: activity
+    method: GET
+    endpoint: /labor/labor-invite-employer/get-mgm-info
+    doc_id: 2100-3
+    event: ""
+    request: {}
+    push: null
+    guards:
+      - need: 打工夥伴已登入
+        satisfy: {caps: [active]}
+    side_effects: []
+
+  A4_labor_mgm_task_progress:
+    system: activity
+    summary: 打工端 — 全民 MGM 活動，取得任務進度（本月累計 / 完成數 / 列表）
+    actor: labor
+    api: activity
+    method: GET
+    endpoint: /labor/labor-invite-employer/task-progress
+    doc_id: 2100-4
+    event: ""
+    request: {}
+    push: null
+    guards:
+      - need: 打工夥伴已登入
+        satisfy: {caps: [active]}
+    side_effects: []
+
+  A5_labor_mgm_base_info:
+    system: activity
+    summary: 打工端 — 全民 MGM 活動，取得基礎資訊（活動是否上架 / 狀態；無需登入）
+    actor: labor
+    api: activity
+    method: GET
+    endpoint: /labor/labor-invite-employer/get-info
+    doc_id: 2100-5
+    event: ""
+    request: {}
+    push: null
+    guards:
+      - need: 無（匿名亦可；happy 仍以登入夥伴呼叫）
+        satisfy: {note: "回 status / activity_status"}
+    side_effects: []
+
+  A6_employer_mgm_info:
+    system: activity
+    summary: 商家端 — 全民 MGM 活動，取得活動資訊（邀請碼 / 是否發佈過工作 / 活動狀態）
+    actor: employer
+    api: activity
+    method: GET
+    endpoint: /employer/labor-invite-employer/get-mgm-info
+    doc_id: 2100-1
+    event: ""
+    request: {shop_id: "{{employer.shop_id}}"}      # 選填；帶當前商家店鋪
+    push: null
+    guards:
+      - need: 商家已登入
+        satisfy: {caps: [active]}
+    side_effects: []
+
+  # ----- 活動 Q&A / 百萬獎金 -----
+  A7_activity_qa_list:
+    system: activity
+    summary: 活動 Q&A 列表（type 歸屬類型，如 3 供膳體檢補助）
+    actor: labor
+    api: activity
+    method: GET
+    endpoint: /qa
+    doc_id: "2101"
+    event: ""
+    request: {type: 3}                              # 必填：歸屬類型
+    push: null
+    guards:
+      - need: 打工夥伴已登入
+        satisfy: {caps: [active]}
+    side_effects: []
+
+  A8_labor_millions_prize_init:
+    system: activity
+    summary: 打工端 — 新版百萬獎金，初始化資訊（累積獎金 / 參與星級次數）
+    actor: labor
+    api: activity
+    method: GET
+    endpoint: /labor/millions-prize-second/init-data
+    doc_id: "2102"
+    event: ""
+    request: {}
+    push: null
+    guards:
+      - need: 打工夥伴已登入
+        satisfy: {caps: [active]}
+    side_effects: []
+
+  # ----- 加薪任務 / 新手加薪任務 -----
+  A9_labor_salary_task_init:
+    system: activity
+    summary: 打工端 — 加薪任務，初始化資訊（不傳 alias 即查進行中活動）
+    actor: labor
+    api: activity
+    method: GET
+    endpoint: /labor/salary-increase-task/init-data
+    doc_id: 2104-1
+    event: ""
+    request: {}                                     # alias 選填；不傳查當前活動
+    push: null
+    guards:
+      - need: 打工夥伴已登入
+        satisfy: {caps: [active]}
+    side_effects: []
+
+  A10_labor_salary_task_search:
+    system: activity
+    summary: 打工端 — 加薪任務，任務清單（依活動別名查當前夥伴的任務 / 獎金）
+    actor: labor
+    api: activity
+    method: GET
+    endpoint: /labor/salary-increase-task/search
+    doc_id: 2104-2
+    event: ""
+    request: {alias: labor_salary_increase_task}    # 必填：活動別名
+    push: null
+    guards:
+      - need: 打工夥伴已登入且 alias 對應活動進行中
+        satisfy: {note: "happy 用進行中活動別名；非活動對象回 is_excluded=true 仍 success"}
+    side_effects: []
+
+  A11_labor_beginner_salary_init:
+    system: activity
+    summary: 打工端 — 新手加薪任務，初始化資訊（不傳 alias 即查進行中活動）
+    actor: labor
+    api: activity
+    method: GET
+    endpoint: /labor/beginner-salary-increase-task/init-data
+    doc_id: 2105-1
+    event: ""
+    request: {}
+    push: null
+    guards:
+      - need: 打工夥伴已登入
+        satisfy: {caps: [active]}
+    side_effects: []
+
+  A12_labor_beginner_salary_search:
+    system: activity
+    summary: 打工端 — 新手加薪任務，任務清單（依活動別名查任務 / 獎金）
+    actor: labor
+    api: activity
+    method: GET
+    endpoint: /labor/beginner-salary-increase-task/search
+    doc_id: 2105-2
+    event: ""
+    request: {alias: beginner_labor_salary_increase_task}   # 必填：活動別名
+    push: null
+    guards:
+      - need: 打工夥伴已登入且 alias 對應活動進行中
+        satisfy: {note: "happy 用進行中活動別名；非活動對象回 is_excluded=true 仍 success"}
+    side_effects: []
