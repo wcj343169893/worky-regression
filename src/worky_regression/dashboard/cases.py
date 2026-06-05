@@ -380,6 +380,31 @@ class CaseStore:
         return {"id": out["spec"]["id"], "saved": out["saved"],
                 "system": out["system"], "source": source}
 
+    def republish_case(self, case_id: str) -> dict:
+        """以既有用例 spec 為範本「重新發佈」——複製成全新 id 後立即執行。
+
+        針對「發佈資訊與時間高度綁定」的用例（例：『1 小時後開始』在不同時間發佈，
+        工作起始時間就不同）：每次重新發佈都是一筆**全新獨立記錄**，不沿用、不牽連歷史。
+
+        為何不牽連原用例與歷史：
+          - 深拷貝來源 spec（`copy.deepcopy`），絕不動到 _find 回傳的來源 spec 物件；
+          - 新 id 用 `_unique_case_id(f"{case_id}-pub")`（與複製的 `-copy` 後綴區隔，
+            語意是「再發佈一次」），天然防撞；
+          - 執行歷史是 qa_runs，本來就以 case_id 區分，新 id 沒有任何歷史，
+            執行結果只會掛在這條新記錄下，完全不碰原用例的 qa_runs。
+        落地直接複用 decompose_commit（再防撞 + 寫檔 + sync_cases），run=True 立即執行。
+        回傳含 result（形狀同 run_case 回傳），供前端顯示這次發佈的執行結果。
+        """
+        found = self._find(case_id)
+        if found is None:
+            raise ValueError(f"找不到用例 {case_id}")
+        _, source, spec = found
+        spec_copy = copy.deepcopy(spec)              # 深拷貝，絕不動到來源 spec 物件
+        spec_copy["id"] = self._unique_case_id(f"{case_id}-pub")
+        out = self.decompose_commit(spec_copy, run=True)    # 落地（再防撞 + 寫檔 + 立即執行）
+        return {"id": out["spec"]["id"], "saved": out["saved"],
+                "system": out["system"], "source": source, "result": out["result"]}
+
     def suggest_tab(self, description: str) -> dict:
         """依描述產生一個 AI 分解 tab 設定（label/system/query/placeholder）。"""
         from ..planner import suggest_tab as _suggest_tab

@@ -89,6 +89,9 @@ td.act{display:flex;gap:6px;justify-content:center}
 /* 「複製」按鈕：沿用 .btn，小尺寸；用 accent2 點綴與查看/執行區分 */
 .copy-btn{padding:5px 12px;font-size:13px;border-radius:8px}
 .copy-btn:hover{background:var(--accent2);border-color:var(--accent2);color:#fff}
+/* 「重新發佈」按鈕：沿用 .btn，小尺寸；用 cyan 點綴與查看/執行/複製區分 */
+.republish-btn{padding:5px 12px;font-size:13px;border-radius:8px}
+.republish-btn:hover{background:var(--cyan);border-color:var(--cyan);color:#0b1020}
 
 /* 測試用例頁 */
 .btn.primary{background:linear-gradient(135deg,var(--accent),#7c5cff);border-color:transparent;color:#fff}

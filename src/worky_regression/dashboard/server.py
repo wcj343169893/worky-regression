@@ -179,6 +179,13 @@ class Handler(BaseHTTPRequestHandler):
                     self._send_json({"error": "缺少 id"}, 400)
                 else:
                     self._send_json(_cases().copy_case(cid))
+            elif path == "/api/cases/republish":
+                # 重新發佈：以該用例 spec 為範本複製成新 id 後立即執行（時間綁定用例每次都落成獨立新記錄）
+                cid = (body or {}).get("id")
+                if not cid:
+                    self._send_json({"error": "缺少 id"}, 400)
+                else:
+                    self._send_json(_cases().republish_case(cid))
             elif path in ("/api/cases/analyze", "/api/cases/swap-account"):
                 # analyze：失敗步驟的 AI 診斷（只回建議，不自動執行）
                 # swap-account：排除失敗 actor 目前帳號，配池中另一個同能力號整支重跑
