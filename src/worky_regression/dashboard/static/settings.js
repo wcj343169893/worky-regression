@@ -14,7 +14,7 @@ export async function renderSettings() {
       <div class="set-card"><h3>資料庫（驗證目標）</h3>
         ${kv("DB", esc(d.db_name))}${kv("Host", esc(d.db_host))}${kv("Port", d.db_port)}</div>
       <div class="set-card"><h3>目標 API</h3>
-        ${kv("API Base", esc(d.api_base))}${kv("Platform", esc(d.platform))}</div>
+        ${kv("API Base", esc(d.api_base))}${kv("Activity API", esc(d.activity_api_base || "—"))}${kv("Platform", esc(d.platform))}</div>
       <div class="set-card"><h3>DeepSeek（用例分解器）</h3>
         ${kv("Model", esc(d.deepseek_model))}${kv("Base URL", esc(d.deepseek_base_url))}${kv("API Key", dot)}</div>
       <div class="set-card"><h3>資料量</h3>

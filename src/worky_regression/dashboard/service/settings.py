@@ -8,7 +8,8 @@ class SettingsMixin:
         return {
             "db_name": s.db_name, "db_host": s.db_host, "db_port": s.db_port,
             "qa_db_name": s.qa_db_name,
-            "api_base": s.api_base, "platform": s.platform,
+            "api_base": s.api_base, "activity_api_base": s.activity_api_base,
+            "platform": s.platform,
             "deepseek_model": s.deepseek_model, "deepseek_base_url": s.deepseek_base_url,
             "deepseek_key_set": bool(s.deepseek_api_key),
             "counts": {
