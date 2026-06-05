@@ -12,10 +12,11 @@ path:
     job_sn: job_sn_list.0
   expect:
     http: 200
-    state:
-      sql: "SELECT status FROM s_jobs WHERE job_sn='{{state.job_sn}}'"
+    # 改打查詢接口驗證（取代讀 s_jobs.status）；info 不暴露 status，驗等價暴露欄位 recruited_count=0。
+    api:
+      query: Q_employer_job_info
       equals:
-        status: 1
+        recruited_count: 0
 
 # guard(no_time_conflict) setup：清夥伴殘留的上工工作，確保失敗來自「截止」而非時段衝突
 - db_exec: >

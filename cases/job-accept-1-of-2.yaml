@@ -16,10 +16,11 @@ path:
     job_sn: job_sn_list.0
   expect:
     http: 200
-    state:
-      sql: "SELECT status FROM s_jobs WHERE job_sn='{{state.job_sn}}'"
+    # 改打查詢接口驗證（取代讀 s_jobs.status）；info 不暴露 status，驗等價暴露欄位 recruited_count=0。
+    api:
+      query: Q_employer_job_info
       equals:
-        status: 1                       # JobStatus 媒合中
+        recruited_count: 0              # 剛發佈、媒合中、尚無人錄取
 
 # ── Phase 0 前置：清確認工作（繞 30207 時段重疊 + 30229 同店同日）────────────
 # 申請工作的 form rule 會擋兩種殘留的「上工(STATUS_GO_TO_WORK=1)」工作：

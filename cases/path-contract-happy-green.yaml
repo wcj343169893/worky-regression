@@ -20,10 +20,11 @@ path:
       task_sn: task_sn
     expect:
       http: 200
-      state:
-        sql: "SELECT status FROM s_contract_tasks WHERE task_sn='{{state.task_sn}}'"
+      # 改打發案者單一任務明細接口驗證對外狀態（取代讀 s_contract_tasks.status）
+      api:
+        query: Q_publisher_task_info
         equals:
-          status: 1                       # 媒合中
+          publisher_task_status.code: 1   # PublisherTaskStatus::MATCHING=1（媒合中）
 
   # T2 接案者申請 → publisher 收 CONTRACT_RECEIVER_APPLY_TASK
   - transition: T2_receiver_apply

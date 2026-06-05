@@ -170,6 +170,18 @@ query_units:
       查得到該 job(success=true) 即證明已發佈（未發佈會回 INVALID_JOB_SN）。
       info 不對外暴露 status 欄，驗「媒合中」改用等價暴露欄位 recruited_count（剛發佈=0）。
       可比對欄位：recruited_count / recruit_count / start_at / hourly_wage / work_minutes 等。
+  Q_publisher_task_info:
+    system: contract
+    summary: 發案者查單一任務明細（驗證承攬任務對外狀態用）
+    actor: publisher
+    method: GET
+    endpoint: /contract/task/info
+    doc_id: 405-2
+    request:
+      task_sn: '{{state.task_sn}}'
+    note: |
+      回應 data.publisher_task_status.code 為發案者端對外任務狀態（PublisherTaskStatus）：
+      1=媒合中(MATCHING)、7=任務完成…（對應 DB s_contract_tasks.status 經正規化）。
 
 task_units:
 

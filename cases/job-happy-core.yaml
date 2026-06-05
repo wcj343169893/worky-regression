@@ -11,10 +11,11 @@ path:
       job_sn: job_sn_list.0
     expect:
       http: 200
-      state:
-        sql: "SELECT status FROM s_jobs WHERE job_sn='{{state.job_sn}}'"
+      # 改打查詢接口驗證（取代讀 s_jobs.status）；info 不暴露 status，驗等價暴露欄位 recruited_count=0。
+      api:
+        query: Q_employer_job_info
         equals:
-          status: 1                      # Task/JobStatus MATCHING
+          recruited_count: 0             # 剛發佈、媒合中、尚無人錄取
 
   # 前置(guard→setup)：清掉夥伴殘留的「上工」工作，繞 30207 時段重疊 / 30229 同店同日
   - db_exec: >
