@@ -190,7 +190,25 @@ class Handler(BaseHTTPRequestHandler):
                     self._send_json({"error": "缺少 description"}, 400)
                 else:
                     self._send_json(_cases().suggest_tab(desc))
+            elif path == "/api/cases/decompose/preview":
+                # 分解第一段：呼叫 LLM 產 plan/spec 但不落地（不寫檔、不入庫），回前端彈窗確認
+                uc = str((body or {}).get("use_case", "")).strip()
+                if not uc:
+                    self._send_json({"error": "缺少 use_case"}, 400)
+                else:
+                    # system 為前端 tab 指定的目標系統（可選；空 = 讓 LLM 自己判斷）
+                    sysname = str((body or {}).get("system", "")).strip() or None
+                    self._send_json(_cases().decompose_preview(uc, system=sysname))
+            elif path == "/api/cases/decompose/commit":
+                # 分解第二段：使用者確認/校正後才真正落地（寫檔 + sync_cases，run 才執行）
+                spec = (body or {}).get("spec_yaml") or (body or {}).get("spec")
+                if not spec:
+                    self._send_json({"error": "缺少 spec_yaml / spec"}, 400)
+                else:
+                    self._send_json(_cases().decompose_commit(
+                        spec, run=bool((body or {}).get("run"))))
             elif path == "/api/cases/decompose":
+                # 舊一步到位路由：保留向後相容（CLI / 既有呼叫端）
                 uc = str((body or {}).get("use_case", "")).strip()
                 if not uc:
                     self._send_json({"error": "缺少 use_case"}, 400)

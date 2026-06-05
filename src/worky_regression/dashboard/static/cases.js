@@ -123,7 +123,7 @@ export async function renderCases(key, tabKey) {
         <div class="dc-tabs">${tabsHtml}</div>
         <div class="ai-form">
           <textarea id="uc" rows="2" placeholder="${esc(cur.ph)}"></textarea>
-          <label class="ck"><input type="checkbox" id="uc-run" /> 分解後立即執行</label>
+          <label class="ck"><input type="checkbox" id="uc-run" /> 建立後立即執行</label>
           <button class="btn primary" id="uc-go">分解</button>
         </div>
       </div>
@@ -458,33 +458,100 @@ async function openStepModal(key, cid, idx) {
   showStep(key, cid, data, idx);
 }
 
+// 分解後任務流步驟清單（沿用 cstep 樣式）；plan.steps 來自 preview 回傳
+function decomposeStepsHtml(plan) {
+  return (plan.steps || []).map((st, i) => {
+    const lbl = st.kind === "db_exec" ? "db_exec" : esc(st.transition || "?");
+    return `<div class="cstep"><span class="ci">${i}</span>
+      <span class="badge ${st.kind === "db_exec" ? "b-draft" : "b-running"}">${lbl}</span>
+      ${st.note ? `<span class="sub2">${esc(st.note)}</span>` : ""}</div>`;
+  }).join("");
+}
+
+// 掃描 spec YAML 中與「時間 / 打卡碼 / db_exec 參數」相關的行，醒目列出供使用者核對。
+// 重點是讓「1 小時後」這類語意能被人眼驗證有沒有被正確翻譯（含 UNIX_TIMESTAMP / +3600 /
+// start_at / end_at / 日期字樣 / 打卡碼等）。回傳要塞進提示區的 HTML（無命中回空字串）。
+const TIME_HINT_RE = /UNIX_TIMESTAMP|start_at|end_at|start_code|end_code|\+\s*3600|\+\s*\d{3,}|\bNOW\(\)|\d{4}[/-]\d{1,2}[/-]\d{1,2}|\d{1,2}:\d{2}|DATE_ADD|INTERVAL/i;
+function timeHintsHtml(specYaml) {
+  const hits = String(specYaml || "").split("\n")
+    .map((ln) => ln.trim())
+    .filter((ln) => ln && TIME_HINT_RE.test(ln));
+  if (!hits.length) {
+    return `<div class="sub2">（未偵測到明顯的時間 / 打卡碼參數；若用例與時間相關，請手動核對下方 YAML）</div>`;
+  }
+  return `<div class="time-hints">${hits.map((ln) =>
+    `<div class="thint"><code>${esc(ln)}</code></div>`).join("")}</div>`;
+}
+
+// 落地成功後的結果抽屜（preview 確認 + commit 後共用呈現）
+function showDecomposeResult(d, plan, run) {
+  openDrawer(`
+    <div class="dhead"><span class="sn">${esc(d.saved)} · ${esc(d.system)}</span>
+      <h3>${esc((plan && plan.path_id) || d.spec.id || "")} <span class="pill">AI 產生</span></h3>
+      <p class="sub2">${esc((plan && plan.description) || d.spec.description || "")}</p></div>
+    <div class="sec"><h4>任務流</h4>${plan ? decomposeStepsHtml(plan) : ""}</div>
+    ${d.result ? `<div class="sec"><h4>執行結果 ${resBadge(d.result.status)}</h4>${runResultHtml(d.result)}</div>` : ""}`);
+  toast(run ? `已建立並執行：${d.result ? (d.result.status === "passed" ? "通過" : "失敗") : ""}`
+    : "已建立，存入 generated/");
+}
+
+// 確認彈窗：展示 preview 出的關鍵參數 + 時間提示 + 可編輯 spec YAML，
+// 「確定建立」才送 commit；「取消」直接關閉、不留任何記錄。
+function openConfirmModal(key, pv, run) {
+  const plan = pv.plan || {};
+  openModal(`<div class="dc-confirm">
+    <h3>確認生成參數 <span class="pill">尚未建立</span></h3>
+    <p class="sub2">以下為 AI 分解結果，<b>尚未落地</b>。請核對（特別是時間語意），可直接編輯下方 YAML 後再建立；取消則不留任何記錄。</p>
+    <div class="sec"><h4>用例</h4>
+      <div class="sub2"><code>${esc(pv.proposed_id || "")}</code> · ${esc(pv.system || "")}</div>
+      <p class="sub2">${esc(plan.description || "")}</p></div>
+    <div class="sec"><h4>任務流（${(plan.steps || []).length} 步）</h4>${decomposeStepsHtml(plan)}</div>
+    <div class="sec"><h4>⏱ 時間 / 打卡碼 / db_exec 參數（請確認「${esc((plan.description || "").slice(0, 20))}」的時間語意是否正確）</h4>
+      <div id="dc-hints">${timeHintsHtml(pv.spec_yaml)}</div></div>
+    <div class="sec"><h4>spec YAML（可編輯校正）</h4>
+      <textarea id="dc-yaml" class="dc-yaml" rows="16" spellcheck="false">${esc(pv.spec_yaml || "")}</textarea></div>
+    <label class="ck"><input type="checkbox" id="dc-run" ${run ? "checked" : ""} /> 建立後立即執行</label>
+    <div class="dc-confirm-actions">
+      <button class="btn ghost" id="dc-cancel">取消</button>
+      <button class="btn primary" id="dc-ok">確定建立</button>
+    </div>
+  </div>`);
+  // YAML 編輯後即時刷新時間提示，協助使用者邊改邊核對時間參數
+  const ta = $("dc-yaml");
+  if (ta) ta.oninput = () => { const h = $("dc-hints"); if (h) h.innerHTML = timeHintsHtml(ta.value); };
+  $("dc-cancel").onclick = closeModal;  // 取消：不送任何東西、不留記錄
+  const ok = $("dc-ok");
+  ok.onclick = async () => {
+    const specYaml = $("dc-yaml").value;
+    const doRun = $("dc-run").checked;  // checkbox 語意：建立後立即執行（只在 commit 帶上）
+    const oldTxt = ok.textContent; ok.disabled = true;
+    ok.textContent = doRun ? "建立 + 執行中…" : "建立中…";
+    try {
+      const d = await apiPost("/api/cases/decompose/commit", { spec_yaml: specYaml, run: doRun });
+      closeModal();
+      showDecomposeResult(d, plan, doRun);
+      loadCases(key);
+    } catch (e) {
+      toast("建立失敗：" + e.message);
+      ok.disabled = false; ok.textContent = oldTxt;
+    }
+  };
+}
+
 async function doDecompose(key) {
   const uc = $("uc").value.trim();
   if (!uc) { toast("請先輸入用例"); return; }
   const s = state[key] || {}, cur = tabByKey(s.tab);
   // 規劃中領域（labor/employer）：前端先攔，給明確提示，不送後端
   if (cur.planned) { toast(`${cur.label}領域分解規劃中，暫不支援`); return; }
+  // uc-run checkbox 語意改為「建立後立即執行」，先讀起來帶進確認彈窗（只在 commit 時生效）
   const run = $("uc-run").checked, btn = $("uc-go"), old = btn.textContent;
-  btn.disabled = true; btn.textContent = run ? "分解 + 執行中…" : "分解中…";
+  btn.disabled = true; btn.textContent = "分解中…";
   try {
-    // 帶上當前 tab 的 system（all 為 ""，後端視為不指定）
-    const d = await apiPost("/api/cases/decompose", { use_case: uc, run, system: cur.system });
-    const plan = d.plan || {};
-    const steps = (plan.steps || []).map((st, i) => {
-      const lbl = st.kind === "db_exec" ? "db_exec" : esc(st.transition || "?");
-      return `<div class="cstep"><span class="ci">${i}</span>
-        <span class="badge ${st.kind === "db_exec" ? "b-draft" : "b-running"}">${lbl}</span>
-        ${st.note ? `<span class="sub2">${esc(st.note)}</span>` : ""}</div>`;
-    }).join("");
-    openDrawer(`
-      <div class="dhead"><span class="sn">${esc(d.saved)} · ${esc(d.system)}</span>
-        <h3>${esc(plan.path_id || "")} <span class="pill">AI 產生</span></h3>
-        <p class="sub2">${esc(plan.description || "")}</p></div>
-      <div class="sec"><h4>分解後任務流</h4>${steps}</div>
-      ${d.result ? `<div class="sec"><h4>執行結果 ${resBadge(d.result.status)}</h4>${runResultHtml(d.result)}</div>` : ""}`);
-    toast(run ? `分解完成並執行：${d.result ? (d.result.status === "passed" ? "通過" : "失敗") : ""}`
-      : "分解完成，已存入 generated/");
-    loadCases(key);
+    // 第一段：只 preview（產 plan/spec 但不落地），帶上當前 tab 的 system（all 為 ""）
+    const pv = await apiPost("/api/cases/decompose/preview", { use_case: uc, system: cur.system });
+    // 第二段：彈窗確認/校正，使用者按「確定建立」才 commit 落地（取消不留記錄）
+    openConfirmModal(key, pv, run);
   } catch (e) { toast("分解失敗：" + e.message); }
   finally { btn.disabled = false; btn.textContent = old; }
 }

@@ -365,19 +365,68 @@ class CaseStore:
         from ..planner import suggest_tab as _suggest_tab
         return _suggest_tab(description, self.settings)
 
-    def decompose(self, use_case: str, run: bool = False,
-                  system: str | None = None) -> dict:
+    def decompose_preview(self, use_case: str, system: str | None = None) -> dict:
+        """分解第一段：呼叫 LLM 產 plan + 展開 spec，算好防撞 id，但**不落地**。
+
+        刻意只做純計算（planner 分解 → build_path → _unique_case_id），
+        全程不 mkdir / 不 write_text / 不 sync_cases / 不 _run_spec —— 取消時不留任何記錄。
+        回傳同時附 spec 的 YAML 字串（spec_yaml），供前端塞進可編輯 textarea。
+        使用者確認/校正後再以 decompose_commit 真正建立。
+        """
         from ..planner import build_path
         from ..planner import decompose as _decompose
 
         # system 為前端 tab 指定的目標系統（job/contract）；透傳給 planner
         plan = _decompose(use_case, self.settings, system=system)
         spec = build_path(plan)
-        spec["id"] = self._unique_case_id(str(spec.get("id") or "ai-case"))  # 防覆蓋
+        spec["id"] = self._unique_case_id(str(spec.get("id") or "ai-case"))  # 預先算好防撞號
+        spec_yaml = yaml.safe_dump(spec, allow_unicode=True, sort_keys=False)
+        return {"plan": plan.raw, "spec": spec, "spec_yaml": spec_yaml,
+                "proposed_id": spec["id"], "system": plan.system}
+
+    def decompose_commit(self, spec: dict | str, run: bool = False) -> dict:
+        """分解第二段：把（可能經前端校正過的）spec 真正落地。
+
+        spec 可為 dict 或 YAML 字串（前端送 textarea 內容時為字串）。
+        落地流程：解析 → 對最終 id 再做一次 _unique_case_id 防撞（preview→commit
+        之間可能有人佔號）→ mkdir + write_text + sync_cases；run 為真才 _run_spec。
+        回傳形狀與舊 decompose 相容：{plan?, spec, saved, system, result?}。
+        """
+        if isinstance(spec, str):
+            parsed = yaml.safe_load(spec)
+            if not isinstance(parsed, dict) or "path" not in parsed:
+                raise ValueError("spec YAML 格式不正確（需為含 path 的物件）")
+            spec = parsed
+        # commit 時對最終 id 再防撞一次（preview 算過的號到此刻可能已被別人佔用）
+        spec["id"] = self._unique_case_id(str(spec.get("id") or "ai-case"))
+        system = _detect_system(spec)
         GENERATED_DIR.mkdir(parents=True, exist_ok=True)
         out = GENERATED_DIR / f"{spec['id']}.yaml"
         out.write_text(yaml.safe_dump(spec, allow_unicode=True, sort_keys=False), encoding="utf-8")
-        payload = {"plan": plan.raw, "spec": spec, "saved": out.name, "system": plan.system}
+        payload = {"spec": spec, "saved": out.name, "system": system}
         if run:
+            # _run_spec 內部會 sync_cases 再執行
             payload["result"] = self._run_spec(spec, source="generated", file=out.name)
+        else:
+            # 不執行時也要把用例註冊進 qa_cases（與 list_cases / _run_spec 的 sync 一致）
+            self.qa.sync_cases([{
+                "id": spec["id"], "file": out.name, "system": system, "source": "generated",
+                "description": str(spec.get("description", "")).strip(),
+                "step_count": len(spec.get("path", [])),
+                "yaml": yaml.safe_dump(spec, allow_unicode=True, sort_keys=False),
+                "created_at": 0,
+            }])
         return payload
+
+    def decompose(self, use_case: str, run: bool = False,
+                  system: str | None = None) -> dict:
+        """一步到位的舊行為（preview + commit 組合），供 CLI / 既有呼叫端沿用。
+
+        新看板流程改走 decompose_preview（彈窗確認）+ decompose_commit（確認後落地）；
+        此方法保留是為了不破壞任何依賴舊「分解即落地」語意的呼叫端。
+        """
+        pv = self.decompose_preview(use_case, system=system)
+        out = self.decompose_commit(pv["spec"], run=run)
+        # 補回舊 decompose 會帶的 plan（commit 不重算 plan，從 preview 取）
+        out["plan"] = pv["plan"]
+        return out
