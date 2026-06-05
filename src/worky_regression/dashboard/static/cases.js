@@ -160,13 +160,16 @@ export async function renderCases(key) {
   loadCases(key);
 }
 
-// 切到某 tab：套用 system + 查詢內容(query) + placeholder，回頂層後整頁重渲染。
-// 自訂 tab 帶 query → 同時設定清單搜尋字；內建 tab 無 query → 清空搜尋，語意一致。
+// 切到某 tab：套用篩選 + placeholder，回頂層後整頁重渲染。
+// 篩選優先以 system 為主（結構性、可靠）；只有「無 system」的 tab 才退而用 query 文字搜尋。
+// 否則 system + query 兩個條件 AND 起來，常因 query 文字未出現在用例描述而把清單濾成空的。
 function selectTab(key, tabKey) {
   const s = state[key], t2 = tabByKey(tabKey);
   s.tab = t2.key;
   s.system = t2.system;          // all / 未判定 → ""
-  s.q = t2.query || "";          // 自訂 tab 的查詢內容；內建 tab 無 query 即清空
+  // 有 system → 只用 system 篩（清空搜尋字，避免 query 再把該領域用例濾光）；
+  // 無 system → query 是唯一可用的篩選依據，套用為搜尋字。
+  s.q = t2.system ? "" : (t2.query || "");
   resetToRoot(s);                // 回頂層 + 首頁
   renderCases(key);              // 重渲染：active、placeholder、搜尋框、清單一次到位
 }
