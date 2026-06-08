@@ -70,8 +70,12 @@ class QAStore:
 
     def insert_run(self, *, run_id: str, case_id: str, system: str, status: str,
                    description: str, started_at: int, failed_at: int | None,
-                   steps: list[dict[str, Any]], source: str = "run") -> None:
-        """寫一次執行（qa_runs + qa_run_steps），同交易；同 run_id 重入會先清再插（冪等）。"""
+                   steps: list[dict[str, Any]], source: str = "run",
+                   actors: dict | None = None) -> None:
+        """寫一次執行（qa_runs + qa_run_steps），同交易；同 run_id 重入會先清再插（冪等）。
+
+        actors：本次參與帳號快照（{role: {...}}），以 JSON 存 qa_runs.actors，供詳情頁展示。
+        """
         passed = sum(1 for s in steps if s.get("status") == "passed")
         total = len(steps)
         with self._engine.begin() as conn:
@@ -79,12 +83,13 @@ class QAStore:
             conn.execute(text("DELETE FROM qa_runs WHERE run_id=:r"), {"r": run_id})
             conn.execute(text("""
                 INSERT INTO qa_runs
-                  (run_id, case_id, `system`, status, description, started_at, passed, total, failed_at, source)
-                VALUES (:run_id, :case_id, :system, :status, :description, :started_at, :passed, :total, :failed_at, :source)
+                  (run_id, case_id, `system`, status, description, started_at, passed, total, failed_at, source, actors)
+                VALUES (:run_id, :case_id, :system, :status, :description, :started_at, :passed, :total, :failed_at, :source, :actors)
             """), {
                 "run_id": run_id, "case_id": case_id, "system": system, "status": status,
                 "description": description, "started_at": int(started_at), "passed": passed,
                 "total": total, "failed_at": failed_at, "source": source,
+                "actors": json.dumps(actors or {}, ensure_ascii=False),
             })
             if steps:
                 conn.execute(text("""
@@ -97,6 +102,28 @@ class QAStore:
                     "elapsed_ms": int(s.get("elapsed_ms", 0)), "error": s.get("error"),
                     "observations": json.dumps(s.get("observations") or {}, ensure_ascii=False),
                 } for i, s in enumerate(steps)])
+
+    # ── 看板可編輯設定（qa_settings key-value）─────────────────────────────────
+    def get_settings(self, keys: list[str] | None = None) -> dict[str, str]:
+        """讀設定；keys 為 None 時回全部。`key` 為 MySQL 保留字，加反引號。"""
+        with self._engine.begin() as conn:
+            if keys:
+                stmt = text("SELECT `key`, value FROM qa_settings WHERE `key` IN :ks") \
+                    .bindparams(bindparam("ks", expanding=True))
+                rows = conn.execute(stmt, {"ks": keys}).fetchall()
+            else:
+                rows = conn.execute(text("SELECT `key`, value FROM qa_settings")).fetchall()
+        return {r._mapping["key"]: r._mapping["value"] for r in rows}
+
+    def set_settings(self, items: dict[str, str]) -> None:
+        """upsert 設定（value 為 None 的鍵略過，不覆蓋既有）。"""
+        rows = [{"k": k, "v": v} for k, v in items.items() if v is not None]
+        if not rows:
+            return
+        sql = text("INSERT INTO qa_settings (`key`, value) VALUES (:k, :v) "
+                   "ON DUPLICATE KEY UPDATE value = VALUES(value)")
+        with self._engine.begin() as conn:
+            conn.execute(sql, rows)
 
     # ── 讀取（回傳前端既有形狀 + run_id）───────────────────────────────────────
     @staticmethod
@@ -164,9 +191,16 @@ class QAStore:
                     "status": m["status"], "elapsed_ms": m["elapsed_ms"],
                     "observations": obs or {}, "error": m["error"],
                 })
+            actors = run.get("actors")
+            if isinstance(actors, str):
+                try:
+                    actors = json.loads(actors)
+                except Exception:  # noqa: BLE001
+                    actors = {}
             return {
                 "run_id": run["run_id"], "status": run["status"],
-                "started_at": run["started_at"], "failed_at": run["failed_at"], "steps": steps,
+                "started_at": run["started_at"], "failed_at": run["failed_at"],
+                "steps": steps, "actors": actors or {},
             }
 
     def case_seq(self, case_id: str) -> int | None:

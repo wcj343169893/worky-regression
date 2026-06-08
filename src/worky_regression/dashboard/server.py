@@ -51,6 +51,22 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _sse_start(self):
+        """開一條 Server-Sent Events 串流連線（標頭只送一次，之後逐筆 _sse_send）。"""
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Connection", "keep-alive")
+        # 關掉 nginx 等反代的緩衝，event 才會即時到前端
+        self.send_header("X-Accel-Buffering", "no")
+        self.end_headers()
+
+    def _sse_send(self, etype: str, payload):
+        """送一筆 SSE 事件；前端關頁造成的 BrokenPipeError 由呼叫端吞掉以續跑。"""
+        data = json.dumps({"type": etype, **payload}, ensure_ascii=False, default=str)
+        self.wfile.write(f"data: {data}\n\n".encode("utf-8"))
+        self.wfile.flush()
+
     def _send_file(self, path: Path):
         if not path.is_file():
             self._send_json({"error": "not found"}, 404)
@@ -139,6 +155,14 @@ class Handler(BaseHTTPRequestHandler):
                     limit=_int(query, "limit", 20),
                     offset=_int(query, "offset", 0),
                     parent_id=_one(query, "parent_id", "__root__")))
+            elif path == "/api/cases/run-stream":
+                # SSE 即時逐步執行：連線本身驅動執行，每步開始/結束推一筆事件給看板。
+                # EventSource 只能 GET，故 id 走 query string（?id=<case_id>）。
+                cid = _one(query, "id", "")
+                if not cid:
+                    self._send_json({"error": "缺少 id"}, 400)
+                else:
+                    self._run_stream(cid)
             elif path.startswith("/api/cases/") and path.endswith("/steps"):
                 cid = path[len("/api/cases/"):-len("/steps")]
                 data = _cases().case_steps(cid)
@@ -160,6 +184,34 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as e:  # noqa: BLE001
             traceback.print_exc()
             self._send_json({"error": str(e)}, 500)
+
+    def _run_stream(self, case_id: str):
+        """以 SSE 跑一條用例：連線本身驅動執行，逐步推送事件給看板。
+
+        執行同步跑在這條請求自己的 thread 內（ThreadingHTTPServer），邊跑邊吐 event。
+        前端中途關頁 → 寫入觸發 BrokenPipeError，標記斷線後續事件不再嘗試寫，
+        但 run_case_streaming 仍會跑完並照常落地 worky_qa_dashboard（關頁不丟 run）。
+        """
+        self._sse_start()
+        disconnected = {"v": False}
+
+        def on_event(etype, payload):
+            if disconnected["v"]:
+                return
+            try:
+                self._sse_send(etype, payload)
+            except (BrokenPipeError, ConnectionResetError):
+                disconnected["v"] = True
+
+        try:
+            _cases().run_case_streaming(case_id, on_event)
+        except Exception as e:  # noqa: BLE001 — 已開 SSE，錯誤改以事件送出
+            traceback.print_exc()
+            if not disconnected["v"]:
+                try:
+                    self._sse_send("error", {"error": str(e)})
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
 
     def do_POST(self):  # noqa: N802
         parsed = urlparse(self.path)
@@ -234,6 +286,31 @@ class Handler(BaseHTTPRequestHandler):
                     sysname = str((body or {}).get("system", "")).strip() or None
                     self._send_json(_cases().decompose(
                         uc, run=bool((body or {}).get("run")), system=sysname))
+            # ── 系統設置：後台管理員帳密 + 審核 ──
+            elif path == "/api/settings/backend":
+                b = body or {}
+                self._send_json(_service().update_backend_config(
+                    base=b.get("base"), username=b.get("username"),
+                    password=b.get("password")))
+            elif path == "/api/backend/login-test":
+                self._send_json(_service().backend_login_test())
+            elif path == "/api/labors/review":
+                rid = _review_id(body)
+                if rid is None:
+                    self._send_json({"error": "缺少 id"}, 400)
+                else:
+                    self._send_json(_service().review_labor(
+                        rid, approve=bool((body or {}).get("approve")),
+                        reasons=(body or {}).get("reasons")))
+            elif path == "/api/shops/review":
+                rid = _review_id(body)
+                if rid is None:
+                    self._send_json({"error": "缺少 id"}, 400)
+                else:
+                    self._send_json(_service().review_shop(
+                        rid, approve=bool((body or {}).get("approve")),
+                        reason_ids=(body or {}).get("reason_ids"),
+                        other_reason=str((body or {}).get("other_reason", ""))))
             else:
                 self._send_json({"error": "not found"}, 404)
         except BrokenPipeError:
@@ -274,6 +351,15 @@ def _filters(q: dict) -> dict:
 def _step_index(body: dict):
     """從 POST body 取 step_index（int），缺失/非數字回 None。"""
     v = (body or {}).get("step_index")
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def _review_id(body: dict):
+    """從 POST body 取審核對象 id（int），缺失/非數字回 None。"""
+    v = (body or {}).get("id")
     try:
         return int(v)
     except (TypeError, ValueError):

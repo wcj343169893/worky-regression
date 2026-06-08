@@ -83,12 +83,16 @@ class AccountPool:
         want = set(caps_required)
         skip = {str(x) for x in (exclude or [])}
         with self._qa_engine.begin() as conn:
+            # 排序：① 同 owner 已租過的優先（同一 run 內取回原帳號）；
+            #      ② 其次「最久未用優先」(last_used_at ASC) → 在多帳號時自動輪換，
+            #         分散每商家每日發佈上限（避免 20020 刊登中工作超過上限）；
+            #      ③ 最後 account_id 穩定排序。
             rows = conn.execute(text("""
                 SELECT id, account_id, role, user_type, phone, username, shop_id, caps, note
                 FROM qa_accounts
                 WHERE role=:role AND state<>'disabled'
                   AND (state='available' OR lease_expires_at < :now)
-                ORDER BY (lease_owner=:owner) DESC, account_id ASC
+                ORDER BY (lease_owner=:owner) DESC, last_used_at ASC, account_id ASC
             """), {"role": role, "now": now, "owner": owner}).all()
             def _caps(r) -> list[str]:
                 c = r.caps
@@ -108,6 +112,10 @@ class AccountPool:
                     f"role={role} 需要 {n} 個具備 {sorted(want)} 的帳號，僅 {len(chosen)} 個符合。"
                     f"\n可用候選(account_id, caps)={avail}"
                 )
+            # 標記「最近使用時間」→ 下次配發走最久未用優先輪換（與 lease 無關，純輪換用）
+            for r in chosen:
+                conn.execute(text(
+                    "UPDATE qa_accounts SET last_used_at=:now WHERE id=:id"), {"now": now, "id": r.id})
             if lease:
                 exp = now + lease_secs
                 for r in chosen:
@@ -134,7 +142,7 @@ class AccountPool:
                 FROM qa_accounts
                 WHERE role=:role AND state<>'disabled'
                   AND (state='available' OR lease_expires_at < :now)
-                ORDER BY account_id ASC
+                ORDER BY last_used_at ASC, account_id ASC
             """), {"role": role, "now": now}).all()
 
             def _caps(r):
@@ -148,6 +156,9 @@ class AccountPool:
                     f"role={role} 需要 {n} 個『具 {sorted(base)} 但缺 {lacking}』的帳號，僅 {len(chosen)} 個。"
                     f"\n候選={avail}"
                 )
+            for r in chosen:
+                conn.execute(text(
+                    "UPDATE qa_accounts SET last_used_at=:now WHERE id=:id"), {"now": now, "id": r.id})
             if lease:
                 exp = now + 900
                 for r in chosen:

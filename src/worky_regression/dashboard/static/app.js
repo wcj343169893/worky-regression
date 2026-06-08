@@ -21,13 +21,17 @@ const NAV = [
 
 function route() {
   closeDrawer();
-  // 雜湊格式：#view 或 #view/<sub>；sub 目前僅 cases 用來定位領域 tab（刷新可還原）
-  let [key, sub] = (location.hash.replace("#", "") || "jobs").split("/");
+  // 雜湊格式：
+  //   #view 或 #view/<sub>
+  //   cases 用 #cases/<tab>/<父id>/<父id2>…：第一段 sub 為領域 tab，其後各段為下鑽父用例鏈，
+  //   讓「查看子任務」的層級寫進 URL（刷新 / 前進後退皆可還原）。
+  let [key, ...rest] = (location.hash.replace("#", "") || "jobs").split("/");
   // 相容舊雜湊：兩個用例入口已合併為單一 cases，正規化避免白屏
   if (key === "job-cases" || key === "task-cases") key = "cases";
   NAV.forEach((n) => { const b = document.querySelector(`.nav button[data-k="${n.key}"]`); if (b) b.classList.toggle("active", n.key === key); });
   if (BOARDS[key]) return renderBoard(key);
-  if (CASES[key]) return renderCases(key, sub);
+  // rest[0] = tab，rest.slice(1) = 下鑽父用例鏈
+  if (CASES[key]) return renderCases(key, rest[0], rest.slice(1));
   if (TABLES[key]) return renderTable(key);
   if (key === "settings") return renderSettings();
   location.hash = "jobs";

@@ -23,6 +23,7 @@ export const pad = (n) => String(n).padStart(2, "0");
 
 export const resBadge = (st) => st === "passed" ? `<span class="badge b-done">通過</span>`
   : st === "failed" ? `<span class="badge b-failed">失敗</span>`
+  : st === "skipped" ? `<span class="badge b-draft">略過</span>`
   : `<span class="badge b-draft">${esc(st || "-")}</span>`;
 
 export function fmtTs(v) {

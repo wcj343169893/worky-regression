@@ -80,8 +80,8 @@ tbody tr{cursor:default;transition:.1s}
 tbody tr:hover{background:var(--panel2)}
 tbody tr.norow:hover{background:transparent}
 tbody tr.sel{background:rgba(91,140,255,.12)}
-td.act,th.act{text-align:center;white-space:nowrap;width:1%}
-td.act{display:flex;gap:6px;justify-content:center}
+/* td.act,th.act{text-align:center;white-space:nowrap;width:1%}
+td.act{display:flex;gap:6px;justify-content:center} */
 .view-btn{padding:5px 14px;font-size:13px;border-radius:8px}
 .view-btn:hover{background:var(--accent);border-color:var(--accent);color:#fff}
 .run-btn{padding:5px 14px;font-size:13px;border-radius:8px}
@@ -151,6 +151,17 @@ textarea:focus{outline:none;border-color:var(--accent)}
 .tchip.tchip-pass{background:rgba(61,220,151,.16);border-color:var(--ok);color:var(--ok)}
 .tchip.tchip-fail{background:rgba(255,107,107,.18);border-color:var(--danger);color:var(--danger)}
 .tchip.tchip-skip{opacity:.55}
+/* 進行中：SSE step_start 點亮，背景橘色呼吸閃爍，step_end 後換成 pass/fail 色 */
+.tchip.tchip-running{background:rgba(255,180,84,.20);border-color:#ffb454;color:#ffb454;
+  animation:tchip-pulse 1s ease-in-out infinite}
+@keyframes tchip-pulse{0%,100%{opacity:1}50%{opacity:.35}}
+/* 詳情頁：略過(skip)用例橫幅 */
+.skip-banner{margin:0 0 12px;padding:9px 12px;border-radius:10px;font-size:13px;
+  background:rgba(255,180,84,.12);border:1px solid var(--warn);color:var(--warn)}
+/* 詳情頁「參與帳號」表：角色 / 手機 / id / 型別 */
+.actors-table{width:100%;border-collapse:collapse;font-size:12px}
+.actors-table th,.actors-table td{text-align:left;padding:4px 8px;border-bottom:1px solid var(--line)}
+.actors-table th{color:var(--muted);font-weight:600}
 .tchip.clickable{cursor:pointer;transition:.12s}
 .tchip.clickable:hover{filter:brightness(1.25);border-color:var(--accent)}
 /* AI 分解確認彈窗：落地前檢視/校正生成參數（沿用 .sec/.pill/.cstep/.ck 視覺語彙）*/
@@ -257,6 +268,23 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
 .kv:last-child{border-bottom:0}
 .kv .key{color:var(--muted)} .kv .val{font-weight:600;text-align:right;word-break:break-all}
 .dot-ok{color:var(--ok)} .dot-no{color:var(--danger)}
+
+/* 後台管理員設定卡片（跨欄、可編輯）*/
+.set-card-wide{grid-column:1/-1}
+.set-hint{margin:0 0 12px;font-size:12px;color:var(--muted)}
+.set-form{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px}
+.set-form label{display:flex;flex-direction:column;gap:5px;font-size:12px;color:var(--muted)}
+.set-form input{appearance:none;background:var(--panel2);border:1px solid var(--line);border-radius:8px;
+  padding:8px 10px;color:var(--text,#e6ebff);font-size:13px}
+.set-form input:focus{outline:none;border-color:var(--accent)}
+.set-actions{display:flex;align-items:center;gap:10px;margin-top:14px}
+.set-status{font-size:13px}
+.set-status.ok{color:var(--ok)} .set-status.no{color:var(--danger)}
+
+/* 審核操作欄小按鈕 */
+.btn.mini{padding:3px 9px;font-size:12px;margin-right:5px}
+.btn.ok{border-color:var(--ok);color:var(--ok)} .btn.ok:hover{background:var(--ok);color:#fff;border-color:transparent}
+.btn.no{border-color:var(--danger);color:var(--danger)} .btn.no:hover{background:var(--danger);color:#fff;border-color:transparent}
 
 /* 詳情區塊（右欄內嵌）*/
 .sec{margin-bottom:20px}

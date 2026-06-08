@@ -169,6 +169,8 @@ class CaseStore:
             "id": case_id, "file": path.name, "source": source,
             "system": _detect_system(spec),
             "description": str(spec.get("description", "")).strip(),
+            "skip": bool(spec.get("skip")),
+            "skip_reason": str(spec.get("skip_reason", "")).strip(),
             "steps": steps,
             "yaml": path.read_text(encoding="utf-8"),
             "history": self.qa.history(case_id, limit=10),
@@ -227,7 +229,7 @@ class CaseStore:
 
     # ── 執行 / 分解（會真的打被測 API）────────────────────────────────────────
     def _run_spec(self, spec: dict, *, source: str = "builtin", file: str = "",
-                  actors: dict | None = None) -> dict:
+                  actors: dict | None = None, on_event=None) -> dict:
         from ..autotest import _actors_for
         from ..recorder import RecordingRunner
         from ..verifier import DBVerifier
@@ -241,11 +243,18 @@ class CaseStore:
             "yaml": yaml.safe_dump(spec, allow_unicode=True, sort_keys=False),
             "created_at": 0,
         }])
+        # skip 用例（時間鎖 / 無 API 可替代）：不配帳號、不連 DB、不打被測 API，
+        # 只記一筆全 skipped 的 run（避免為跑不了的用例白白佔用帳號池或觸發 PoolShortage）。
+        if spec.get("skip"):
+            return RecordingRunner(None, qa_store=self.qa, system=system).run(
+                spec, actors={}, on_event=on_event).to_dict()
         db = DBVerifier(self.settings.for_system(system))   # contract/job dev 分庫
         # actors 可由呼叫端覆蓋（換號時帶入「已排除原帳號」的 actors）；否則照常配發
         if actors is None:
             actors = _actors_for(system, self.settings)
-        return RecordingRunner(db, qa_store=self.qa, system=system).run(spec, actors=actors).to_dict()
+        # on_event（可選）：透傳給 RecordingRunner 做逐步事件回呼（看板 SSE 即時刷新用）
+        return RecordingRunner(db, qa_store=self.qa, system=system).run(
+            spec, actors=actors, on_event=on_event).to_dict()
 
     def run_case(self, case_id: str) -> dict:
         found = self._find(case_id)
@@ -253,6 +262,18 @@ class CaseStore:
             raise ValueError(f"找不到用例 {case_id}")
         path, source, spec = found
         return self._run_spec(spec, source=source, file=path.name)
+
+    def run_case_streaming(self, case_id: str, on_event) -> dict:
+        """同 run_case，但逐步把執行事件回呼給 on_event（看板 SSE 用）。
+
+        執行模型與 run_case 完全相同（同步、同樣落地 worky_qa_dashboard），差別只在
+        多了 on_event 回呼。回傳值同 run_case（完整 RunResult dict），供呼叫端收尾。
+        """
+        found = self._find(case_id)
+        if found is None:
+            raise ValueError(f"找不到用例 {case_id}")
+        path, source, spec = found
+        return self._run_spec(spec, source=source, file=path.name, on_event=on_event)
 
     # ── 失敗步驟的 AI 分析 / 換號重跑（step modal「分析 / 重試 / 換一個號」）──────
     def _failed_step(self, case_id: str, step_index: int) -> tuple[dict, dict]:

@@ -72,6 +72,9 @@ class QARun(Base):
     total: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
     failed_at: Mapped[int | None] = mapped_column(Integer)
     source: Mapped[str] = mapped_column(String(16), nullable=False, server_default="run")
+    # 本次執行參與的帳號快照（{role: {phone, user_id, user_type, shop_id, display_name}}）；
+    # 供詳情頁展示「參與測試的手機號 / id」。帳號由池配發、每次可能不同，故隨 run 落地。
+    actors: Mapped[dict | None] = mapped_column(JSON)
     created_at: Mapped[datetime] = mapped_column(server_default=func.current_timestamp())
 
     __table_args__ = (Index("idx_case_started", "case_id", "started_at"),)
@@ -92,6 +95,20 @@ class QARunStep(Base):
     observations: Mapped[dict | None] = mapped_column(JSON)
 
     __table_args__ = (Index("idx_run", "run_id", "step_index"),)
+
+
+class QASetting(Base):
+    """看板可編輯設定（key-value）：目前存後台管理員帳密（base/username/password）。
+
+    與 .env 不同：.env 是部署期固定的連線/密鑰，這裡是執行期由看板 UI 編輯並持久化的設定。
+    密碼需可重放到 Yii2 後台表單登入，故以明文存放；API 對外只回 password_set 布林、不外洩明文。
+    """
+    __tablename__ = "qa_settings"
+
+    key: Mapped[str] = mapped_column(String(64), primary_key=True)
+    value: Mapped[str | None] = mapped_column(Text)
+    updated_at: Mapped[datetime] = mapped_column(
+        server_default=func.current_timestamp(), onupdate=func.current_timestamp())
 
 
 class QAAccount(Base):
@@ -117,6 +134,8 @@ class QAAccount(Base):
     # 軟租約：避免同一帳號被並行 run 重複借走
     lease_owner: Mapped[str | None] = mapped_column(String(160))
     lease_expires_at: Mapped[int] = mapped_column(BigInteger, nullable=False, server_default="0")
+    # 最近被配發的時間（unix 秒）；acquire 以此做「最久未用優先」輪換，分散每商家每日發佈上限。
+    last_used_at: Mapped[int] = mapped_column(BigInteger, nullable=False, server_default="0")
 
     __table_args__ = (
         Index("uq_account_role", "account_id", "role", unique=True),

@@ -15,7 +15,7 @@ from __future__ import annotations
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import yaml
 
@@ -44,6 +44,8 @@ class RunResult:
     steps: list[StepResult]
     failed_at: int | None = None    # 失敗步的 index
     run_id: str | None = None       # 每次執行唯一 id（{path_id}-{started_at}-{hex}）
+    # 參與本次執行的帳號快照：{role: {phone, user_id, user_type, shop_id, display_name}}
+    actors: dict[str, dict[str, Any]] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         d = asdict(self)
@@ -68,36 +70,83 @@ class RecordingRunner:
             publisher: Actor | None = None, receiver: Actor | None = None,
             employer: Actor | None = None, labor: Actor | None = None,
             actors: dict[str, Actor] | None = None,
-            write: bool = True, started_at: int | None = None) -> RunResult:
+            write: bool = True, started_at: int | None = None,
+            on_event: Callable[[str, dict], None] | None = None) -> RunResult:
+        """逐步執行並落地。
+
+        on_event（可選）：每步開始/結束、整支開始/結束都回呼一次，供看板做 SSE 即時逐步刷新。
+          事件型別與 payload：
+            run_start  {run_id, total, transitions:[...]}
+            step_start {index, kind, name, tindex|None}
+            step_end   {index, status, elapsed_ms, error, tindex|None}
+            run_end    {status, failed_at, passed, total}
+          tindex 是「只數 transition 步驟」的序號（跳過 db_exec/sleep/assert_*），
+          與看板 chip 一一對應；非 transition 步驟為 None。
+          回呼自身的例外（含前端關頁造成的 BrokenPipeError）一律吞掉——
+          推送失敗不能中斷執行，整支仍須跑完並照常落地。
+        """
         spec = path if isinstance(path, dict) else self._load(path)
+        # run_id 前移：run_start 事件需要它，故 id 校驗 + 計算都在進迴圈前完成
+        path_id = spec.get("id")
+        if not path_id:
+            raise ValueError("用例缺少 id：每筆用例都必須有唯一 id 才能落庫追溯（請在 YAML 補 id:）")
+        ts = started_at if started_at is not None else int(time.time())
+        run_id = make_run_id(path_id, ts)
+
         state = self.runner.init_state(
             actors=actors, publisher=publisher, receiver=receiver,
             employer=employer, labor=labor, extra_vars=spec.get("vars"),
         )
 
+        def emit(etype: str, payload: dict) -> None:
+            if on_event is None:
+                return
+            try:
+                on_event(etype, payload)
+            except Exception:  # noqa: BLE001 — 推送失敗（含 BrokenPipeError）不可中斷執行
+                pass
+
+        # skip 用例（時間鎖 / 無 API 可替代）：不執行任何步驟、不打被測 API，
+        # 只記一筆全 skipped 的 run。stopped 從一開始就 True，迴圈會把每步記成 skipped。
+        skipped = bool(spec.get("skip"))
+        skip_reason = str(spec.get("skip_reason", "")).strip()
+
         steps: list[StepResult] = []
         status = "passed"
         failed_at: int | None = None
-        stopped = False
+        stopped = skipped
+        tindex = -1  # transition 序號（與 chip 對應）；每遇 transition 步驟 +1
+
+        emit("run_start", {"run_id": run_id, "started_at": ts, "total": len(spec["path"]),
+                           "skipped": skipped, "skip_reason": skip_reason,
+                           "transitions": [s.get("transition") for s in spec["path"]
+                                           if s.get("transition")]})
 
         for i, step in enumerate(spec["path"]):
             is_db = "db_exec" in step
             is_sleep = "sleep" in step
             is_assert = "assert_state" in step
             is_assert_api = "assert_api" in step
+            is_wait_api = "wait_api" in step
             if is_db:
                 kind = name = "db_exec"
             elif is_assert:
                 kind, name = "assert_state", "assert_state"
             elif is_assert_api:
                 kind, name = "assert_api", "assert_api"
+            elif is_wait_api:
+                kind, name = "wait_api", f"wait_api {step['wait_api'].get('query', '')}"
             elif is_sleep:
                 kind, name = "sleep", f"sleep {step['sleep']}s"
             else:
                 kind, name = "transition", step.get("transition", "?")
+            ti = (tindex := tindex + 1) if kind == "transition" else None
             if stopped:
                 steps.append(StepResult(i, kind, name, "skipped", 0))
+                emit("step_end", {"index": i, "status": "skipped",
+                                  "elapsed_ms": 0, "error": None, "tindex": ti})
                 continue
+            emit("step_start", {"index": i, "kind": kind, "name": name, "tindex": ti})
             t0 = time.time()
             try:
                 if is_db:
@@ -106,22 +155,26 @@ class RecordingRunner:
                     obs = self.runner._run_assert(step, state)
                 elif is_assert_api:
                     obs = self.runner._run_assert_api(step, state)
+                elif is_wait_api:
+                    obs = self.runner._run_wait_api(step, state)
                 elif is_sleep:
                     obs = self.runner._run_sleep(step, state)
                 else:
                     obs = self.runner._run_step(step, state)
-                steps.append(StepResult(i, kind, name, "passed",
-                                        int((time.time() - t0) * 1000), obs or {}))
+                elapsed = int((time.time() - t0) * 1000)
+                steps.append(StepResult(i, kind, name, "passed", elapsed, obs or {}))
+                emit("step_end", {"index": i, "status": "passed",
+                                  "elapsed_ms": elapsed, "error": None, "tindex": ti})
             except Exception as e:  # noqa: BLE001 — 記錄任何失敗，含 AssertionError
-                steps.append(StepResult(i, kind, name, "failed",
-                                        int((time.time() - t0) * 1000),
-                                        error=f"{type(e).__name__}: {e}"))
+                elapsed = int((time.time() - t0) * 1000)
+                err = f"{type(e).__name__}: {e}"
+                steps.append(StepResult(i, kind, name, "failed", elapsed, error=err))
                 status, failed_at, stopped = "failed", i, True
+                emit("step_end", {"index": i, "status": "failed",
+                                  "elapsed_ms": elapsed, "error": err, "tindex": ti})
 
-        path_id = spec.get("id")
-        if not path_id:
-            raise ValueError("用例缺少 id：每筆用例都必須有唯一 id 才能落庫追溯（請在 YAML 補 id:）")
-        ts = started_at if started_at is not None else int(time.time())
+        if skipped:
+            status = "skipped"   # 全程未執行，狀態獨立標記（前端顯示「略過」而非「失敗」）
         result = RunResult(
             path_id=path_id,
             description=str(spec.get("description", "")).strip(),
@@ -129,11 +182,30 @@ class RecordingRunner:
             status=status,
             steps=steps,
             failed_at=failed_at,
-            run_id=make_run_id(path_id, ts),
+            run_id=run_id,
+            actors=self._snapshot_actors(state),
         )
         if write and self.qa_store is not None:
             self._persist(result)
+        emit("run_end", {"status": status, "failed_at": failed_at,
+                        "skipped": skipped, "skip_reason": skip_reason,
+                        "passed": sum(1 for s in steps if s.status == "passed"),
+                        "total": len(steps)})
         return result
+
+    @staticmethod
+    def _snapshot_actors(state) -> dict[str, dict[str, Any]]:
+        """擷取本次執行的帳號身份（不含 client 等不可序列化欄位），供詳情頁展示參與帳號。"""
+        snap: dict[str, dict[str, Any]] = {}
+        for role, a in (getattr(state, "actors", None) or {}).items():
+            snap[role] = {
+                "phone": getattr(a, "phone", None),
+                "user_id": getattr(a, "user_id", None),
+                "user_type": getattr(a, "user_type", None),
+                "shop_id": getattr(a, "shop_id", None),
+                "display_name": getattr(a, "display_name", ""),
+            }
+        return snap
 
     def _persist(self, result: RunResult) -> None:
         self.qa_store.insert_run(
@@ -146,6 +218,7 @@ class RecordingRunner:
             failed_at=result.failed_at,
             steps=[asdict(s) for s in result.steps],
             source="run",
+            actors=result.actors,
         )
 
     @staticmethod

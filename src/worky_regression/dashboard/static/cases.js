@@ -84,16 +84,36 @@ function caseDetailHtml(d) {
   const last = d.last_result;
   return `
     <div class="dhead"><span class="sn">${esc(d.file)} · ${esc(d.system)}</span>
-      <h3>${esc(d.id)} <span class="pill">${d.source === "generated" ? "AI 產生" : "內建"}</span></h3>
+      <h3>${esc(d.id)} <span class="pill">${d.source === "generated" ? "AI 產生" : "內建"}</span>${d.skip ? ` <span class="pill">略過</span>` : ""}</h3>
       <p class="sub2">${esc(d.description || "")}</p></div>
+    ${d.skip ? `<div class="skip-banner">⏸ 此用例已標記 <b>略過</b>，執行時不打被測 API：${esc(d.skip_reason || "（未填原因）")}</div>` : ""}
     <div class="sec"><h4>任務流（${d.steps.length} 步）</h4>${stepList}</div>
+    ${actorsSecHtml(last)}
     <div class="sec"><h4>最近執行結果</h4>
       ${last ? `<div class="sub2" style="margin-bottom:8px">${resBadge(last.status)} ${fmtTs(last.started_at)}${last.run_id ? ` · <code>${esc(last.run_id)}</code>` : ""}</div>${runResultHtml(last)}`
         : `<div class="sub2">（尚無執行記錄）</div>`}</div>
     <div class="sec"><h4>YAML</h4><pre class="yaml">${esc(d.yaml)}</pre></div>`;
 }
 
-export async function renderCases(key, tabKey) {
+// 參與帳號區塊：列出最近一次執行用到的 actor（角色 / 手機 / id / 型別）。
+// 帳號由池配發、每次可能不同，故取自 last_result.actors（隨 run 落地）；無記錄則不顯示此區塊。
+const userTypeLabel = (t) => t === 1 ? "商家" : t === 2 ? "打工夥伴" : "";
+function actorsSecHtml(last) {
+  const actors = (last && last.actors) || {};
+  const roles = Object.keys(actors);
+  if (!roles.length) return "";
+  const rows = roles.map((role) => {
+    const a = actors[role] || {};
+    return `<tr><td><code>${esc(role)}</code></td><td>${esc(a.phone || "-")}</td>
+      <td>${a.user_id != null ? esc(String(a.user_id)) : "-"}</td>
+      <td>${esc(userTypeLabel(a.user_type))}</td></tr>`;
+  }).join("");
+  return `<div class="sec"><h4>參與帳號（最近一次執行）</h4>
+    <table class="actors-table"><thead><tr><th>角色</th><th>手機</th><th>ID</th><th>型別</th></tr></thead>
+    <tbody>${rows}</tbody></table></div>`;
+}
+
+export async function renderCases(key, tabKey, drillPath = []) {
   const cfg = CASES[key];
   // system 為頁內狀態（"" = 全部），由 AI 分解 tab 控制；tab 記住當前選中的領域 key
   // stack/parentId：主任務→子任務下鑽用的麵包屑堆疊與當前層父 id（頂層為 null）
@@ -105,6 +125,12 @@ export async function renderCases(key, tabKey) {
   // 避免重新整理按鈕重渲染時誤清掉使用者正在「全部」分頁打的搜尋字。
   const want = tabKey || "all";
   if (want !== s.tab) applyTab(s, want);
+  // 以 URL 的下鑽鏈為準還原層級（空 = 頂層）：刷新 / 瀏覽器前進後退都能正確還原。
+  // 只在父層真的改變時把分頁歸零，避免同層重渲染誤跳回第一頁。
+  const newParent = drillPath.length ? drillPath[drillPath.length - 1] : null;
+  if (s.parentId !== newParent) s.page = 0;
+  s.stack = drillPath.map((id) => ({ id, label: id }));
+  s.parentId = newParent;
   const cur = tabByKey(s.tab);
   // 內建 + 自訂 tab 依序渲染；自訂 tab 帶可移除的 ✕；末尾再接「＋新增」按鈕
   const tabsHtml = allTabs().map((t) =>
@@ -144,8 +170,15 @@ export async function renderCases(key, tabKey) {
         </div>
       </div>
     </div>`;
-  // 搜尋：回首頁並回到頂層（清空下鑽堆疊），讓搜尋語意一致
-  let t; $("q").oninput = (e) => { clearTimeout(t); s.q = e.target.value; t = setTimeout(() => { resetToRoot(s); loadCases(key); }, 300); };
+  // 搜尋：回到頂層（清空下鑽堆疊），讓搜尋語意一致。
+  // 在子層搜尋 → 走 hash 回頂層（同步 URL）；已在頂層 → 原地刷新（不重建、不失焦，常見情境）。
+  let t; $("q").oninput = (e) => {
+    clearTimeout(t); s.q = e.target.value;
+    t = setTimeout(() => {
+      if (s.stack && s.stack.length) goDrill(key, []);
+      else loadCases(key);
+    }, 300);
+  };
   $("uc-go").onclick = () => doDecompose(key);
   // 切 tab（內建或自訂）：整頁重渲染，套用該 tab 的 system / 查詢內容 / placeholder
   $("view").querySelectorAll(".dc-tab[data-tab]").forEach((b) =>
@@ -226,22 +259,31 @@ function openAddTabModal(key) {
 // 回到頂層：清空下鑽堆疊與當前父 id，並回到第一頁
 function resetToRoot(s) { s.stack = []; s.parentId = null; s.page = 0; }
 
-// 下鑽進某用例的子清單：把當前層 push 進堆疊，切到該用例為新父層，回第一頁
+// 下鑽導航的單一入口：把「父用例鏈」寫進 hash（#cases/<tab>/<父id>…），
+// 交給 hashchange → route → renderCases 還原層級並 loadCases。這樣下鑽層級就進了 URL，
+// 刷新 / 瀏覽器前進後退都能還原。hash 未變（少見）才手動補渲染。
+function goDrill(key, drillIds) {
+  const s = state[key];
+  const tab = s.tab || "all";
+  const parts = [key];
+  // all 且無下鑽 → 保持乾淨的 #cases；否則一律帶上 tab 段，下鑽段接其後
+  if (tab !== "all" || drillIds.length) parts.push(tab);
+  parts.push(...drillIds);
+  const newHash = parts.join("/");
+  if (location.hash.replace("#", "") === newHash) renderCases(key, tab, drillIds);
+  else location.hash = newHash;
+}
+
+// 下鑽進某用例的子清單：在當前父鏈尾端加上該用例 id
 function drillInto(key, c) {
   const s = state[key];
-  s.stack.push({ id: c.id, label: c.id });
-  s.parentId = c.id;
-  s.page = 0;
-  loadCases(key);
+  goDrill(key, (s.stack || []).map((n) => n.id).concat(c.id));
 }
 
 // 麵包屑點某層：pop 到該層（idx = -1 代表回頂層「測試用例」）
 function popTo(key, idx) {
   const s = state[key];
-  s.stack = s.stack.slice(0, idx + 1);
-  s.parentId = s.stack.length ? s.stack[s.stack.length - 1].id : null;
-  s.page = 0;
-  loadCases(key);
+  goDrill(key, (s.stack || []).slice(0, idx + 1).map((n) => n.id));
 }
 
 // 渲染麵包屑：頂層只顯示「測試用例」（不可點）；下鑽後逐層可點返回
@@ -329,19 +371,75 @@ async function openCaseDetail(id) {
   $("drawer-body").innerHTML = d ? caseDetailHtml(d) : `<div class="empty">載入失敗</div>`;
 }
 
-async function runCase(key, btn) {
+// 執行：改走 SSE（/api/cases/run-stream），邊跑邊即時更新該列 chip——
+//   run_start  → 該列所有 chip 還原待跑底色
+//   step_start → 對應 chip 點亮「進行中」閃爍（橘）
+//   step_end   → 依結果為該 chip 上色（綠/紅/灰），局部刷新，不整頁重載
+//   run_end    → 局部更新該列「最近結果」欄 + 開抽屜顯示完整結果（不整頁重載）
+// 失敗/連線中斷則 toast 並還原按鈕。republish / swap / retry 仍走同步 POST，不受影響。
+function runCase(key, btn) {
   const id = btn.dataset.id, old = btn.textContent;
+  const row = btn.closest("tr");
+  // 以列為範圍取 chip（data-ti 為 transition 序號，與後端事件的 tindex 對齊）
+  const chip = (ti) => (ti == null || !row) ? null : row.querySelector(`.tchip[data-ti="${ti}"]`);
+  const setChip = (ti, cls) => {
+    const c = chip(ti);
+    if (!c) return;
+    c.classList.remove("tchip-running", "tchip-pass", "tchip-fail", "tchip-skip");
+    if (cls) c.classList.add(cls);
+  };
+  const finish = () => { btn.disabled = false; btn.textContent = old; };
+  const statusToCls = (st) => st === "passed" ? "tchip-pass" : st === "failed" ? "tchip-fail"
+    : st === "skipped" ? "tchip-skip" : "";
+
   btn.disabled = true; btn.textContent = "執行中…";
   toast(`執行中：${id}（登入 + 呼叫被測 API，請稍候）`);
+
+  const es = new EventSource("/api/cases/run-stream?id=" + encodeURIComponent(id));
+  let startedAt = null, total = 0;
+  es.onmessage = (ev) => {
+    let e; try { e = JSON.parse(ev.data); } catch { return; }
+    if (e.type === "run_start") {
+      startedAt = e.started_at; total = e.total;
+      // 還原該列所有 chip 為待跑底色（重跑時清掉上一輪殘留的綠/紅）
+      if (row) row.querySelectorAll(".tchip").forEach((c) =>
+        c.classList.remove("tchip-running", "tchip-pass", "tchip-fail", "tchip-skip"));
+    } else if (e.type === "step_start") {
+      setChip(e.tindex, "tchip-running");       // 進行中：閃爍
+    } else if (e.type === "step_end") {
+      setChip(e.tindex, statusToCls(e.status)); // 完成：上色（局部刷新）
+    } else if (e.type === "run_end") {
+      es.close(); finish();
+      delete stepCache[id];                     // 清步驟詳情快取 → chip 點擊 modal 取最新結果
+      if (e.skipped) toast(`${id}：略過${e.skip_reason ? "（" + e.skip_reason + "）" : ""}`);
+      else toast(`${id}：${e.status === "passed" ? "通過" : "失敗"}（${e.passed}/${e.total}）`);
+      updateLastResultCell(row, e, startedAt);  // 局部更新「最近結果」欄，不整頁重載
+      showRunResultDrawer(id, e);               // 開抽屜顯示完整結果
+    } else if (e.type === "error") {
+      es.close(); finish();
+      toast("執行失敗：" + (e.error || "未知錯誤"));
+    }
+  };
+  es.onerror = () => { es.close(); finish(); toast("執行中斷：與看板的連線已斷開"); };
+}
+
+// run_end 後局部更新該列「最近結果」欄（td.act 前一格），免整頁重載即反映本次結果
+function updateLastResultCell(row, e, startedAt) {
+  if (!row) return;
+  const act = row.querySelector("td.act");
+  const cell = act && act.previousElementSibling;
+  if (!cell) return;
+  cell.innerHTML = `${resBadge(e.status)} <span class="sub2">${e.passed}/${e.total} · ${fmtTs(startedAt)}</span>`;
+}
+
+// run_end 後開抽屜顯示完整步驟結果：直接抓該用例最新 steps（剛落地）渲染，與重試/換號收尾一致
+async function showRunResultDrawer(id, e) {
   try {
-    const res = await apiPost("/api/cases/run", { id });
-    const pass = res.steps.filter((x) => x.status === "passed").length;
-    toast(`${id}：${res.status === "passed" ? "通過" : "失敗"}（${pass}/${res.steps.length}）`);
-    openDrawer(`<div class="dhead"><h3>執行結果 · ${esc(id)} ${resBadge(res.status)}</h3></div>
-      <div class="sec">${runResultHtml(res)}</div>`);
-    loadCases(key);
-  } catch (e) { toast("執行失敗：" + e.message); }
-  finally { btn.disabled = false; btn.textContent = old; }
+    const d = await api("/api/cases/" + encodeURIComponent(id));
+    const r = d.last_result;
+    openDrawer(`<div class="dhead"><h3>執行結果 · ${esc(id)} ${resBadge(e.status)}</h3></div>
+      <div class="sec">${r ? runResultHtml(r) : "（無步驟）"}</div>`);
+  } catch (_) { /* 抽屜僅輔助，失敗不影響已即時更新的 chip */ }
 }
 
 // 以既有用例 spec 為範本快速再建一條新用例（不含執行歷史），刷新後新列因 mtime 最新排到最前
