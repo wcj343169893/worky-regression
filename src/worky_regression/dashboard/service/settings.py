@@ -12,6 +12,8 @@ class SettingsMixin:
             "platform": s.platform,
             "deepseek_model": s.deepseek_model, "deepseek_base_url": s.deepseek_base_url,
             "deepseek_key_set": bool(s.deepseek_api_key),
+            # 後台管理員帳密（可編輯持久化；只回 password_set，不外洩明文）
+            "backend": self.backend_config(),
             "counts": {
                 "jobs": self.db.query_one("SELECT COUNT(*) c FROM s_jobs WHERE is_deleted=0")["c"],
                 "contract_tasks": self.db.query_one("SELECT COUNT(*) c FROM s_contract_tasks WHERE is_deleted=0")["c"],

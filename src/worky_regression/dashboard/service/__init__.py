@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 from ...config import Settings
+from .backend import BackendMixin
 from .base import ServiceBase
 from .contract import ContractMixin
 from .jobs import JobMixin
@@ -19,7 +20,8 @@ from .manage import ManageMixin
 from .settings import SettingsMixin
 
 
-class DashboardService(ContractMixin, JobMixin, ManageMixin, SettingsMixin, ServiceBase):
+class DashboardService(ContractMixin, JobMixin, ManageMixin, SettingsMixin,
+                       BackendMixin, ServiceBase):
     """組合各業務 mixin；建構與連線邏輯在 ServiceBase。"""
 
 

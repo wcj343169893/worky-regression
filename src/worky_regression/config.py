@@ -32,6 +32,10 @@ class Settings:
     sdk_version: str
     device_name: str
 
+    # 後台管理員（backend.*.worky.com.tw）預設 URL；帳密不放 .env，改由看板 UI 編輯
+    # 並持久化到 qa_settings（見 qa_models.QASetting）。此處只給 base 的 .env 預設值。
+    backend_base: str
+
     # DeepSeek API（用例分解器 Layer ③；OpenAI 相容介面。無 key 時分解器停用，其餘框架照常）
     deepseek_api_key: str
     deepseek_base_url: str
@@ -69,6 +73,7 @@ class Settings:
             db_name=req("WORKY_DB_NAME"),
             contract_db_name=os.environ.get("WORKY_CONTRACT_DB_NAME", ""),
             qa_db_name=os.environ.get("WORKY_QA_DB_NAME", "worky_qa_dashboard"),
+            backend_base=os.environ.get("WORKY_BACKEND_BASE", "").rstrip("/"),
             platform=os.environ.get("WORKY_PLATFORM", "WebPC"),
             sdk_version=os.environ.get("WORKY_SDK_VERSION", "1.0.0"),
             device_name=os.environ.get("WORKY_DEVICE_NAME", "regression-runner"),
