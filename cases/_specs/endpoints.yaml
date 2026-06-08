@@ -645,7 +645,11 @@ task_units:
       - need: 已知正確上班打卡碼 start_code
         satisfy: {db_exec: "UPDATE s_labor_jobs SET start_code='{{state.start_code}}' WHERE job_id=(SELECT id FROM s_jobs WHERE job_sn='{{state.job_sn}}') AND labor_id={{labor.user_id}}"}
       - need: 現在已進入可打卡時間（end_at-24h 之後）
+        # s_jobs 與 s_labor_jobs 兩張表的時段都要拉到當下：clock-in 看 s_jobs，
+        # clock-out 看 s_labor_jobs.start_at/end_at（否則 J6 回 40403 錯誤的下班打卡時間）。
         satisfy: {db_exec: "UPDATE s_jobs SET start_at=UNIX_TIMESTAMP(), end_at=UNIX_TIMESTAMP()+7200 WHERE job_sn='{{state.job_sn}}'"}
+      - need: 夥伴的工作時段也拉到當下（clock-out 時間校驗看 s_labor_jobs）
+        satisfy: {db_exec: "UPDATE s_labor_jobs SET start_at=UNIX_TIMESTAMP(), end_at=UNIX_TIMESTAMP()+7200 WHERE job_id=(SELECT id FROM s_jobs WHERE job_sn='{{state.job_sn}}') AND labor_id={{labor.user_id}}"}
     branches:
       - when: 打卡碼錯誤
         expect_fail: {message_contains: "打卡碼"}
