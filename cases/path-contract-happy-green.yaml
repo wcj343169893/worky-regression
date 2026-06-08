@@ -11,6 +11,8 @@
 #
 # 三層驗證：HTTP 200 + 業務 success + 推播落地（push: {} 只驗 type_id 落地 s_notifications）。
 id: path-contract-happy-green
+skip: true
+skip_reason: "時間鎖：打卡/任務開始結束需落在時段內，後端強制 start_time≥now+24h；禁 db_exec(#4)後無 API 可壓縮時間，需真實等待 24h+。"
 description: "承攬制全綠 happy path：發→申→錄取→(橋接)→開始→結束→通過（含推播驗證）"
 
 path:

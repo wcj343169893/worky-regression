@@ -33,12 +33,17 @@ _DEFICIENCY_ACTOR = {
 }
 
 
-def _guard_db_execs(name: str) -> list[str]:
+def _guard_skips(name: str) -> list[str]:
+    """該 transition guards 裡標記為無法自動化（時間鎖 / 無 API 可替代）的 skip 原因。
+
+    #4 後 endpoints.yaml 不再放 db_exec：時間壓縮 / 打卡碼預寫 / recruit_deadline 等
+    改用 satisfy.skip 標記，產生器據此把整支用例標 skip（覆蓋缺口可見、但不可跑）。
+    """
     out = []
     for g in (unit_spec(name).get("guards") or []):
-        sql = (g.get("satisfy") or {}).get("db_exec")
-        if sql:
-            out.append(sql)
+        r = (g.get("satisfy") or {}).get("skip")
+        if r:
+            out.append(r)
     return out
 
 
@@ -68,19 +73,22 @@ def _happy_step(name: str) -> dict[str, Any]:
     return step
 
 
-def _setup_steps(name: str) -> list[dict[str, Any]]:
-    """某 transition 的 guards 轉成的 db_exec 前置步驟（caps/by 不在此，分別由帳號池/前序處理）。"""
-    return [{"db_exec": sql, "expect_min_affected": 0} for sql in _guard_db_execs(name)]
+def _chain_skips(target: str) -> list[str]:
+    """target 自身 + 其前序鏈所有 guard 的 skip 原因（去重保序）。
+
+    任一前置守衛無法自動化（時間鎖等）→ 整條經過它的用例都跑不了，故彙整成用例層 skip。
+    """
+    reasons: list[str] = []
+    for name in _prereq_chain(target) + [target]:
+        for r in _guard_skips(name):
+            if r not in reasons:
+                reasons.append(r)
+    return reasons
 
 
 def _prefix(target: str) -> list[dict[str, Any]]:
-    """抵達 target「動作前」的所有步驟：前序 transition（各帶自身 guard setup）+ target 的 guard setup。"""
-    steps: list[dict[str, Any]] = []
-    for name in _prereq_chain(target):
-        steps += _setup_steps(name)
-        steps.append(_happy_step(name))
-    steps += _setup_steps(target)
-    return steps
+    """抵達 target「動作前」的前序 transition（#4 後不再注入 db_exec 前置；caps/by 由帳號池/前序處理）。"""
+    return [_happy_step(name) for name in _prereq_chain(target)]
 
 
 def _slug(text: str) -> str:
@@ -109,9 +117,11 @@ def _branch_case(target: str, br: dict[str, Any], idx: int) -> dict[str, Any]:
     # 同一 actor 連續呼叫會觸發後端 9002「執行操作過快」(~1s 節流)，arrange.by 後補 sleep
     if arrange.get("by"):
         steps.append({"sleep": 2})
-    # db_exec：交易級前置
-    if arrange.get("db_exec"):
-        steps.append({"db_exec": arrange["db_exec"]})
+    # 前置守衛無法自動化（時間鎖等）→ 整支 skip
+    skip_reasons += _chain_skips(target)
+    # arrange.skip：此負向情境本身無 API 可佈置（recruit_deadline 拉過去、start_at 改過去等）→ skip
+    if arrange.get("skip"):
+        skip_reasons.append(arrange["skip"])
     # caps_lacking：綁一個「缺該能力」的 deficiency actor（池可提供者）；否則標 skip
     action_bind = None
     for cap in (arrange.get("caps_lacking") or []):
@@ -135,19 +145,25 @@ def _branch_case(target: str, br: dict[str, Any], idx: int) -> dict[str, Any]:
     }
     if skip_reasons:
         case["skip"] = True
-        case["skip_reason"] = "；".join(skip_reasons)
+        case["skip_reason"] = "；".join(dict.fromkeys(skip_reasons))  # 去重保序
     return case
 
 
 def generate(target: str, level: str = "L1") -> list[dict[str, Any]]:
     """產生 target transition 的用例：L0 happy（+L1 時每個 branch 一條負向）。"""
     u = unit_spec(target)
-    cases: list[dict[str, Any]] = [{
+    happy: dict[str, Any] = {
         "id": f"gen-{target}-happy",
         "description": f"[L0] {u.get('summary', target)} happy path",
         "vars": {"job_recruit_count": 1},
         "path": _prefix(target) + [_happy_step(target)],
-    }]
+    }
+    # 前置守衛有時間鎖等無法自動化者 → happy 流本身也跑不了，整支標 skip（覆蓋缺口可見）
+    csk = _chain_skips(target)
+    if csk:
+        happy["skip"] = True
+        happy["skip_reason"] = "；".join(csk)
+    cases: list[dict[str, Any]] = [happy]
     if level in ("L1", "L2"):
         for i, br in enumerate(u.get("branches") or []):
             cases.append(_branch_case(target, br, i))

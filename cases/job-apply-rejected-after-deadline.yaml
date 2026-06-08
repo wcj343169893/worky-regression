@@ -1,4 +1,6 @@
 id: job-apply-rejected-after-deadline
+skip: true
+skip_reason: "招募截止由後端依 start_time 推算且恆在未來；禁 db_exec(#4)後無 API 可把 recruit_deadline 拉到過去，負向情境無法重現。"
 description: >
   負向(L1)：招募截止後，打工夥伴申請上工應被拒。對應 J2_labor_apply 的 branch
   「已過招募截止」。示範 branch → 可跑負向子用例（expect.success=false + message_contains）。

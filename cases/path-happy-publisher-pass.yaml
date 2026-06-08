@@ -9,6 +9,8 @@
 # 注意：使用 FunPoint 信用卡（payment_method_id=1）。publisher 236 已預先綁卡，
 # dev 環境會自動扣款，避免 ATM 那條「等待付款」的卡關。
 id: path-happy-publisher-pass
+skip: true
+skip_reason: "時間鎖：打卡/任務開始結束需落在時段內，後端強制 start_time≥now+24h；禁 db_exec(#4)後無 API 可壓縮時間，需真實等待 24h+。"
 description: "承攬制完整 happy path：發 → 申 → 同 → 開始 → 結束 → 通過"
 
 path:

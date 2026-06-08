@@ -12,10 +12,18 @@ import yaml
 
 from .actor import Actor
 from .registry import PUSH_TYPE_IDS, get as get_transition, query_unit
-from .verifier import DBVerifier
+from .verifier import DBVerifier, PushAssertionError
 
 
 VAR_PATTERN = re.compile(r"\{\{\s*([^}]+?)\s*\}\}")
+
+
+class DBAccessDisabled(RuntimeError):
+    """執行期一律不碰被測 DB（#4）：db_exec / expect.state / assert_state 已停用。
+
+    狀態查驗改打查詢端點（expect.api / assert_api / wait_api）；需等後端定時任務/隊列
+    推進狀態時用 wait_api 輪詢。時間鎖類用例（打卡 / contract 開始結束）無 API 可替代，標 skip。
+    """
 
 
 # staging 的 min_publish_interval_seconds / recruit_deadline_offset_seconds 約 600s，
@@ -141,6 +149,8 @@ class PathRunner:
                 self._run_assert(step, state)
             elif "assert_api" in step:
                 self._run_assert_api(step, state)
+            elif "wait_api" in step:
+                self._run_wait_api(step, state)
             elif "sleep" in step:
                 self._run_sleep(step, state)
             else:
@@ -201,44 +211,21 @@ class PathRunner:
         return state
 
     def _run_db_exec(self, step: dict, state: PathExecutionState) -> dict[str, Any]:
-        """執行任意 SQL（用於模擬外部副作用，例如 ATM 付款完成）。
+        """已停用（#4）：執行期不碰被測 DB。
 
-        Worky model 層有 memcached cache，UPDATE 後預設會 flush_all 失效快取。
-        若 sql 是 'SELECT 1' 之類的 no-op，僅執行 cache flush。
+        原用途：時間壓縮橋接（start_at/end_at=NOW()）、強制狀態（pay_status=102）、SELECT 查驗。
+        遷移指引：查驗改 expect.api / assert_api；等隊列推進狀態用 wait_api；時間鎖類用例標 skip。
         """
-        sql = state.resolve(step["db_exec"])
-        affected = self.db.execute(sql)
-        # SELECT 不需 affected_rows 檢查
-        if not sql.strip().upper().startswith("SELECT"):
-            expected_min = step.get("expect_min_affected", 1)
-            if affected < expected_min:
-                raise AssertionError(
-                    f"[db_exec] expected >= {expected_min} affected rows, got {affected}\n"
-                    f"sql: {sql}"
-                )
-        flushed = self.db.flush_memcached() if step.get("flush_cache", True) else False
-        print(f"  [db_exec] {sql[:60]}... → affected={affected} cache_flushed={flushed}")
-        return {"sql": sql, "affected": affected, "cache_flushed": flushed}
+        sql = str(step.get("db_exec", ""))[:80]
+        raise DBAccessDisabled(
+            f"db_exec 已停用（#4 執行期不碰 DB）。改用 transition / assert_api / wait_api，"
+            f"時間鎖類用例請標 skip。原 SQL: {sql}…")
 
     def _run_assert(self, step: dict, state: PathExecutionState) -> dict[str, Any]:
-        """純 DB 狀態斷言（無 transition），用於驗證「沒被改動 / 沒被錄取」這類負向狀態。
-
-        step:  {assert_state: {sql: ..., equals: {col: val}}}
-        """
-        spec = step["assert_state"]
-        sql = state.resolve(spec["sql"])
-        row = self.db.query_one(sql)
-        if row is None:
-            raise AssertionError(f"[assert_state] query returned no rows: {sql}")
-        for col, expected in (spec.get("equals") or {}).items():
-            expected = state.resolve(expected)
-            actual = row.get(col)
-            if str(actual) != str(expected):
-                raise AssertionError(
-                    f"[assert_state] {col}: expected {expected!r}, got {actual!r}\nsql: {sql}"
-                )
-        print(f"  [assert_state] ok: {sql[:70]}")
-        return {"assert_state": sql, "row": dict(row)}
+        """已停用（#4）：assert_state 直接 SELECT 被測 DB。改用 assert_api 打查詢端點比對回應。"""
+        raise DBAccessDisabled(
+            "assert_state 已停用（#4 執行期不碰 DB）。改用 assert_api（打查詢端點比對回應），"
+            "例：{assert_api: {query: Q_labor_job_matches, find: {...}, equals: {...}}}。")
 
     def _run_sleep(self, step: dict, state: PathExecutionState) -> dict[str, Any]:
         """暫停數秒。用於繞過後端「執行操作過快」(9002) 類的短窗節流（TTL 約 1s）。"""
@@ -269,7 +256,11 @@ class PathRunner:
         base = (actor.client.settings.activity_api_base
                 if getattr(transition, "api_group", "main") == "activity" else None)
 
-        watermark = self.db.max_notification_id()
+        # 推播驗證改打 API（#4 不查 DB）：行動前先記下「收件 actor 通知清單水位(max id)」，
+        # 行動後查水位之後新出現、type_id 相符的通知。只在本步預期推播時才取水位（省一次查詢）。
+        push_watermark = 0
+        if "push" in step.get("expect", {}) and transition.pushes_to:
+            push_watermark = self._notification_max_id(state.actors[transition.pushes_to])
         # GET 走 query string（params），其餘走 body
         if transition.method.upper() == "GET":
             resp = actor.client.request(transition.method, transition.endpoint,
@@ -352,16 +343,13 @@ class PathRunner:
             target_actor = state.actors[transition.pushes_to]
             type_id = PUSH_TYPE_IDS[transition.push_type_id]
 
-            push = self.db.assert_push(
-                watermark,
-                recipient_uid=target_actor.user_id,
-                recipient_user_type=target_actor.user_type,
-                expected_type_id=type_id,
+            push = self._assert_push_api(
+                target_actor, push_watermark, type_id,
                 title_contains=state.resolve(push_expect.get("title_contains")) if push_expect.get("title_contains") else None,
                 body_contains=state.resolve(push_expect.get("body_contains")) if push_expect.get("body_contains") else None,
             )
             obs["checks"].append({"kind": "push", "type_id": type_id,
-                                  "to": transition.pushes_to, "push_id": push.id})
+                                  "to": transition.pushes_to, "push_id": push.get("id")})
 
         # 業務狀態驗證（首選）：打對應查詢接口比對回應，驗的是對外行為而非 DB 長相。
         api_expect = expect.get("api")
@@ -369,23 +357,69 @@ class PathRunner:
             for one in (api_expect if isinstance(api_expect, list) else [api_expect]):
                 obs["checks"].append(self._verify_api(one, state))
 
-        # 業務狀態驗證（過渡相容）：expect.state(sql) 直接讀 DB；新用例改用 expect.api。
-        state_expect = step.get("expect", {}).get("state")
-        if state_expect:
-            sql = state.resolve(state_expect["sql"])
-            row = self.db.query_one(sql)
-            if row is None:
-                raise AssertionError(f"[{transition.name}] state query returned no rows: {sql}")
-            for col, expected in state_expect.get("equals", {}).items():
-                expected = state.resolve(expected)
-                actual = row.get(col)
-                if str(actual) != str(expected):
-                    raise AssertionError(
-                        f"[{transition.name}] state.{col}: expected {expected!r}, got {actual!r}"
-                    )
-                obs["checks"].append({"kind": "state", "col": col, "value": actual})
+        # 業務狀態驗證：expect.state(SQL) 已停用（#4 執行期不碰 DB），改用 expect.api。
+        if step.get("expect", {}).get("state"):
+            raise DBAccessDisabled(
+                f"[{transition.name}] expect.state 已停用（#4 執行期不碰 DB）。"
+                f"改用 expect.api（打查詢端點比對回應）：expect: {{api: {{query: ..., equals: {{...}}}}}}。")
 
         return obs
+
+    # ── 推播驗證改打 API（#4 不查 s_notifications）────────────────────────────
+    # 依收件 actor 的 user_type 自動挑通知查詢端點（1→商家、2→打工夥伴；publisher/receiver 皆 2）。
+    _NOTIFICATION_QUERY = {1: "Q_employer_notifications", 2: "Q_labor_notifications"}
+
+    def _notification_list(self, actor: Actor) -> list[dict[str, Any]]:
+        """以該 actor 身份打通知清單 API，回正規化的通知陣列（每筆含 id/type_id/title/content…）。"""
+        qname = self._NOTIFICATION_QUERY.get(actor.user_type)
+        if not qname:
+            raise PushAssertionError(f"無法為 user_type={actor.user_type} 的 actor 查通知（無對應 query_unit）")
+        q = query_unit(qname)
+        resp = actor.client.request("GET", q["endpoint"], params=(q.get("request") or {"page": 1}))
+        if resp.status_code != 200:
+            raise PushAssertionError(f"通知查詢 HTTP {resp.status_code}: {resp.text[:200]}")
+        payload = resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {}
+        if payload.get("success") is False:
+            raise PushAssertionError(
+                f"通知查詢失敗 code={payload.get('code')} message={payload.get('message')!r}")
+        data = payload.get("data")
+        # labor 回 {category_groups, list:[...]}、employer 回 [...]（或同樣帶 list）→ 正規化成陣列
+        items = data.get("list") if isinstance(data, dict) else (data if isinstance(data, list) else [])
+        return [it for it in (items or []) if isinstance(it, dict)]
+
+    def _notification_max_id(self, actor: Actor) -> int:
+        """收件 actor 通知清單目前最大 id（行動前水位）。查不到回 0（視為全部都是新的）。"""
+        return max((int(n.get("id") or 0) for n in self._notification_list(actor)), default=0)
+
+    def _assert_push_api(self, actor: Actor, watermark_id: int, expected_type_id: int, *,
+                         title_contains: str | None = None, body_contains: str | None = None,
+                         timeout_sec: float = 8.0, poll_interval: float = 0.5) -> dict[str, Any]:
+        """輪詢收件 actor 的通知清單，直到出現「水位後、type_id 相符」的通知或逾時。
+
+        取代 DBVerifier.assert_push（不再 SELECT s_notifications）。推播可能由隊列非同步落地，
+        故輪詢等待（timeout_sec）。命中後再比對 title/content 包含關係。
+        """
+        deadline = time.time() + timeout_sec
+        seen_types: list[int] = []
+        while True:
+            fresh = [n for n in self._notification_list(actor) if int(n.get("id") or 0) > watermark_id]
+            seen_types = [int(n.get("type_id") or 0) for n in fresh]
+            matches = [n for n in fresh if int(n.get("type_id") or 0) == expected_type_id]
+            if matches:
+                push = max(matches, key=lambda n: int(n.get("id") or 0))
+                if title_contains and title_contains not in (push.get("title") or ""):
+                    raise PushAssertionError(
+                        f"推播標題不含 {title_contains!r}，實得 {push.get('title')!r}")
+                if body_contains and body_contains not in (push.get("content") or ""):
+                    raise PushAssertionError(
+                        f"推播內文不含 {body_contains!r}，實得 {push.get('content')!r}")
+                print(f"  [push.api] uid={actor.user_id} type_id={expected_type_id} push_id={push.get('id')}")
+                return push
+            if time.time() >= deadline:
+                raise PushAssertionError(
+                    f"逾時 {timeout_sec}s：收件 user_id={actor.user_id} 在水位 {watermark_id} 後"
+                    f"無 type_id={expected_type_id} 的推播；實得新通知 type_id={seen_types}")
+            time.sleep(poll_interval)
 
     def _verify_api(self, api: dict, state: PathExecutionState) -> dict[str, Any]:
         """打對應查詢接口比對回應欄位（取代 SELECT 驗 DB）。
@@ -446,6 +480,31 @@ class PathRunner:
         """獨立的接口斷言步驟（不綁 transition）：直接打查詢接口比對，取代 assert_state(SQL)。
         需在 step 內指定 actor（無 transition 上下文可繼承）。"""
         return self._verify_api(step["assert_api"], state)
+
+    def _run_wait_api(self, step: dict, state: PathExecutionState) -> dict[str, Any]:
+        """輪詢查詢端點直到條件成立或逾時——等後端定時任務 / 隊列推進工作/申請狀態用（取代死等 sleep）。
+
+        step: {wait_api: {query, actor?, args?, find?, equals, http?,
+                          timeout?(秒,預設30), interval?(秒,預設2)}}
+        每輪複用 _verify_api 打一次查詢比對；未滿足(AssertionError)就睡 interval 再試，逾時才失敗。
+        """
+        spec = step["wait_api"]
+        timeout = float(spec.get("timeout", 30))
+        interval = float(spec.get("interval", 2))
+        deadline = time.time() + timeout
+        attempts = 0
+        while True:
+            attempts += 1
+            try:
+                res = self._verify_api(spec, state)
+                res["kind"] = "wait_api"
+                res["attempts"] = attempts
+                return res
+            except AssertionError as e:
+                if time.time() >= deadline:
+                    raise AssertionError(
+                        f"[wait_api {spec.get('query')}] 逾時 {timeout}s（試 {attempts} 次）仍未滿足條件：{e}")
+                time.sleep(interval)
 
     @staticmethod
     def _dig(data: dict, dotted: str) -> Any:

@@ -195,6 +195,33 @@ query_units:
       回應 data.matching[] 為進行中的媒合，每筆含 job_sn + status（LaborMatchJob 狀態，與 DB 同值）：
       4=打工夥伴申請(STATUS_LABOR_APPLY)、6=商家錄取(STATUS_EMPLOYER_ACCEPT)、16=備取(STATUS_BACKUP)…
       用 expect.api / assert_api 的 find:{in: matching, where:{job_sn: ...}} 取單筆再驗 status。
+  # ── 推播通知查詢（驗推播改打 API，不再 SELECT s_notifications）──────────────
+  # runner 的 push 驗證依「收件 actor 的 user_type」自動挑下面對應端點：1→employer、2→labor
+  # （publisher/receiver 皆 user_type=2，走 labor 端點）。回應每筆含 id/type_id/title/content/created_at，
+  # runner 取「行動前水位(max id)之後新出現、且 type_id 相符」的通知比對 title/content。
+  Q_labor_notifications:
+    system: job
+    summary: 打工夥伴查歷史通知（驗推播用；publisher/receiver 同走此端點）
+    actor: labor
+    method: GET
+    endpoint: /labor/notification/list
+    doc_id: '251'
+    request:
+      page: 1                         # 第 1 頁即最新；每頁 20 筆、僅 30 天內
+    note: |
+      回應 data.list[] 每筆含 id / type_id / title / content / created_at / read。
+      runner._assert_push_api 以此取代 s_notifications SELECT（不查 DB）。
+  Q_employer_notifications:
+    system: job
+    summary: 商家查歷史通知（驗推播用）
+    actor: employer
+    method: GET
+    endpoint: /employer/notification/list
+    doc_id: '151'
+    request:
+      page: 1
+    note: |
+      回應 data 為通知陣列（或 {list:[...]}）；每筆含 id / type_id / title / content / created_at。
 
 task_units:
 
@@ -376,7 +403,7 @@ task_units:
   #     - need:    人類可讀條件
   #       satisfy: 擇一 ── caps:[..]（帳號池配具該能力帳號）
   #                       ｜ by: <transition>（由前序步驟建立狀態）
-  #                       ｜ db_exec: "<SQL>"（交易級資料前置；待驗證層 API 化後改 API 動作）
+  #                       ｜ skip: "<原因>"（時間鎖/無 API 可替代；產生器據此把整支用例標 skip）
   #   branches ── 業務分支：L1 各生一條「負向子用例」（預期 API 失敗）。
   #     - when:        觸發條件
   #       expect_fail: {code: <int>} 或 {message_contains: "<片語>"}
@@ -471,7 +498,7 @@ task_units:
       - need: 夥伴已實名認證且 profile 完整、未停權
         satisfy: {caps: [verified, profile_complete, active]}
       - need: 夥伴該時段無已確認工作（s_labor_jobs status=1, end_at>now）
-        satisfy: {db_exec: "UPDATE s_labor_jobs SET status=8 WHERE labor_id={{labor.user_id}} AND status=1 AND end_at>UNIX_TIMESTAMP()"}
+        satisfy: {note: "靠帳號池 LRU 輪換 + runner 未來時段輪轉避開（#4 不再用 db_exec 清殘留）"}
     branches:
       - when: 夥伴尚未填寫個人資訊（id_number 空）
         expect_fail: {code: 30211}                  # LABOR_PROFILE_NOT_FILLED
@@ -505,7 +532,7 @@ task_units:
         arrange: {note: "recruit_count=1 且已錄取額滿後再申請"}
       - when: 已過招募截止
         expect_fail: {message_contains: "招募已截止"}
-        arrange: {db_exec: "UPDATE s_jobs SET recruit_deadline=UNIX_TIMESTAMP()-1 WHERE job_sn='{{state.job_sn}}'"}
+        arrange: {skip: "招募截止由後端依 start_time 推算且恆在未來，無 API 可拉到過去，負向情境無法重現"}
     side_effects:
       - table: s_labor_match_jobs
         key: "job_id=(SELECT id FROM s_jobs WHERE job_sn='{{state.job_sn}}') AND labor_id={{labor.user_id}}"
@@ -527,7 +554,7 @@ task_units:
     branches:
       - when: 招募已截止後才取消
         expect_fail: {message_contains: "招募已截止"}
-        arrange: {db_exec: "UPDATE s_jobs SET recruit_deadline=UNIX_TIMESTAMP()-1 WHERE job_sn='{{state.job_sn}}'"}
+        arrange: {skip: "招募截止由後端依 start_time 推算且恆在未來，無 API 可拉到過去，負向情境無法重現"}
     side_effects:
       - table: s_labor_match_jobs
         key: "job_id=(SELECT id FROM s_jobs WHERE job_sn='{{state.job_sn}}') AND labor_id={{labor.user_id}}"
@@ -557,7 +584,7 @@ task_units:
         arrange: {note: "recruit_count=1，先錄取一位額滿，再錄取第二位"}
       - when: 招募時間已結束
         expect_fail: {code: 20307}                  # ACCEPT_AUDIT_RECRUIT_TIME_EXPIRED
-        arrange: {db_exec: "UPDATE s_jobs SET recruit_deadline=UNIX_TIMESTAMP()-1 WHERE job_sn='{{state.job_sn}}'"}
+        arrange: {skip: "招募截止由後端依 start_time 推算且恆在未來，無 API 可拉到過去，負向情境無法重現"}
       - when: 該夥伴已取消申請
         expect_fail: {code: 20305}                  # ACCEPT_AUDIT_STATUS_LABOR_CANCEL_APPLICATION
         arrange: {by: [J2b_labor_cancel_apply]}
@@ -643,13 +670,13 @@ task_units:
       - need: 已錄取且待上工（J3，job_status=1、actual_clock_in_at 空）
         satisfy: {by: J3_employer_accept}
       - need: 已知正確上班打卡碼 start_code
-        satisfy: {db_exec: "UPDATE s_labor_jobs SET start_code='{{state.start_code}}' WHERE job_id=(SELECT id FROM s_jobs WHERE job_sn='{{state.job_sn}}') AND labor_id={{labor.user_id}}"}
+        satisfy: {skip: "時間鎖：打卡碼需預寫、工作時段需壓縮到當下，禁 db_exec(#4) 後無 API 可替代"}
       - need: 現在已進入可打卡時間（end_at-24h 之後）
         # s_jobs 與 s_labor_jobs 兩張表的時段都要拉到當下：clock-in 看 s_jobs，
         # clock-out 看 s_labor_jobs.start_at/end_at（否則 J6 回 40403 錯誤的下班打卡時間）。
-        satisfy: {db_exec: "UPDATE s_jobs SET start_at=UNIX_TIMESTAMP(), end_at=UNIX_TIMESTAMP()+7200 WHERE job_sn='{{state.job_sn}}'"}
+        satisfy: {skip: "時間鎖：打卡碼需預寫、工作時段需壓縮到當下，禁 db_exec(#4) 後無 API 可替代"}
       - need: 夥伴的工作時段也拉到當下（clock-out 時間校驗看 s_labor_jobs）
-        satisfy: {db_exec: "UPDATE s_labor_jobs SET start_at=UNIX_TIMESTAMP(), end_at=UNIX_TIMESTAMP()+7200 WHERE job_id=(SELECT id FROM s_jobs WHERE job_sn='{{state.job_sn}}') AND labor_id={{labor.user_id}}"}
+        satisfy: {skip: "時間鎖：打卡碼需預寫、工作時段需壓縮到當下，禁 db_exec(#4) 後無 API 可替代"}
     branches:
       - when: 打卡碼錯誤
         expect_fail: {message_contains: "打卡碼"}
@@ -673,7 +700,7 @@ task_units:
       - need: 已上班打卡（J5，job_status=2、actual_clock_out_at 空）
         satisfy: {by: J5_labor_clock_in}
       - need: 已知正確下班打卡碼 end_code
-        satisfy: {db_exec: "UPDATE s_labor_jobs SET end_code='{{state.end_code}}' WHERE job_id=(SELECT id FROM s_jobs WHERE job_sn='{{state.job_sn}}') AND labor_id={{labor.user_id}}"}
+        satisfy: {skip: "時間鎖：打卡碼需預寫、工作時段需壓縮到當下，禁 db_exec(#4) 後無 API 可替代"}
     branches:
       - when: 打卡碼錯誤
         expect_fail: {message_contains: "打卡碼"}
@@ -701,7 +728,7 @@ task_units:
     branches:
       - when: 工作已開始後才取消
         expect_fail: {message_contains: "已開始"}
-        arrange: {db_exec: "UPDATE s_jobs SET start_at=UNIX_TIMESTAMP()-3600 WHERE job_sn='{{state.job_sn}}'"}
+        arrange: {skip: "需把工作時間改到過去模擬「已開始」，禁 db_exec(#4) 後無 API 可替代"}
     side_effects:
       - table: s_labor_jobs
         key: "job_id=(SELECT id FROM s_jobs WHERE job_sn='{{state.job_sn}}') AND labor_id={{labor.user_id}}"

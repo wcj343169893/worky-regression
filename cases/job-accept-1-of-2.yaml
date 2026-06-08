@@ -22,18 +22,10 @@ path:
       equals:
         recruited_count: 0              # 剛發佈、媒合中、尚無人錄取
 
-# ── Phase 0 前置：清確認工作（繞 30207 時段重疊 + 30229 同店同日）────────────
-# 申請工作的 form rule 會擋兩種殘留的「上工(STATUS_GO_TO_WORK=1)」工作：
-#   30207 該時段已有確認工作（時段重疊）；30229 同一企業每日僅限一次（同店同日）。
-# 兩位都是測試 labor，把其「未來未完成的上工工作」一律標記已完成(8)即可確定性繞過。
-# 註：這是「交易級」資料守衛，將來驗證層遷出 SQL 時，這步應改由夥伴自己的 API 動作完成。
-- db_exec: >
-    UPDATE s_labor_jobs
-    SET status = 8
-    WHERE labor_id IN ({{labor1.user_id}}, {{labor2.user_id}})
-      AND status = 1
-      AND end_at > UNIX_TIMESTAMP()
-  expect_min_affected: 0
+# ── Phase 0：清確認工作的 db_exec 已移除（#4 執行期不碰 DB）─────────────────
+# 原以 UPDATE s_labor_jobs status=8 清殘留上工工作以繞 30207 時段重疊 / 30229 同店同日。
+# 改靠：帳號池 LRU 輪換（#1，配不同夥伴）+ runner 未來時段輪轉（每跑換時段）自然避開衝突；
+# 偶發撞號時該次 30207/30229 失敗、可重跑（取捨見遷移記錄）。
 
 # ── Phase 1 動作：兩位夥伴各自申請（bind 切換身份；商家收 10025）──────────────
 # bind 讓 query 單元的 actor=labor 解析到該步綁定的夥伴；驗各自媒合清單該 job 的 status

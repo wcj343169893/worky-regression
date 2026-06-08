@@ -1,4 +1,6 @@
 id: job-happy-core
+skip: true
+skip_reason: "時間鎖：打卡/任務開始結束需落在時段內，後端強制 start_time≥now+24h；禁 db_exec(#4)後無 API 可壓縮時間，需真實等待 24h+。"
 description: >
   「工作」系統核心 happy path：商家發佈工作 → 打工夥伴申請上工 → 商家同意上工。
   三層驗證 HTTP / 推播 / DB 副作用。打卡與結算（J5/J6）因需時間與打卡碼操作，
