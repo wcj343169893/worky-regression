@@ -1,5 +1,6 @@
 "use strict";
-// 系統設置：DB / API / DeepSeek 唯讀概覽 + 後台管理員帳密（可編輯持久化）。
+// 系統設置：API / DeepSeek 唯讀概覽 + 後台管理員帳密（可編輯持久化）。
+// #4：不再顯示/查詢被測後端 DB（移除「資料庫（驗證目標）」與即時 COUNT 的「資料量」卡）。
 
 import { $, api, apiPost, esc, toast } from "./util.js";
 
@@ -13,18 +14,12 @@ export async function renderSettings() {
   $("view").innerHTML = `
     <div class="view-head"><h2>系統設置</h2></div>
     <div class="set-grid">
-      <div class="set-card"><h3>資料庫（驗證目標）</h3>
-        ${kv("DB", esc(d.db_name))}${kv("Host", esc(d.db_host))}${kv("Port", d.db_port)}</div>
-      <div class="set-card"><h3>目標 API</h3>
+      <div class="set-card"><h3>目標 API（驗證以此為準）</h3>
         ${kv("API Base", esc(d.api_base))}${kv("Activity API", esc(d.activity_api_base || "—"))}${kv("Platform", esc(d.platform))}</div>
       <div class="set-card"><h3>DeepSeek（用例分解器）</h3>
         ${kv("Model", esc(d.deepseek_model))}${kv("Base URL", esc(d.deepseek_base_url))}${kv("API Key", dot)}</div>
-      <div class="set-card"><h3>資料量</h3>
-        ${kv("工作 s_jobs", d.counts.jobs.toLocaleString())}
-        ${kv("承攬制任務", d.counts.contract_tasks.toLocaleString())}
-        ${kv("打工夥伴", d.counts.labors.toLocaleString())}
-        ${kv("商家", d.counts.employers.toLocaleString())}
-        ${kv("店鋪", d.counts.shops.toLocaleString())}</div>
+      <div class="set-card"><h3>QA 看板資料庫</h3>
+        ${kv("DB", esc(d.qa_db_name))}<p class="set-hint">框架自身的庫（用例/執行/帳號池）；不含被測後端 DB。</p></div>
 
       <div class="set-card set-card-wide"><h3>後台管理員（審核打工夥伴 / 店鋪）</h3>
         <p class="set-hint">用於登入後台審核打工夥伴資料與店鋪資料。密碼僅存於看板資料庫、不外洩明文。</p>

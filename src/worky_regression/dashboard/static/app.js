@@ -47,7 +47,8 @@ function init() {
   window.addEventListener("hashchange", route);
   const tick = () => { const d = new Date(); $("clock").textContent = `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`; };
   tick(); setInterval(tick, 1000);
-  api("/api/settings").then((d) => $("db-sub").textContent = `${d.db_name} @ ${d.db_host}`).catch(() => {});
+  // 頂部標識改顯示「驗證目標 API」（#4：被測 DB 不再是驗證目標）
+  api("/api/settings").then((d) => $("db-sub").textContent = d.api_base || d.platform || "—").catch(() => {});
   route();
 }
 init();
