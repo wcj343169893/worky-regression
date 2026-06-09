@@ -50,8 +50,9 @@ class Actor:
             raise LoginFailedError(f"{self.role} login: no accessToken in response: {data}")
         self.client.set_access_token(
             token=token,
-            expired_at=data.get("accessTokenExpiredAt", 0),
+            expired_at=data.get("accessTokenExpiredAt") or data.get("accessTokenExpired") or 0,
             refresh_token=data.get("refreshToken", ""),
+            refresh_expired_at=data.get("refreshTokenExpiredAt") or data.get("refreshTokenExpired") or 0,
         )
         self._logged_in = True
 

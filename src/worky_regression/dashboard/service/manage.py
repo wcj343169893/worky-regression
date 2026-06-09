@@ -48,7 +48,8 @@ class ManageMixin:
                 "items": rows}
 
     SHOP_FILTERS = {"validation_status": ("validation_status", "eq"),
-                    "validation_type": ("validation_type", "eq")}
+                    "validation_type": ("validation_type", "eq"),
+                    "employer_id": ("employer_id", "eq")}
 
     def list_shops(self, *, q: str = "", filters: dict | None = None,
                    limit: int = 50, offset: int = 0) -> dict:

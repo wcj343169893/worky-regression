@@ -19,6 +19,16 @@ from .config import Settings
 from . import qa_models
 
 
+def _json_or(v, default):
+    """欄位是字串就 json.loads，已是 dict/list 直接用，失敗回 default。"""
+    if isinstance(v, str):
+        try:
+            return json.loads(v)
+        except (ValueError, TypeError):
+            return default
+    return v if v is not None else default
+
+
 def make_run_id(case_id: str, started_at: int) -> str:
     """每次執行唯一 id：用例 id + 秒級時間戳 + 6 hex，同秒多跑也不撞。"""
     return f"{case_id}-{started_at}-{secrets.token_hex(3)}"
@@ -124,6 +134,137 @@ class QAStore:
                    "ON DUPLICATE KEY UPDATE value = VALUES(value)")
         with self._engine.begin() as conn:
             conn.execute(sql, rows)
+
+    # ── 頁面標記（qa_markups）─────────────────────────────────────────────────
+    def insert_markup(self, *, route: str, selector: str | None, element_text: str | None,
+                      rect: dict | None, content: str, screenshot_path: str | None,
+                      created_at: int) -> int:
+        """新增一筆待處理標記，回傳自增 id。"""
+        sql = text("""
+            INSERT INTO qa_markups
+              (route, selector, element_text, rect, content, screenshot_path, status, created_at)
+            VALUES (:route, :selector, :element_text, :rect, :content, :shot, 'pending', :ts)
+        """)
+        with self._engine.begin() as conn:
+            res = conn.execute(sql, {
+                "route": route, "selector": selector, "element_text": element_text,
+                "rect": json.dumps(rect, ensure_ascii=False) if rect is not None else None,
+                "content": content, "shot": screenshot_path, "ts": created_at})
+            return int(res.lastrowid)
+
+    @staticmethod
+    def _markup_filters(status: str | None, q: str | None) -> tuple[str, dict]:
+        """組標記查詢的 WHERE 子句 + 參數（status 精確、q 對 content/route/selector LIKE）。"""
+        clauses, params = [], {}
+        if status:
+            clauses.append("status=:st")
+            params["st"] = status
+        if q:
+            clauses.append("(content LIKE :q OR route LIKE :q OR selector LIKE :q)")
+            params["q"] = f"%{q}%"
+        where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+        return where, params
+
+    def list_markups(self, status: str | None = None, q: str | None = None,
+                     limit: int = 100, offset: int = 0) -> list[dict]:
+        """列標記（新到舊）；status 精確過濾、q 模糊搜尋；支援分頁 offset。rect 解回 dict。"""
+        where, params = self._markup_filters(status, q)
+        sql = text(f"""
+            SELECT id, route, selector, element_text, rect, content, screenshot_path,
+                   status, resolved, result, replies, created_at, updated_at
+            FROM qa_markups {where}
+            ORDER BY id DESC LIMIT :lim OFFSET :off
+        """)
+        params.update({"lim": int(limit), "off": int(offset)})
+        with self._engine.connect() as conn:
+            rows = conn.execute(sql, params).fetchall()
+        out = []
+        for r in rows:
+            d = dict(r._mapping)
+            d["rect"] = _json_or(d.get("rect"), None)
+            d["replies"] = _json_or(d.get("replies"), []) or []
+            out.append(d)
+        return out
+
+    def count_markups(self, status: str | None = None, q: str | None = None) -> int:
+        """符合條件的標記總數（給分頁器算頁數）。"""
+        where, params = self._markup_filters(status, q)
+        with self._engine.connect() as conn:
+            return int(conn.execute(
+                text(f"SELECT COUNT(*) FROM qa_markups {where}"), params).scalar() or 0)
+
+    def get_markup(self, markup_id: int) -> dict | None:
+        rows = self.list_markups()
+        for d in rows:
+            if d["id"] == markup_id:
+                return d
+        with self._engine.connect() as conn:
+            r = conn.execute(text("SELECT * FROM qa_markups WHERE id=:i"), {"i": markup_id}).first()
+        return dict(r._mapping) if r else None
+
+    def claim_pending_markup(self) -> dict | None:
+        """原子領取最舊一筆 pending 標記，標記為 processing 後回傳；無則回 None。
+
+        以 UPDATE ... WHERE status='pending' ORDER BY id LIMIT 1 搶占，避免多 worker 重領同筆。
+        """
+        with self._engine.begin() as conn:
+            row = conn.execute(text(
+                "SELECT id FROM qa_markups WHERE status='pending' ORDER BY id LIMIT 1"
+            )).first()
+            if not row:
+                return None
+            mid = int(row._mapping["id"])
+            updated = conn.execute(text(
+                "UPDATE qa_markups SET status='processing' WHERE id=:i AND status='pending'"
+            ), {"i": mid}).rowcount
+            if not updated:
+                return None  # 被別的 worker 搶先
+            r = conn.execute(text(
+                "SELECT id, route, selector, element_text, rect, content, screenshot_path, "
+                "status, result, replies, created_at FROM qa_markups WHERE id=:i"), {"i": mid}).first()
+        d = dict(r._mapping)
+        d["rect"] = _json_or(d.get("rect"), None)
+        d["replies"] = _json_or(d.get("replies"), []) or []
+        return d
+
+    def finish_markup(self, markup_id: int, *, status: str, result: str | None) -> None:
+        """worker 處理完回寫狀態與摘要（status = done | failed）。"""
+        with self._engine.begin() as conn:
+            conn.execute(text(
+                "UPDATE qa_markups SET status=:s, result=:r WHERE id=:i"
+            ), {"s": status, "r": result, "i": markup_id})
+
+    def reply_markup(self, markup_id: int, reply: str, *, at: int) -> bool:
+        """追加一則使用者回覆並把 status 打回 pending，讓 worker 帶脈絡再次優化。
+
+        回 False 表示找不到該標記。讀-改-寫在同一交易內，避免並發覆寫回覆串。
+        """
+        with self._engine.begin() as conn:
+            row = conn.execute(text(
+                "SELECT replies FROM qa_markups WHERE id=:i"), {"i": markup_id}).first()
+            if not row:
+                return False
+            replies = _json_or(row._mapping["replies"], []) or []
+            replies.append({"text": reply, "at": at})
+            conn.execute(text(
+                "UPDATE qa_markups SET replies=:rp, status='pending', result=result WHERE id=:i"
+            ), {"rp": json.dumps(replies, ensure_ascii=False), "i": markup_id})
+        return True
+
+    def set_markup_resolved(self, markup_id: int, resolved: bool) -> bool:
+        """設定「已解決」開關（1=已解決，源頁面不再畫框；0=取消解決，重新顯示）。
+
+        純前端可視化的隱藏/顯示，不動 status，故 worker 處理流程不受影響。回 False 表示無此標記。
+        """
+        with self._engine.begin() as conn:
+            res = conn.execute(text(
+                "UPDATE qa_markups SET resolved=:v WHERE id=:i"),
+                {"v": 1 if resolved else 0, "i": markup_id})
+            return res.rowcount > 0
+
+    def delete_markup(self, markup_id: int) -> None:
+        with self._engine.begin() as conn:
+            conn.execute(text("DELETE FROM qa_markups WHERE id=:i"), {"i": markup_id})
 
     # ── 讀取（回傳前端既有形狀 + run_id）───────────────────────────────────────
     @staticmethod

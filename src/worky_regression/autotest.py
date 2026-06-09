@@ -24,11 +24,11 @@ from pathlib import Path
 
 import yaml
 
-from .actor import Actor
+from .actor import Actor, LoginFailedError
 from .client import WorkyClient
 from .config import Settings
 from .planner import TaskPlan, build_path, decompose, plan_to_json
-from .qa_accounts import AccountPool, PooledAccount
+from .qa_accounts import AccountPool, PoolShortage, PooledAccount
 from .qa_store import QAStore
 from .recorder import RecordingRunner
 from .verifier import DBVerifier
@@ -47,13 +47,69 @@ def _build_actor(s: Settings, accounts: dict, role: str, key: str, user_type: in
     return actor
 
 
-def _actor_from_pool(s: Settings, pa: PooledAccount, role: str) -> Actor:
-    """用帳號池配發的帳號登入成 Actor（執行期只認 caps，不認 id）。"""
+def _actor_from_pool(s: Settings, pa: PooledAccount, role: str,
+                     pool: AccountPool | None = None) -> Actor:
+    """用帳號池配發的帳號取得已認證 Actor（執行期只認 caps，不認 id）。
+
+    token 走「有效就用、到期才刷」：
+      ① 池內 access token 仍有效（含 5 分鐘緩衝）→ 直接用，不打網路。
+      ② access 過期但 refresh 仍有效 → POST /token/refresh 換新 access token。
+      ③ refresh 也過期 / 無 token / 刷新被拒 → 完整登入。
+    任何拿到新 token 的路徑都把結果寫回池（save_token），下次配發重用。
+    """
     client = WorkyClient(s, user_type=pa.user_type)
     actor = Actor(role=role, user_type=pa.user_type, phone=pa.phone,
                   user_id=pa.account_id, client=client, shop_id=pa.shop_id)
-    actor.login(audit_code=s.audit_sms_code)
+
+    cached = pool.load_token(pa.account_id, role) if pool else None
+    if cached and cached.get("access_token"):
+        client.set_access_token(
+            token=cached["access_token"],
+            expired_at=int(cached.get("access_token_expired_at") or 0),
+            refresh_token=cached.get("refresh_token") or "",
+            refresh_expired_at=int(cached.get("refresh_token_expired_at") or 0),
+        )
+
+    if client.access_valid():
+        actor._logged_in = True            # ① 池內 token 仍有效，免登入
+    elif client.refresh_valid() and client.refresh():
+        actor._logged_in = True            # ② 刷新成功
+        if pool:
+            pool.save_token(pa.account_id, role, access_token=client.access_token,
+                            refresh_token=client.refresh_token,
+                            access_expired_at=client.access_token_expired_at,
+                            refresh_expired_at=client.refresh_token_expired_at)
+    else:
+        actor.login(audit_code=s.audit_sms_code)  # ③ 完整登入
+        if pool:
+            pool.save_token(pa.account_id, role, access_token=client.access_token,
+                            refresh_token=client.refresh_token,
+                            access_expired_at=client.access_token_expired_at,
+                            refresh_expired_at=client.refresh_token_expired_at)
     return actor
+
+
+def _login_from_pool(s: Settings, pool: AccountPool, role: str, caps: list[str], n: int,
+                     *, owner: str, exclude: list[str] | None = None) -> list[Actor]:
+    """配發並登入 n 個 role 帳號；登入失敗者自動排除、改配池中下一個同能力帳號（#2 自動換號）。
+
+    actor 登入失敗（如 audit 登入碼被拒 40003、帳號被鎖）不再讓整支用例直接死，而是排除該號、
+    重配同 caps 的替補，直到湊滿 n。替補耗盡（剩餘合格帳號不足）才拋 PoolShortage——此時是
+    「池內可登入的合格帳號不夠」，訊息明確，提示補帳號（見帳號池管理頁）。
+    """
+    excluded = [str(x) for x in (exclude or [])]
+    actors: list[Actor] = []
+    while len(actors) < n:
+        # acquire 不足 n-len 時自會拋 PoolShortage（替補已耗盡）→ 直接往外傳
+        pas = pool.acquire(role, caps, n - len(actors), owner=owner, lease=False, exclude=excluded)
+        for pa in pas:
+            # 不論登入成敗都排除此號，避免 lease=False 下次輪重配到同一個（造成重複身分）
+            excluded.append(str(pa.account_id))
+            try:
+                actors.append(_actor_from_pool(s, pa, role, pool))
+            except LoginFailedError as e:
+                print(f"  [actors] {role} #{pa.account_id} 登入失敗，自動換號：{e}")
+    return actors
 
 
 def ensure_publisher_invoice(actor: Actor) -> None:
@@ -96,20 +152,25 @@ def _actors_for(system: str, s: Settings,
         # employer 為已驗證店鋪商家。執行期只讀 qa_accounts，不直連工作庫挖帳號。
         pool = AccountPool(s)
         labor_caps = ["verified", "profile_complete", "audit_role", "active", "clean"]
-        labors = pool.acquire("labor", labor_caps, 2, owner="job-actors", lease=False,
+        # 登入失敗自動換號（#2）：配 2 個「可登入」的全 caps 夥伴 + 1 個可登入的商家。
+        la = _login_from_pool(s, pool, "labor", labor_caps, 2, owner="job-actors",
                               exclude=exclude.get("labor"))
-        emp = pool.acquire("employer", ["active", "verified_shop"], 1,
-                           owner="job-actors", lease=False, exclude=exclude.get("employer"))[0]
-        la = [_actor_from_pool(s, pa, "labor") for pa in labors]
+        emp = _login_from_pool(s, pool, "employer", ["active", "verified_shop"], 1,
+                               owner="job-actors", exclude=exclude.get("employer"))[0]
         actors = {
-            "employer": _actor_from_pool(s, emp, "employer"),
+            "employer": emp,
             "labor": la[0],
             "labor1": la[0],
             "labor2": la[1],
         }
-        # 第三個合格夥伴待帳號池補足（目前 clean 的 audit labor 僅 236/365 兩個）。
-        if len(labors) >= 3:
-            actors["labor3"] = _actor_from_pool(s, labors[2], "labor")
+        # 第三個合格夥伴（選配）：排除已用兩位，再配一個可登入全 caps 夥伴；池不足就略過。
+        try:
+            used = [str(a.user_id) for a in la]
+            actors["labor3"] = _login_from_pool(
+                s, pool, "labor", labor_caps, 1, owner="job-actors",
+                exclude=(exclude.get("labor") or []) + used)[0]
+        except PoolShortage:
+            pass
         # 負向用例用的「缺能力」夥伴（deficiency actor）：盡力配發，池中沒有就略過該名。
         # 帳號須「只缺目標能力、其餘前置滿足」才能可靠觸發對應守衛失敗（後端驗證有序）。
         deficiency = {
@@ -119,22 +180,21 @@ def _actors_for(system: str, s: Settings,
         for name, (lack, base) in deficiency.items():
             try:
                 pa = pool.acquire_lacking("labor", lack, base, owner="job-actors", lease=False)[0]
-                actors[name] = _actor_from_pool(s, pa, "labor")
+                actors[name] = _actor_from_pool(s, pa, "labor", pool)
             except Exception:  # noqa: BLE001 — 池中無此缺能力帳號就不提供，產生器會跳過對應分支
                 pass
         return actors
     if system == "activity":
         # 營運活動（Activity API）唯讀查詢：打工端用 labor token、商家端用 employer token。
+        # 登入失敗自動換號（#2）；湊不到才 PoolShortage。
         pool = AccountPool(s)
-        labor = pool.acquire("labor", ["audit_role", "active"], 1,
-                             owner="activity-actors", lease=False, exclude=exclude.get("labor"))[0]
-        actors = {"labor": _actor_from_pool(s, labor, "labor")}
-        # 商家端活動端點（/employer/...）需要 employer；池中有就配發，沒有則略過該角色
+        actors = {"labor": _login_from_pool(s, pool, "labor", ["audit_role", "active"], 1,
+                                            owner="activity-actors", exclude=exclude.get("labor"))[0]}
+        # 商家端活動端點（/employer/...）需要 employer；池中有可登入的就配，沒有則略過該角色
         try:
-            emp = pool.acquire("employer", ["active", "verified_shop"], 1,
-                               owner="activity-actors", lease=False, exclude=exclude.get("employer"))[0]
-            actors["employer"] = _actor_from_pool(s, emp, "employer")
-        except Exception:  # noqa: BLE001 — 無合格商家帳號時，僅打工端活動可測
+            actors["employer"] = _login_from_pool(s, pool, "employer", ["active", "verified_shop"], 1,
+                                                  owner="activity-actors", exclude=exclude.get("employer"))[0]
+        except PoolShortage:  # 無合格/可登入商家帳號時，僅打工端活動可測
             pass
         return actors
     publisher = _build_actor(s, accounts, "publisher", "publisher_primary", 2)

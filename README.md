@@ -208,6 +208,28 @@ results/           # 舊執行結果記錄（gitignore；已匯入 DB，現以 D
 固定簡訊碼：**9527**（`WORKY_AUDIT_SMS_CODE`）。登入直接打 `/labor/login/confirm`，
 body `{phone, password: md5("9527")}`，免發碼。
 
+### API 自助建帳號入池（無需工作庫權限）
+
+框架沒有讀工作庫權限時，可純靠 API 自己造測試帳號入池。**dev/測試環境的註冊回應會直接帶
+驗證碼**（`data.code`），所以全程 API 即可完成：產 `09` 開頭 10 位手機號 → 註冊 → 確認 →
+補資料 → 讀 profile 取真實 id，寫進 `qa_accounts`（`note='api'`，與 audit 種子區分）。
+
+```bash
+source .venv/bin/activate
+# 建 3 個打工夥伴入池（register → confirm → 補輪廓資料）
+python -m worky_regression.qa_accounts register --role labor --n 3
+# 建 2 個商家入池（register → confirm）
+python -m worky_regression.qa_accounts register --role employer --n 2
+python -m worky_regression.qa_accounts list        # 檢視（api 建的帳號 note 標 'api'）
+```
+
+看板「帳號池」頁也有「**＋ 註冊入池**」按鈕（對當前 tab 角色，單次上限 20）。
+
+**caps 限制（重要）**：純 API 只能建到基本能力——
+labor = `active` / `clean` / `profile_complete`，employer = `active`。
+`verified`（實名認證）、`audit_role`（可被媒合的發佈角色）、`verified_shop`（店鋪送審+後台核）
+**純 API 達不到**，需這些能力的用例仍用上方 audit 種子帳號。兩者並存於池中。
+
 ---
 
 ## 簽名規則（X-Worky-Signature）
@@ -337,6 +359,69 @@ YAML 模板可參考 `cases/path-contract-happy-green.yaml`。
 - Consumer 屬性類：`.../common/components/RabbitMQ/Attribute/RabbitMQConsumer.php`
 - OnEvent 屬性類：`.../common/components/EventTrigger/Attribute/OnEvent.php`
 - ConfigLoader（自動掃描來源）：`.../common/helpers/ConfigLoader.php`
+
+---
+
+## 把 worker 跑起來
+
+兩支背景 worker 與看板 server 解耦、可獨立起停。共通：先進虛擬環境、背景常駐用 `nohup` + `-u`
+（不帶 `-u` 看不到即時 log，見 CLAUDE.md），log 落到 `logs/`。
+
+```bash
+source .venv/bin/activate
+mkdir -p logs   # 首次背景常駐前
+```
+
+### 標記處理 worker（markup_worker）
+
+處理看板「頁面標記(mark up)」：輪詢 `qa_markups` 的 `pending` → 把標記內容＋元素定位（＋回覆串）
+組成 prompt 呼叫 headless `claude -p` → 依需求自動改看板代碼（或只回建議）→ 回寫 `result`、
+狀態改 `done`/`failed`。看板頁面的標記框與徽章會即時反映狀態（前端輪詢）。
+
+> 前置：`claude` CLI 已安裝且在 PATH（headless 跑）。**worker 沒跑時，標記送出後會一直停在
+> 「待處理」**，因為沒有人領取處理。
+
+```bash
+# A) 只處理一筆就退出（除錯 / 想先看一筆效果）
+python scripts/markup_worker.py --once
+
+# B) 持續輪詢（無待處理時每 5s 探一次）
+python scripts/markup_worker.py
+
+# C) 背景常駐
+nohup python -u scripts/markup_worker.py > logs/markup_worker.log 2>&1 &
+
+# 只回建議、不讓 Claude 動檔（預設會帶 --dangerously-skip-permissions 自動改檔）
+python scripts/markup_worker.py --no-skip-permissions
+```
+
+常用旗標：`--interval <秒>`（輪詢間隔，預設 5）、`--timeout <秒>`（單筆 claude 上限，預設 1800）、
+`--once`、`--no-skip-permissions`。
+
+### 帳號池補池 worker（account_pool_worker）
+
+偵測各角色「可配發數」（state=available 或租約已過期），低於低標（預設 3）時先回收過期租約，
+若仍不足才跑 `provision()`（解停權 / 上架 audit role + sync_caps）把流失的種子帳號救回。
+池是固定 audit 種子帳號，不註冊新帳號，零侵入被測倉。
+
+```bash
+# 只檢查 / 補一次
+python scripts/account_pool_worker.py --once
+
+# 持續輪詢（預設 60s；--min-available 調低標，--no-heal 只回收+sync）
+python scripts/account_pool_worker.py
+
+# 背景常駐
+nohup python -u scripts/account_pool_worker.py > logs/account_pool_worker.log 2>&1 &
+```
+
+### 查看 / 停止背景 worker
+
+```bash
+pgrep -af "markup_worker|account_pool_worker"   # 看哪支在跑（PID）
+tail -f logs/markup_worker.log                  # 跟 log
+kill <PID>                                       # 停止
+```
 
 ---
 

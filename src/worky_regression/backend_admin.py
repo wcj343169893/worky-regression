@@ -67,14 +67,15 @@ class BackendAdminClient:
         if m:
             self.csrf = m.group(1)
 
-    def _post(self, path: str, *, data: dict, params: dict | None = None) -> requests.Response:
+    def _post(self, path: str, *, data: dict, params: dict | None = None,
+              allow_redirects: bool = True) -> requests.Response:
         """帶 CSRF（表單欄位 + header 雙保險）的 POST。"""
         body = dict(data)
         body[self.csrf_param] = self.csrf
         return self.session.post(
             self.base + path, params=params, data=body,
             headers={"X-CSRF-Token": self.csrf, "X-Requested-With": "XMLHttpRequest"},
-            timeout=30,
+            timeout=30, allow_redirects=allow_redirects,
         )
 
     # ── 登入 ───────────────────────────────────────────────────────────────
@@ -89,16 +90,39 @@ class BackendAdminClient:
         if not self.csrf:
             raise BackendLoginError("登入頁取不到 CSRF token（後台 URL 可能不對）")
 
-        resp = self._post("/site/login", data={
+        # 不帶 X-Requested-With、且不自動跟隨：帶 AJAX 標頭時 Yii2 以 `X-Redirect`
+        # （非 `Location`）回應，requests 不會跟隨、狀態停在 302 而被誤判失敗。
+        # 改以「重定向目標」判定成敗：成功 → 導向首頁；失敗 → 重渲染 /site/login。
+        body = {
             "LoginForm[username]": self.username,
             "LoginForm[password]": self.password,
-        })
-        # 失敗時 Yii2 會重新渲染登入頁（仍含密碼欄位 / 錯誤訊息）
+            self.csrf_param: self.csrf,
+        }
+        try:
+            resp = self.session.post(
+                self.base + "/site/login", data=body,
+                headers={"X-CSRF-Token": self.csrf},
+                timeout=30, allow_redirects=False)
+        except requests.RequestException as e:
+            raise BackendLoginError(f"無法連線後台：{e}") from e
+
+        redirect = resp.headers.get("Location") or resp.headers.get("X-Redirect") or ""
+        if resp.status_code in (301, 302) or redirect:
+            if "/site/login" in redirect:
+                raise BackendLoginError("帳號或密碼錯誤")
+            # 成功導向首頁；再 GET 一次刷新 CSRF（審核方法也會各自重取，失敗不致命）
+            try:
+                home = self.session.get(redirect or self.base + "/", timeout=30)
+                self._absorb_csrf(home.text)
+            except requests.RequestException:
+                pass
+            return
+        # 200：Yii2 重新渲染登入頁（仍含密碼欄位 / 錯誤訊息）
         text_ = resp.text
-        if "/site/login" in resp.url or _LOGIN_FORM.search(text_):
-            msg = "帳號或密碼錯誤" if "Incorrect username or password" in text_ \
-                else f"登入未成功（HTTP {resp.status_code}）"
-            raise BackendLoginError(msg)
+        if "Incorrect username or password" in text_:
+            raise BackendLoginError("帳號或密碼錯誤")
+        if _LOGIN_FORM.search(text_):
+            raise BackendLoginError(f"登入未成功（HTTP {resp.status_code}）")
         self._absorb_csrf(text_)
 
     # ── 審核打工夥伴（labor id 為鍵；回 JSON code）──────────────────────────────
@@ -142,10 +166,13 @@ class BackendAdminClient:
                              params={"id": shop_id}, timeout=30)
         self._absorb_csrf(g.text)
 
+        # approve/reject 一律回 302（空 body），且帶 AJAX 標頭時 X-Redirect 會打回 approve
+        # 本身造成迴圈，故不跟隨。動作成敗以 session flash 呈現在後續任一頁面。
         if approve:
-            resp = self._post("/employer/shop/validation/approve",
-                              params={"id": shop_id},
-                              data={"ShopValidationForm[shop_id]": shop_id})
+            self._post("/employer/shop/validation/approve",
+                       params={"id": shop_id},
+                       data={"ShopValidationForm[shop_id]": shop_id},
+                       allow_redirects=False)
         else:
             form = [("ShopValidationForm[shop_id]", str(shop_id))]
             for rid in (reason_ids or [1]):
@@ -153,25 +180,27 @@ class BackendAdminClient:
             if other_reason:
                 form.append(("ShopValidationForm[other_failed_reason]", other_reason))
             form.append((self.csrf_param, self.csrf))
-            resp = self.session.post(
+            self.session.post(
                 self.base + "/employer/shop/validation/reject",
                 params={"id": shop_id}, data=form,
                 headers={"X-CSRF-Token": self.csrf, "X-Requested-With": "XMLHttpRequest"},
-                timeout=30)
-        return self._parse_shop_result(resp, approve)
+                timeout=30, allow_redirects=False)
+        # GET 店鋪列表（穩定、不迴圈）讀取本次操作的 flash 判定成敗（每次審核皆新 session，無殘留）
+        landing = self.session.get(self.base + "/employer/shop/list", timeout=30)
+        return self._parse_shop_result(landing, approve)
 
     @staticmethod
     def _parse_shop_result(resp: requests.Response, approve: bool) -> dict:
-        # 後台以 flash 提示成敗：成功含「執行成功」，失敗含「失敗」。
+        # 後台以 flash 提示成敗：成功 flash 為「<動作>執行成功」，失敗為「資料檢核失敗: …」或例外訊息。
         text_ = resp.text
         action = "通過審核" if approve else "駁回申請"
-        if "執行成功" in text_ or f"{action}執行成功" in text_:
+        if f"{action}執行成功" in text_ or "執行成功" in text_:
             return {"ok": True, "message": f"{action}執行成功"}
-        # 找失敗 flash 文字
-        m = re.search(r"(資料檢核失敗[^<]*|[^<]*失敗[^<]*)", text_)
+        # 失敗 flash：資料檢核失敗 / alert-danger 內文
+        m = re.search(r"資料檢核失敗[:：]?\s*([^<\n]*)", text_)
+        if m:
+            raise BackendError(f"審核店鋪失敗：{m.group(0).strip()[:120]}")
+        m = re.search(r'alert-danger[^>]*>\s*([^<]+?)\s*<', text_)
         if m:
             raise BackendError(f"審核店鋪失敗：{m.group(1).strip()[:120]}")
-        # 無明確 flash：以最終是否被導回 list 視為成功（approve 常見）
-        if "/employer/shop/list" in resp.url or resp.status_code == 200:
-            return {"ok": True, "message": f"{action}已送出"}
-        raise BackendError(f"審核店鋪結果無法判定（HTTP {resp.status_code}）")
+        raise BackendError("審核店鋪結果無法判定（後台未回傳成敗 flash）")

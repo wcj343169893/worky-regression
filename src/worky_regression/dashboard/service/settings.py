@@ -6,6 +6,8 @@
 """
 from __future__ import annotations
 
+from ...config import db_consistency
+
 
 class SettingsMixin:
     def settings_info(self) -> dict:
@@ -18,4 +20,6 @@ class SettingsMixin:
             "deepseek_key_set": bool(s.deepseek_api_key),
             # 後台管理員帳密（可編輯持久化；只回 password_set，不外洩明文）
             "backend": self.backend_config(),
+            # 被測倉分支 ↔ .env 庫名一致性（不同分支對應不同庫；不一致＝測試數據需重建/切庫）
+            "db_consistency": db_consistency(s),
         }

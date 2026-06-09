@@ -87,3 +87,58 @@ class Settings:
         if system == "contract" and self.contract_db_name:
             return replace(self, db_name=self.contract_db_name)
         return self
+
+
+# ── 被測倉分支 → 庫名（防 .env 與實際分支漂移）─────────────────────────────────
+# 不同分支對應不同被測庫（切分支＝換一套測試數據）。這裡由被測倉 git 分支推算「預期庫名」，
+# 與 .env 的 WORKY_DB_NAME 比對，不一致即告警——正是先前 v30x/v31x 漂移踩到的坑。
+# 被測倉路徑可用 WORKY_SRC_DIR 覆寫（預設 /www/wwwroot/worky，與 CLAUDE.md 一致）。
+WORKY_SRC_DIR = os.environ.get("WORKY_SRC_DIR", "/www/wwwroot/worky")
+
+
+def worky_branch(worky_dir: str = WORKY_SRC_DIR) -> str:
+    """讀被測倉當前分支（優先 git-branch.txt，否則 git rev-parse），小寫；讀不到回空字串。"""
+    import subprocess
+    f = Path(worky_dir) / "git-branch.txt"
+    if f.exists():
+        b = f.read_text(encoding="utf-8", errors="ignore").strip()
+        if b:
+            return b.lower()
+    try:
+        out = subprocess.run(
+            ["git", "--git-dir", f"{worky_dir}/.git", "rev-parse", "--abbrev-ref", "HEAD"],
+            capture_output=True, text=True, timeout=5)
+        return out.stdout.strip().lower()
+    except Exception:  # noqa: BLE001 — 環境無 git / 路徑不存在 → 視為讀不到
+        return ""
+
+
+def expected_worky_db(branch: str) -> str:
+    """由分支名推算被測庫名（移植 worky/common/config/main-local.php）。非 next 分支回預設。"""
+    database = "worky_next_v221x"  # main-local.php 的預設值
+    if branch.startswith("next"):
+        names = ["worky", "next"]
+        parts = branch.split("-")
+        if "fix" in parts or "wkd" in parts:
+            names.append("staging")
+        version = parts[1] if len(parts) > 1 else ""
+        suffix = parts[2] if len(parts) > 2 else ""
+        if version and suffix in ("plus",):
+            version = f"{version}_{suffix}"
+        if version:
+            names.append(version)
+        database = "_".join(names)
+    return database
+
+
+def db_consistency(settings: "Settings", worky_dir: str = WORKY_SRC_DIR) -> dict:
+    """回傳被測倉分支 / 推算庫 / .env 庫 / 是否一致，供看板顯示與啟動告警。"""
+    br = worky_branch(worky_dir)
+    exp = expected_worky_db(br) if br else ""
+    return {
+        "branch": br,
+        "expected_db": exp,
+        "configured_db": settings.db_name,
+        "consistent": bool(br) and exp == settings.db_name,
+        "worky_dir": worky_dir,
+    }

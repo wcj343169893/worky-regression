@@ -24,8 +24,6 @@ const DECOMPOSE_TABS = [
     ph: "承攬任務流程，例：發案方發布任務，夥伴接案後完成驗收" },
   { key: "labor", label: "打工夥伴", system: "labor", planned: true,
     ph: "打工夥伴帳號生命週期（註冊 / 審核…）— 規劃中，暫不支援分解" },
-  { key: "employer", label: "商家", system: "employer", planned: true,
-    ph: "商家建立店鋪 / 審核等流程 — 規劃中，暫不支援分解" },
 ];
 
 // 使用者自訂 tab（透過「＋新增」由 AI 產生）持久化在 localStorage，跨重整保留。
@@ -135,7 +133,6 @@ export async function renderCases(key, tabKey, drillPath = []) {
   // 內建 + 自訂 tab 依序渲染；自訂 tab 帶可移除的 ✕；末尾再接「＋新增」按鈕
   const tabsHtml = allTabs().map((t) =>
     `<button class="dc-tab${t.key === cur.key ? " active" : ""}" data-tab="${esc(t.key)}">${esc(t.label)}` +
-    `${t.planned ? `<span class="dc-soon">規劃中</span>` : ""}` +
     `${t.custom ? `<span class="dc-del" data-del="${esc(t.key)}" title="移除此領域">✕</span>` : ""}</button>`
   ).join("") +
     `<button class="dc-tab dc-add" id="dc-add" title="用一句話描述，AI 自動建立領域 tab">＋ 新增</button>`;

@@ -6,16 +6,17 @@ import { closeDrawer, closeModal } from "./widgets.js";
 import { BOARDS, renderBoard } from "./boards.js";
 import { TABLES, renderTable } from "./tables.js";
 import { CASES, renderCases } from "./cases.js";
+import { renderAccounts } from "./accounts.js";
 import { renderSettings } from "./settings.js";
+import { toggleMarkupMode, renderMarkups, initMarkupOverlays } from "./markup.js";
 
 // ── 頂部主菜單（key 對應雜湊路由 + 各業務模塊）──────────────────────────────
 const NAV = [
   { key: "jobs", label: "工作看板" },
   { key: "tasks", label: "任務看板" },
   { key: "cases", label: "測試用例" },
-  { key: "labors", label: "打工夥伴管理" },
-  { key: "employers", label: "商家管理" },
-  { key: "shops", label: "店鋪管理" },
+  { key: "accounts", label: "帳號池" },
+  { key: "markups", label: "標記" },
   { key: "settings", label: "系統設置" },
 ];
 
@@ -33,6 +34,9 @@ function route() {
   // rest[0] = tab，rest.slice(1) = 下鑽父用例鏈
   if (CASES[key]) return renderCases(key, rest[0], rest.slice(1));
   if (TABLES[key]) return renderTable(key);
+  // accounts / markups 的 tab 也寫進雜湊（#accounts/<role>、#markups/<status>），rest[0] 即 tab
+  if (key === "accounts") return renderAccounts(rest[0]);
+  if (key === "markups") return renderMarkups(rest[0]);
   if (key === "settings") return renderSettings();
   location.hash = "jobs";
 }
@@ -41,6 +45,7 @@ function init() {
   $("nav").innerHTML = NAV.map((n) => `<button data-k="${n.key}">${n.label}</button>`).join("");
   $("nav").querySelectorAll("button").forEach((b) => b.onclick = () => { location.hash = b.dataset.k; });
   $("refresh-btn").onclick = route;
+  $("markup-toggle").onclick = toggleMarkupMode;
   $("drawer-close").onclick = closeDrawer;
   $("drawer-mask").onclick = closeDrawer;
   document.addEventListener("keydown", (e) => { if (e.key === "Escape") { closeModal(); closeDrawer(); } });
@@ -50,5 +55,6 @@ function init() {
   // 頂部標識改顯示「驗證目標 API」（#4：被測 DB 不再是驗證目標）
   api("/api/settings").then((d) => $("db-sub").textContent = d.api_base || d.platform || "—").catch(() => {});
   route();
+  initMarkupOverlays();   // 既有標記在頁面上以虛線框可視化（顏色依狀態）
 }
 init();

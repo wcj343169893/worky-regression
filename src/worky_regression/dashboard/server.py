@@ -10,8 +10,12 @@
 """
 from __future__ import annotations
 
+import base64
 import json
 import mimetypes
+import re
+import secrets
+import time
 import traceback
 from functools import lru_cache
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -23,6 +27,35 @@ from .cases import CaseStore
 from . import status as st
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
+# results/markups/：標記截圖落地處（results 已 gitignore）
+MARKUP_SHOT_DIR = Path(__file__).resolve().parents[3] / "results" / "markups"
+
+# ── 前端資源 cache-busting ───────────────────────────────────────────────────
+# 看板前端是原生 ES Module（import 走相對路徑、無版本號）。no-store 只能管到瀏覽器，
+# 管不住「無視 no-store 的邊緣代理 / CDN」——它快取住某個時點的 .js 後，之後改檔強刷也拉不到新版
+# （常見的「修了沒生效」）。解法：服務 .js/.html 時，動態把所有靜態資源 URL 補上隨檔案 mtime 變動的
+# ?v=<ver>，任一檔案一變動版本就換、URL 就換，任何快取都被迫重抓。檔案查找只看 path、忽略 query。
+_JS_IMPORT_RE = re.compile(r'(\b(?:from|import)\b\s*\(?\s*)(["\'])(\.{1,2}/[^"\']+\.js)(["\'])')
+_HTML_ASSET_RE = re.compile(r'((?:src|href)=)(["\'])(/static/[^"\']+\.(?:js|css))(["\'])')
+
+
+def _static_build_version() -> str:
+    """所有前端原始檔（js/css/html）的最新 mtime → 短版本字串；任一檔改動即變動。"""
+    latest = 0
+    for p in STATIC_DIR.rglob("*"):
+        if p.suffix in (".js", ".css", ".html") and p.is_file():
+            latest = max(latest, int(p.stat().st_mtime))
+    return format(latest, "x")
+
+
+def _bust_js_imports(src: str, ver: str) -> str:
+    """把 JS 內相對 import（from/import "./x.js"）的 URL 補上 ?v=ver。"""
+    return _JS_IMPORT_RE.sub(lambda m: f"{m.group(1)}{m.group(2)}{m.group(3)}?v={ver}{m.group(4)}", src)
+
+
+def _bust_html_assets(src: str, ver: str) -> str:
+    """把 HTML 內 /static/*.js|css 的 src/href 補上 ?v=ver。"""
+    return _HTML_ASSET_RE.sub(lambda m: f"{m.group(1)}{m.group(2)}{m.group(3)}?v={ver}{m.group(4)}", src)
 
 
 @lru_cache(maxsize=1)
@@ -73,10 +106,20 @@ class Handler(BaseHTTPRequestHandler):
             return
         ctype = mimetypes.guess_type(str(path))[0] or "application/octet-stream"
         data = path.read_bytes()
+        # JS/HTML：把資源 URL 補上版本號（破代理快取，見 _static_build_version 註解）
+        suffix = path.suffix.lower()
+        if suffix in (".js", ".html"):
+            ver = _static_build_version()
+            text_data = data.decode("utf-8")
+            text_data = _bust_js_imports(text_data, ver) if suffix == ".js" else _bust_html_assets(text_data, ver)
+            data = text_data.encode("utf-8")
         self.send_response(200)
         self.send_header("Content-Type", f"{ctype}; charset=utf-8"
                          if ctype.startswith("text/") or ctype.endswith("javascript")
                          else ctype)
+        # 看板是內部測試工具、改版頻繁；ES Module / HTML 不帶版本號，瀏覽器一旦
+        # 快取舊檔就會看到「修了卻沒生效」的假象（每次都得手動硬重整）。一律禁快取。
+        self.send_header("Cache-Control", "no-store, must-revalidate")
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
         self.wfile.write(data)
@@ -147,6 +190,23 @@ class Handler(BaseHTTPRequestHandler):
                     limit=_int(query, "limit", 50), offset=_int(query, "offset", 0)))
             elif path == "/api/settings":
                 self._send_json(_service().settings_info())
+            elif path == "/api/accounts":
+                # 帳號池管理頁：檢視 labor/employer 池（qa_accounts，非被測後端 DB）
+                self._send_json(_service().list_accounts())
+            # ── 頁面標記（mark up）──
+            elif path == "/api/markups":
+                _qa = _cases().qa
+                _st = _one(query, "status", "") or None
+                _q = _one(query, "q", "") or None
+                self._send_json({
+                    "items": _qa.list_markups(
+                        status=_st, q=_q,
+                        limit=_int(query, "limit", 100),
+                        offset=_int(query, "offset", 0)),
+                    "total": _qa.count_markups(status=_st, q=_q)})
+            elif path.startswith("/api/markups/") and path.endswith("/screenshot"):
+                mid = path[len("/api/markups/"):-len("/screenshot")]
+                self._send_markup_shot(mid)
             # ── 測試用例 ──
             elif path == "/api/cases":
                 self._send_json(_cases().list_cases(
@@ -212,6 +272,53 @@ class Handler(BaseHTTPRequestHandler):
                     self._sse_send("error", {"error": str(e)})
                 except (BrokenPipeError, ConnectionResetError):
                     pass
+
+    def _create_markup(self, body: dict) -> dict:
+        """落地一筆標記：截圖 dataURL 解碼存檔，其餘欄位入庫。"""
+        content = str(body.get("content", "")).strip()
+        if not content:
+            return {"error": "缺少標記內容 content"}
+        shot_rel = self._save_markup_shot(body.get("screenshot"))
+        ts = int(time.time())
+        mid = _cases().qa.insert_markup(
+            route=str(body.get("route", ""))[:64],
+            selector=(str(body.get("selector"))[:4000] if body.get("selector") else None),
+            element_text=(str(body.get("element_text"))[:2000] if body.get("element_text") else None),
+            rect=body.get("rect") if isinstance(body.get("rect"), dict) else None,
+            content=content[:8000],
+            screenshot_path=shot_rel,
+            created_at=ts)
+        return {"ok": True, "id": mid}
+
+    @staticmethod
+    def _save_markup_shot(data_url) -> str | None:
+        """把 base64 dataURL 截圖寫到 results/markups/，回傳相對路徑；無 / 解析失敗回 None。"""
+        if not data_url or not isinstance(data_url, str) or "," not in data_url:
+            return None
+        try:
+            raw = base64.b64decode(data_url.split(",", 1)[1])
+        except (ValueError, TypeError):
+            return None
+        MARKUP_SHOT_DIR.mkdir(parents=True, exist_ok=True)
+        name = f"markup-{int(time.time())}-{secrets.token_hex(3)}.png"
+        (MARKUP_SHOT_DIR / name).write_bytes(raw)
+        return f"results/markups/{name}"
+
+    def _send_markup_shot(self, markup_id: str):
+        """回傳某標記的截圖檔（依庫中相對路徑解析，防穿越）。"""
+        try:
+            m = _cases().qa.get_markup(int(markup_id))
+        except (ValueError, TypeError):
+            m = None
+        rel = (m or {}).get("screenshot_path")
+        if not rel:
+            self._send_json({"error": "no screenshot"}, 404)
+            return
+        target = (MARKUP_SHOT_DIR.parents[1] / rel).resolve()
+        if MARKUP_SHOT_DIR.resolve() not in target.parents:
+            self._send_json({"error": "forbidden"}, 403)
+            return
+        self._send_file(target)
 
     def do_POST(self):  # noqa: N802
         parsed = urlparse(self.path)
@@ -294,6 +401,60 @@ class Handler(BaseHTTPRequestHandler):
                     password=b.get("password")))
             elif path == "/api/backend/login-test":
                 self._send_json(_service().backend_login_test())
+            elif path == "/api/accounts/test-login":
+                # 帳號池：以該帳號實打被測登入 API，回 ok/訊息（診斷登入報錯）
+                aid = (body or {}).get("account_id")
+                role = (body or {}).get("role")
+                if aid is None or not role:
+                    self._send_json({"error": "缺少 account_id / role"}, 400)
+                else:
+                    self._send_json(_service().account_test_login(int(aid), str(role)))
+            elif path == "/api/accounts/state":
+                # 帳號池：啟用 / 停用（disabled 者 acquire 不配發）
+                aid = (body or {}).get("account_id")
+                role = (body or {}).get("role")
+                state = (body or {}).get("state")
+                if aid is None or not role or not state:
+                    self._send_json({"error": "缺少 account_id / role / state"}, 400)
+                else:
+                    self._send_json(_service().set_account_state(int(aid), str(role), str(state)))
+            elif path == "/api/accounts/register":
+                # 帳號池：純 API 自助建帳號入池（產 09 手機號 → 註冊 → 補資料）
+                role = (body or {}).get("role")
+                n = (body or {}).get("n", 1)
+                if not role:
+                    self._send_json({"error": "缺少 role"}, 400)
+                else:
+                    self._send_json(_service().register_accounts(str(role), int(n)))
+            # ── 頁面標記（mark up）──
+            elif path == "/api/markups":
+                self._send_json(self._create_markup(body or {}))
+            elif path == "/api/markups/delete":
+                mid = _review_id(body)  # 共用：取 body.id 為 int
+                if mid is None:
+                    self._send_json({"error": "缺少 id"}, 400)
+                else:
+                    _cases().qa.delete_markup(mid)
+                    self._send_json({"ok": True})
+            elif path == "/api/markups/reply":
+                mid = _review_id(body)
+                reply = str((body or {}).get("content", "")).strip()
+                if mid is None or not reply:
+                    self._send_json({"error": "缺少 id 或回覆內容"}, 400)
+                elif _cases().qa.reply_markup(mid, reply[:8000], at=int(time.time())):
+                    self._send_json({"ok": True, "id": mid})  # 已打回 pending，待 worker 再次處理
+                else:
+                    self._send_json({"error": f"找不到標記 #{mid}"}, 404)
+            elif path == "/api/markups/resolve":
+                # 已解決開關：resolved=1 → 源頁面不再畫框；0 → 重新顯示（純可視化，不動 status）
+                mid = _review_id(body)
+                resolved = bool((body or {}).get("resolved", True))
+                if mid is None:
+                    self._send_json({"error": "缺少 id"}, 400)
+                elif _cases().qa.set_markup_resolved(mid, resolved):
+                    self._send_json({"ok": True, "id": mid, "resolved": resolved})
+                else:
+                    self._send_json({"error": f"找不到標記 #{mid}"}, 404)
             elif path == "/api/labors/review":
                 rid = _review_id(body)
                 if rid is None:
@@ -392,6 +553,14 @@ def serve(host: str = "127.0.0.1", port: int = 8765) -> None:
     print(f"  開啟   : {url}")
     print("  停止   : Ctrl-C")
     print("=" * 56)
+    # 被測倉分支 ↔ .env 庫名一致性告警（不同分支對應不同庫；漂移會讓清單/審核對不上）
+    from ..config import db_consistency
+    _dc = db_consistency(svc.settings)
+    if not _dc["consistent"]:
+        print(f"  ⚠️  被測庫不一致：分支 {_dc['branch'] or '?'} 推算庫={_dc['expected_db'] or '?'} "
+              f"≠ .env={_dc['configured_db']}")
+        print("      切分支＝換一套測試數據：請改 .env WORKY_DB_NAME 並重建帳號池，或切回對應分支。")
+        print("=" * 56)
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:

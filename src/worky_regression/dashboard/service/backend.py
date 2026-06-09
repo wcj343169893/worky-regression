@@ -52,16 +52,37 @@ class BackendMixin:
         except BackendError as e:
             return {"ok": False, "message": str(e)}
 
-    # ── 審核（建 client → login → 審核）────────────────────────────────────
+    # ── 審核（建 client → login → 審核 → 池內帳號重探 caps）────────────────────
     def review_labor(self, labor_id: int, approve: bool,
                      reasons: dict | None = None) -> dict:
         client = self._backend_client()
         client.login()
-        return client.review_labor(int(labor_id), approve, reasons=reasons)
+        result = client.review_labor(int(labor_id), approve, reasons=reasons)
+        # 審核改了工作庫硬狀態 → 若該帳號在池中，重探重算 caps（labor 通過→補 verified）
+        result["caps_synced"] = self._sync_caps_safe(int(labor_id), "labor")
+        return result
 
     def review_shop(self, shop_id: int, approve: bool,
                     reason_ids: list | None = None, other_reason: str = "") -> dict:
         client = self._backend_client()
         client.login()
-        return client.review_shop(int(shop_id), approve,
-                                  reason_ids=reason_ids, other_reason=other_reason)
+        result = client.review_shop(int(shop_id), approve,
+                                    reason_ids=reason_ids, other_reason=other_reason)
+        # 店鋪歸屬商家：若在池中，重探重算 caps（通過→補 shop_approved）
+        result["caps_synced"] = self._sync_shop_owner_caps_safe(int(shop_id))
+        return result
+
+    # ── caps 重探（best-effort：失敗不影響審核結果回報）────────────────────────
+    def _sync_caps_safe(self, account_id: int, role: str):
+        from ...qa_accounts import AccountPool
+        try:
+            return AccountPool(self.settings).sync_account_caps(account_id, role)
+        except Exception as e:  # noqa: BLE001 — 重探失敗不可吃掉審核成功的結果
+            return {"error": f"{type(e).__name__}: {e}"}
+
+    def _sync_shop_owner_caps_safe(self, shop_id: int):
+        from ...qa_accounts import AccountPool
+        try:
+            return AccountPool(self.settings).resync_shop_owner(shop_id)
+        except Exception as e:  # noqa: BLE001
+            return {"error": f"{type(e).__name__}: {e}"}

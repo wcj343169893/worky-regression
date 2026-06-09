@@ -120,6 +120,8 @@ class QAAccount(Base):
     __tablename__ = "qa_accounts"
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    # 帳號所屬被測庫（切分支＝換庫＝換一套帳號）；同 account_id 在不同庫是不同人，故納入唯一鍵。
+    db_name: Mapped[str] = mapped_column(String(64), nullable=False, server_default="")
     account_id: Mapped[int] = mapped_column(Integer, nullable=False)        # worky labor/employer id
     role: Mapped[str] = mapped_column(String(32), nullable=False)          # 'labor' | 'employer'
     user_type: Mapped[int] = mapped_column(Integer, nullable=False)        # 1 商家 / 2 打工夥伴
@@ -136,11 +138,52 @@ class QAAccount(Base):
     lease_expires_at: Mapped[int] = mapped_column(BigInteger, nullable=False, server_default="0")
     # 最近被配發的時間（unix 秒）；acquire 以此做「最久未用優先」輪換，分散每商家每日發佈上限。
     last_used_at: Mapped[int] = mapped_column(BigInteger, nullable=False, server_default="0")
+    # ── 本地 token 快取 ───────────────────────────────────────────────────────
+    # 帳號池保存每個帳號上次登入/刷新拿到的 token，配發時「有效就用、到期才刷」(見 AccountPool)。
+    # token 是 JWT，可能很長，用 LONGTEXT 避免截斷。過期時間皆為 unix 秒，0 表示無/未知。
+    access_token: Mapped[str | None] = mapped_column(LONGTEXT)
+    refresh_token: Mapped[str | None] = mapped_column(LONGTEXT)
+    access_token_expired_at: Mapped[int] = mapped_column(BigInteger, nullable=False, server_default="0")
+    refresh_token_expired_at: Mapped[int] = mapped_column(BigInteger, nullable=False, server_default="0")
+    token_updated_at: Mapped[int] = mapped_column(BigInteger, nullable=False, server_default="0")
 
     __table_args__ = (
-        Index("uq_account_role", "account_id", "role", unique=True),
-        Index("idx_role_state", "role", "state"),
+        Index("uq_db_account_role", "db_name", "account_id", "role", unique=True),
+        Index("idx_db_role_state", "db_name", "role", "state"),
     )
+
+
+class QAMarkup(Base):
+    """頁面標記（看板 UI 上的「mark up」標註）。
+
+    使用者在看板任一頁開標記模式、點選元素後填一段內容，連同元素定位資訊（CSS 選擇器、
+    可見文字、頁面路由、座標）與整頁截圖一起落地。狀態機：
+    `pending`（待處理）→ `processing`（已被 worker 領取）→ `done` / `failed`。
+    獨立的 headless Claude worker（scripts/markup_worker.py）輪詢 pending、依內容自動處理，
+    把處理摘要寫回 `result`。
+    """
+    __tablename__ = "qa_markups"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    route: Mapped[str] = mapped_column(String(64), nullable=False, server_default="")   # 雜湊路由，如 jobs/cases
+    selector: Mapped[str | None] = mapped_column(Text)            # 被選元素的 CSS 選擇器路徑
+    element_text: Mapped[str | None] = mapped_column(Text)        # 被選元素的可見文字（截斷）
+    rect: Mapped[dict | None] = mapped_column(JSON)               # {x,y,w,h,vw,vh,scrollX,scrollY}
+    content: Mapped[str] = mapped_column(Text, nullable=False)    # 使用者填寫的標記內容
+    screenshot_path: Mapped[str | None] = mapped_column(String(255))  # 截圖相對路徑（results/markups/*.png）
+    status: Mapped[str] = mapped_column(String(16), nullable=False, server_default="pending")  # pending|processing|done|failed
+    # 使用者「已解決」開關（獨立於 worker 處理狀態 status）：1=已解決 → 源頁面不再畫框；
+    # 取消解決（改回 0）源頁面重新顯示。純前端可視化的隱藏/顯示，不影響 worker 處理。
+    resolved: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    result: Mapped[str | None] = mapped_column(LONGTEXT)          # worker 最近一次處理摘要 / Claude 輸出
+    # 使用者對處理結果的追加回覆串 [{text,at}]；送出回覆會把 status 打回 pending，worker 帶著
+    # 「上次 result + 回覆串」重新處理（針對同一問題再次優化）。
+    replies: Mapped[list | None] = mapped_column(JSON)
+    created_at: Mapped[int] = mapped_column(BigInteger, nullable=False, server_default="0")
+    updated_at: Mapped[datetime] = mapped_column(
+        server_default=func.current_timestamp(), onupdate=func.current_timestamp())
+
+    __table_args__ = (Index("idx_status_created", "status", "created_at"),)
 
 
 # ── 連線 / URL ───────────────────────────────────────────────────────────────

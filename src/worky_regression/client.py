@@ -36,6 +36,7 @@ class WorkyClient:
         self.access_token: str = ""
         self.refresh_token: str = ""
         self.access_token_expired_at: int = 0
+        self.refresh_token_expired_at: int = 0
         self.udid = uuid.uuid4().hex  # 32 chars
         self.session = requests.Session()
         # 內網/dev domain bypass 系統 proxy（Privoxy 會吞 .worky.com.tw）
@@ -101,8 +102,83 @@ class WorkyClient:
     def get(self, path: str, params: dict | None = None) -> requests.Response:
         return self.request("GET", path, params=params)
 
+    def upload_file(self, file_type: str, content: bytes, *, filename: str = "upload.png",
+                    content_type: str = "image/png", response_type: int = 2) -> requests.Response:
+        """上傳檔案（multipart）到 /file-upload。回 requests.Response（data.uploadedFiles 為網址陣列）。
+
+        簽名規則與 JSON 不同（見 worky api/components/Request.php）：Content-Type 非 application/json
+        時 rawBody 為空 → 改用表單欄位，且 **ksort 排序** 後 http_build_query，再接 commonVars/token/secret。
+        檔案本身不參與簽名。故不可走 self.request（那會帶 application/json）。
+        """
+        fields = {"type": file_type, "response_type": str(response_type)}
+        common_vars = self._common_vars_json()
+        # ksort：key 升序後 urlencode（http_build_query 等價），multipart 無 JSON body
+        sig_str = urlencode(dict(sorted(fields.items())))
+        sig = md5(sig_str + common_vars + self.access_token + self.settings.api_secret)
+        headers = {"X-Worky-Common-Variables": common_vars, "X-Worky-Signature": sig}
+        if self.access_token:
+            headers["Authorization"] = f"Bearer {self.access_token}"
+        return self.session.post(
+            self.settings.api_base + "/file-upload",
+            data=fields, files={"files": (filename, content, content_type)},
+            headers=headers, timeout=30)
+
     def set_access_token(self, token: str, expired_at: int = 0,
-                          refresh_token: str = "") -> None:
+                          refresh_token: str = "", refresh_expired_at: int = 0) -> None:
         self.access_token = token
         self.access_token_expired_at = expired_at
         self.refresh_token = refresh_token
+        self.refresh_token_expired_at = refresh_expired_at
+
+    # ── token 生命週期 ────────────────────────────────────────────────────────
+    def access_valid(self, buffer_secs: int = 300) -> bool:
+        """access token 是否仍可用（預留 buffer 秒緩衝，避免請求途中剛好過期）。
+
+        expired_at=0 視為「不知道過期時間」→ 當作無效，逼呼叫端走刷新/登入較安全。
+        """
+        if not self.access_token or self.access_token_expired_at <= 0:
+            return False
+        return int(time.time()) + buffer_secs < self.access_token_expired_at
+
+    def refresh_valid(self, buffer_secs: int = 0) -> bool:
+        """refresh token 是否仍可用（refresh 有效期 30 天，buffer 預設 0）。"""
+        if not self.refresh_token or self.refresh_token_expired_at <= 0:
+            return False
+        return int(time.time()) + buffer_secs < self.refresh_token_expired_at
+
+    def refresh(self) -> bool:
+        """用 refresh token 換新 access token（POST /token/refresh，不需帶 access token）。
+
+        成功則更新 access/refresh token 與兩個過期時間並回 True；無 refresh token 或
+        後端拒絕則回 False（呼叫端據此 fallback 完整登入）。
+        """
+        if not self.refresh_token:
+            return False
+        # 刷新端點不需 access token，且舊 access token 可能已過期；簽名時清掉以免污染。
+        saved = self.access_token
+        self.access_token = ""
+        try:
+            resp = self.post("/token/refresh", body={"refreshToken": self.refresh_token})
+        except requests.RequestException:
+            self.access_token = saved
+            return False
+        if resp.status_code != 200:
+            self.access_token = saved
+            return False
+        payload = resp.json()
+        if payload.get("success") is False:
+            self.access_token = saved
+            return False
+        data = payload.get("data") if isinstance(payload.get("data"), dict) else payload
+        token = data.get("accessToken") or data.get("access_token")
+        if not token:
+            self.access_token = saved
+            return False
+        # 刷新端點回 accessTokenExpired / refreshTokenExpired；登入端點回 ...ExpiredAt。兩種都收。
+        self.set_access_token(
+            token=token,
+            expired_at=data.get("accessTokenExpired") or data.get("accessTokenExpiredAt") or 0,
+            refresh_token=data.get("refreshToken") or self.refresh_token,
+            refresh_expired_at=data.get("refreshTokenExpired") or data.get("refreshTokenExpiredAt") or 0,
+        )
+        return True

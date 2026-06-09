@@ -280,6 +280,9 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
 .set-actions{display:flex;align-items:center;gap:10px;margin-top:14px}
 .set-status{font-size:13px}
 .set-status.ok{color:var(--ok)} .set-status.no{color:var(--danger)}
+/* 帳號池：測試登入結果訊息（成功綠/失敗紅，可換行顯示完整錯誤） */
+.acc-msg{display:inline-block;margin-left:6px;white-space:normal;word-break:break-all}
+.acc-msg.ok{color:var(--ok)} .acc-msg.no{color:var(--danger)}
 
 /* 審核操作欄小按鈕 */
 .btn.mini{padding:3px 9px;font-size:12px;margin-right:5px}
@@ -312,6 +315,9 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
   padding:13px 16px;border-bottom:1px solid var(--line);flex-wrap:wrap}
 .panel-head h3{margin:0;font-size:15px}
 .panel-head .filters input[type=search]{min-width:170px}
+/* 帳號池「註冊入池」控制：靠右，數字框 + 按鈕 */
+.acc-reg{margin-left:auto;display:flex;align-items:center;gap:8px}
+.acc-reg input[type=number]{min-width:64px;width:72px}
 .col-center .card{height:100%}
 .col-center .table-wrap{max-height:none;flex:1}
 .dist .dist-bar{display:flex;height:14px;border-radius:8px;overflow:hidden;margin:14px 16px 10px;background:var(--panel2)}
@@ -346,3 +352,87 @@ tbody tr.sel{background:var(--panel2);box-shadow:inset 3px 0 0 var(--accent)}
 ::-webkit-scrollbar-thumb{background:#2f3a5c;border:2px solid transparent;background-clip:padding-box;border-radius:8px}
 ::-webkit-scrollbar-thumb:hover{background:#42517d;background-clip:padding-box;border:2px solid transparent}
 ::-webkit-scrollbar-corner{background:transparent}
+
+/* ── 頁面標記（mark up）──────────────────────────────────────────────────── */
+#markup-toggle.on{color:#fff;border-color:transparent;
+  background:linear-gradient(135deg,var(--accent2),var(--accent))}
+/* 標記模式：全頁十字游標 + 提示被測元素可點 */
+body.markup-mode{cursor:crosshair}
+body.markup-mode *{cursor:crosshair !important}
+.markup-hover{position:fixed;z-index:38;pointer-events:none;display:none;
+  border:2px solid var(--accent2);border-radius:6px;
+  background:rgba(124,92,255,.12);box-shadow:0 0 0 1px rgba(124,92,255,.5),0 6px 20px rgba(0,0,0,.4)}
+/* 既有標記在頁面上的可視化：不同顏色虛線框 + 右上角圖標 */
+#markup-overlays{position:fixed;top:0;left:0;width:0;height:0;z-index:15;pointer-events:none}
+.markup-overlay{position:fixed;box-sizing:border-box;border:2px dashed var(--warn);
+  border-radius:6px;pointer-events:none}
+.markup-overlay.mo-done{border-color:var(--ok);background:rgba(61,220,151,.06)}
+.markup-overlay.mo-pending{border-color:var(--warn);background:rgba(255,180,84,.06)}
+.markup-overlay.mo-processing{border-color:var(--info);background:rgba(57,197,224,.06)}
+.markup-overlay.mo-failed{border-color:var(--danger);background:rgba(255,107,107,.06)}
+.markup-overlay-icon{position:absolute;top:-11px;right:-11px;width:22px;height:22px;padding:0;
+  display:flex;align-items:center;justify-content:center;border-radius:50%;font-size:12px;
+  line-height:1;cursor:pointer;pointer-events:auto;color:#0b1020;border:1px solid rgba(0,0,0,.25);
+  box-shadow:0 2px 6px rgba(0,0,0,.4);transition:transform .1s}
+.markup-overlay-icon.mo-done{background:var(--ok)}
+.markup-overlay-icon.mo-pending{background:var(--warn)}
+.markup-overlay-icon.mo-processing{background:var(--info)}
+.markup-overlay-icon.mo-failed{background:var(--danger)}
+.markup-overlay-icon:hover{transform:scale(1.15)}
+/* 標記表單（彈窗內）*/
+.modal-title{margin:0 0 12px;font-size:16px}
+.markup-form{display:flex;flex-direction:column;gap:10px;min-width:min(560px,82vw)}
+.markup-meta{display:flex;flex-direction:column;gap:5px;font-size:12px;color:var(--muted)}
+.markup-meta .k{display:inline-block;min-width:36px;color:var(--muted)}
+.markup-meta code{color:var(--txt);background:var(--panel2);padding:1px 6px;border-radius:6px;
+  word-break:break-all}
+.markup-sel{font-size:11px;color:var(--info);word-break:break-all}
+.markup-eltext{color:var(--txt)}
+.markup-shot-preview{max-width:100%;max-height:300px;border:1px solid var(--line);
+  border-radius:10px;object-fit:contain;background:var(--bg)}
+.markup-form textarea{width:100%;box-sizing:border-box;background:var(--bg);color:var(--txt);
+  border:1px solid var(--line);border-radius:10px;padding:10px;font:inherit;resize:vertical}
+.markup-form textarea:focus{outline:none;border-color:var(--accent)}
+.markup-actions{display:flex;justify-content:flex-end;gap:8px}
+/* 狀態徽章補充 */
+.b-pending{color:var(--warn);border-color:rgba(255,180,84,.4);background:rgba(255,180,84,.1)}
+.b-processing{color:var(--info);border-color:rgba(57,197,224,.4);background:rgba(57,197,224,.1)}
+/* 標記管理頁 */
+.panel{position:relative;z-index:1;background:var(--panel);border:1px solid var(--line);
+  border-radius:var(--radius);padding:18px;box-shadow:var(--shadow)}
+.panel-head h2{margin:0 0 2px;font-size:17px}
+.markup-list{display:flex;flex-direction:column;gap:12px;margin-top:14px}
+/* 標記管理頁套 cases-list 版面：清單區撐滿並自捲（高度對齊「測試用例」頁），分頁器固定底部 */
+.cases-list .markup-list{flex:1;min-height:0;overflow:auto;margin-top:0;padding:14px 4px 4px}
+/* 已解決標記：卡片淡化，附綠色 pill 標示「源頁不顯示」 */
+.markup-card.is-resolved{opacity:.62}
+.pill-ok{color:var(--ok);border:1px solid var(--ok);background:transparent}
+/* align-items:flex-start —— 兩欄各取自然高度，避免截圖較高時把右側 body 拉伸到超出、
+   再被 overflow 裁掉底部的操作列（已解決/刪除）。故也不要 overflow:hidden。 */
+.markup-card{display:flex;align-items:flex-start;gap:14px;background:var(--panel2);
+  border:1px solid var(--line);border-radius:12px;padding:12px}
+.markup-card-shot{flex:0 0 180px;width:180px}
+.markup-card-shot img{width:180px;max-height:240px;object-fit:cover;border:1px solid var(--line);
+  border-radius:8px;cursor:zoom-in;background:var(--bg)}
+.markup-noshot{width:180px;height:110px;display:flex;align-items:center;justify-content:center;
+  color:var(--muted);font-size:12px;border:1px dashed var(--line);border-radius:8px}
+.markup-card-body{flex:1;min-width:0;display:flex;flex-direction:column;gap:7px}
+.markup-card-top{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+.markup-card-top code{color:var(--txt);background:var(--bg);padding:1px 7px;border-radius:6px}
+.markup-card-content{color:var(--txt);font-size:14px;white-space:pre-wrap;word-break:break-word}
+.markup-result{font-size:12px;color:var(--muted)}
+.markup-result summary{cursor:pointer}
+.markup-result pre{white-space:pre-wrap;word-break:break-word;background:var(--bg);
+  border:1px solid var(--line);border-radius:8px;padding:10px;margin:6px 0 0;max-height:280px;overflow:auto}
+/* 回覆串（使用者對處理結果的追加）*/
+.markup-replies{display:flex;flex-direction:column;gap:6px}
+.markup-reply{border-left:2px solid var(--info);padding:4px 0 4px 9px}
+.markup-reply-k{color:var(--info);font-size:12px}
+.markup-reply-text{color:var(--txt);font-size:13px;white-space:pre-wrap;word-break:break-word;margin-top:2px}
+/* 回覆輸入框：補充說明後把標記打回 pending、重新優化 */
+.markup-reply-box{display:flex;gap:8px;align-items:flex-end}
+.markup-reply-input{flex:1;box-sizing:border-box;background:var(--bg);color:var(--txt);
+  border:1px solid var(--line);border-radius:8px;padding:7px 9px;font:inherit;resize:vertical}
+.markup-reply-input:focus{outline:none;border-color:var(--accent)}
+.markup-reply-send{white-space:nowrap}
+.markup-card-act{margin-top:auto}

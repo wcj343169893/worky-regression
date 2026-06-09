@@ -15,7 +15,9 @@ labor 與 employer（商家）都納管：role 欄位區分；employer 也有自
 """
 from __future__ import annotations
 
+import base64
 import json
+import random
 import time
 from dataclasses import dataclass
 from typing import Any
@@ -23,6 +25,7 @@ from typing import Any
 import sqlalchemy
 from sqlalchemy import text
 
+from .client import WorkyClient, md5
 from .config import Settings
 from . import qa_models
 
@@ -51,6 +54,12 @@ SEED_EMPLOYERS = [
 ]
 # 供給階段可校正硬狀態的測試帳號白名單（只動這些測試帳號，不波及真實用戶）。
 PROVISION_LABOR_IDS = [236, 276, 365, 15, 214]
+# 各角色的「種子容量」＝池可能擁有的帳號數上限（池是固定 audit 種子、不註冊新帳號）。
+# 補池低標不可超過容量，否則容量小的角色（如 employer 只 1 個）永遠達不到低標 → 無限空轉。
+SEED_CAPACITY = {"labor": len(SEED_LABOR_IDS), "employer": len(SEED_EMPLOYERS)}
+# API 建店鋪/送審需上傳圖片：用 1x1 透明 PNG 充當（後端只要有效圖檔，不檢內容）。
+_DUMMY_PNG = base64.b64decode(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+M8AAAMBAQDJ/pLvAAAAAElFTkSuQmCC")
 
 
 class AccountPool:
@@ -62,6 +71,11 @@ class AccountPool:
     @property
     def _qa_engine(self):
         return qa_models.get_engine(self.s)
+
+    @property
+    def db(self) -> str:
+        """目前被測庫名：池內帳號按此隔離（切庫＝換一套帳號）。"""
+        return self.s.db_name
 
     def _worky_engine(self):
         """連工作庫（僅供給/同步用；執行期不呼叫）。"""
@@ -90,10 +104,10 @@ class AccountPool:
             rows = conn.execute(text("""
                 SELECT id, account_id, role, user_type, phone, username, shop_id, caps, note
                 FROM qa_accounts
-                WHERE role=:role AND state<>'disabled'
+                WHERE db_name=:db AND role=:role AND state<>'disabled'
                   AND (state='available' OR lease_expires_at < :now)
                 ORDER BY (lease_owner=:owner) DESC, last_used_at ASC, account_id ASC
-            """), {"role": role, "now": now, "owner": owner}).all()
+            """), {"db": self.db, "role": role, "now": now, "owner": owner}).all()
             def _caps(r) -> list[str]:
                 c = r.caps
                 return json.loads(c) if isinstance(c, str) else (c or [])
@@ -140,10 +154,10 @@ class AccountPool:
             rows = conn.execute(text("""
                 SELECT id, account_id, role, user_type, phone, username, shop_id, caps, note
                 FROM qa_accounts
-                WHERE role=:role AND state<>'disabled'
+                WHERE db_name=:db AND role=:role AND state<>'disabled'
                   AND (state='available' OR lease_expires_at < :now)
                 ORDER BY last_used_at ASC, account_id ASC
-            """), {"role": role, "now": now}).all()
+            """), {"db": self.db, "role": role, "now": now}).all()
 
             def _caps(r):
                 c = r.caps
@@ -171,18 +185,326 @@ class AccountPool:
             caps=list(json.loads(r.caps) if isinstance(r.caps, str) else (r.caps or [])), note=r.note,
         ) for r in chosen]
 
+    # ── 本地 token 快取（配發時「有效就用、到期才刷」）─────────────────────────
+    def load_token(self, account_id: int, role: str) -> dict[str, Any] | None:
+        """讀帳號池內保存的 token（不檢查是否過期，由呼叫端的 client 自行判斷）。"""
+        with self._qa_engine.connect() as conn:
+            r = conn.execute(text(
+                "SELECT access_token, refresh_token, access_token_expired_at, "
+                "refresh_token_expired_at FROM qa_accounts "
+                "WHERE db_name=:db AND account_id=:a AND role=:r"),
+                {"db": self.db, "a": int(account_id), "r": role}).first()
+        return dict(r._mapping) if r else None
+
+    def save_token(self, account_id: int, role: str, *, access_token: str,
+                   refresh_token: str, access_expired_at: int, refresh_expired_at: int) -> None:
+        """把登入/刷新後的最新 token 寫回帳號池，供下次配發重用。"""
+        now = int(time.time())
+        with self._qa_engine.begin() as conn:
+            conn.execute(text("""
+                UPDATE qa_accounts SET
+                  access_token=:at, refresh_token=:rt,
+                  access_token_expired_at=:aexp, refresh_token_expired_at=:rexp,
+                  token_updated_at=:now
+                WHERE db_name=:db AND account_id=:a AND role=:r
+            """), {
+                "at": access_token, "rt": refresh_token,
+                "aexp": int(access_expired_at or 0), "rexp": int(refresh_expired_at or 0),
+                "now": now, "db": self.db, "a": int(account_id), "r": role,
+            })
+
     def release(self, owner: str) -> int:
         """歸還某 owner 借走的所有帳號。"""
         with self._qa_engine.begin() as conn:
             res = conn.execute(text(
                 "UPDATE qa_accounts SET state='available', lease_owner=NULL, lease_expires_at=0 "
-                "WHERE lease_owner=:o"), {"o": owner})
+                "WHERE db_name=:db AND lease_owner=:o"), {"db": self.db, "o": owner})
             return res.rowcount
+
+    # ── 動態補池（worker 用：偵測可用數不足 → 回收過期租約 + provision 補回）──────
+    def available_count(self) -> dict[str, int]:
+        """各角色『目前可配發』數：state='available' 或租約已過期者都算可配發。
+
+        與 acquire 的可借判定一致（available 或 lease 過期），故能反映 worker 該不該補。
+        """
+        now = int(time.time())
+        with self._qa_engine.connect() as conn:
+            rows = conn.execute(text(
+                "SELECT role, "
+                "SUM(CASE WHEN state<>'disabled' AND (state='available' OR lease_expires_at < :now) "
+                "         THEN 1 ELSE 0 END) AS avail "
+                "FROM qa_accounts WHERE db_name=:db GROUP BY role"),
+                {"db": self.db, "now": now}).all()
+        return {r.role: int(r.avail or 0) for r in rows}
+
+    def reclaim_expired_leases(self) -> int:
+        """把租約已過期但 state 仍卡 'leased' 的帳號改回 available。回收筆數。
+
+        acquire 雖把過期租約視為可借，但 state 欄沒回 available，看板/統計會低估可用數；
+        這裡顯式回收，讓「可用數」如實反映、也讓 worker 的補池判定不被殘留租約誤導。
+        """
+        now = int(time.time())
+        with self._qa_engine.begin() as conn:
+            res = conn.execute(text(
+                "UPDATE qa_accounts SET state='available', lease_owner=NULL, lease_expires_at=0 "
+                "WHERE db_name=:db AND state='leased' AND lease_expires_at < :now"),
+                {"db": self.db, "now": now})
+            return res.rowcount
+
+    def top_up(self, *, min_available: int = 3, heal: bool = True) -> dict[str, Any]:
+        """動態補池：先回收過期租約；若仍有角色可配發數 < min_available 則跑 provision()。
+
+        provision() 會解停權 / 上架 audit role + sync_caps，把卡住的種子帳號修回可配發。
+        因池是固定 audit 種子帳號（不註冊新帳號），「補一批」= 把流失的種子救回 available。
+        回傳摘要供 worker 記錄；無角色不足時不連工作庫（provisioned=None）。
+        """
+        reclaimed = self.reclaim_expired_leases()
+        before = self.available_count()
+        # 每角色有效低標 = min(min_available, 種子容量)：容量小的角色（employer 只 1 個）
+        # 達到容量即視為滿，不再 provision，避免「永遠 < 低標」的無限補池空轉。
+        targets = {r: min(min_available, SEED_CAPACITY.get(r, min_available)) for r in ("labor", "employer")}
+        low = {r: before.get(r, 0) for r in ("labor", "employer") if before.get(r, 0) < targets[r]}
+        result: dict[str, Any] = {
+            "reclaimed": reclaimed, "before": before,
+            "min_available": min_available, "targets": targets, "low": low, "provisioned": None,
+        }
+        if low:
+            result["provisioned"] = self.provision(heal=heal)
+            result["after"] = self.available_count()
+        return result
 
     def list_all(self) -> list[dict[str, Any]]:
         with self._qa_engine.connect() as conn:
             return [dict(r._mapping) for r in conn.execute(text(
-                "SELECT account_id, role, caps, state, note FROM qa_accounts ORDER BY role, account_id")).all()]
+                "SELECT account_id, role, caps, state, note FROM qa_accounts "
+                "WHERE db_name=:db ORDER BY role, account_id"), {"db": self.db}).all()]
+
+    @staticmethod
+    def _norm_caps(c) -> list[str]:
+        return json.loads(c) if isinstance(c, str) else (c or [])
+
+    def list_pool(self) -> list[dict[str, Any]]:
+        """看板帳號池管理頁用：完整欄位（含 user_type/phone/shop/租約/最近使用）。"""
+        now = int(time.time())
+        with self._qa_engine.connect() as conn:
+            rows = conn.execute(text(
+                "SELECT account_id, role, user_type, phone, username, shop_id, caps, state, "
+                "note, lease_owner, lease_expires_at, last_used_at "
+                "FROM qa_accounts WHERE db_name=:db ORDER BY role, account_id"),
+                {"db": self.db}).all()
+        out = []
+        for r in rows:
+            m = dict(r._mapping)
+            m["caps"] = self._norm_caps(m.get("caps"))
+            # 租約是否仍有效（leased 且未過期）——供前端標示「使用中」
+            m["leased_active"] = bool(m.get("lease_owner")) and int(m.get("lease_expires_at") or 0) > now
+            out.append(m)
+        return out
+
+    def get(self, account_id: int, role: str) -> dict[str, Any] | None:
+        with self._qa_engine.connect() as conn:
+            r = conn.execute(text(
+                "SELECT account_id, role, user_type, phone, username, shop_id, caps, state "
+                "FROM qa_accounts WHERE db_name=:db AND account_id=:a AND role=:r"),
+                {"db": self.db, "a": int(account_id), "r": role}).first()
+        if not r:
+            return None
+        m = dict(r._mapping)
+        m["caps"] = self._norm_caps(m.get("caps"))
+        return m
+
+    def set_state(self, account_id: int, role: str, state: str) -> int:
+        """啟用/停用帳號（available / disabled）；disabled 者 acquire 不會配發。回更新列數。"""
+        if state not in ("available", "disabled"):
+            raise ValueError("state 只能 available / disabled")
+        with self._qa_engine.begin() as conn:
+            res = conn.execute(text(
+                "UPDATE qa_accounts SET state=:s WHERE db_name=:db AND account_id=:a AND role=:r"),
+                {"s": state, "db": self.db, "a": int(account_id), "r": role})
+            return res.rowcount
+
+    # ── 純 API 自助建帳號入池（不連工作庫；09 手機號自動註冊 + 補資料）──────────────
+    # 動機：框架無讀工作庫權限時，靠 API 自己造帳號。dev/測試環境註冊回應會帶驗證碼(code)，
+    # 故全程 API 即可：產 09 手機號 → register → register/confirm(md5 碼) → 補資料 → 讀 profile
+    # 取真實 id 與狀態 → upsert qa_accounts。純 API 達不到 verified/audit_role(需審核/工作庫)，
+    # 故只標基本 caps；那類用例仍用既有 audit 種子。
+    @staticmethod
+    def _gen_phone() -> str:
+        """產 09 開頭的 10 位測試手機號（09 + 8 位數字）。"""
+        return "09" + "".join(random.choice("0123456789") for _ in range(8))
+
+    def _register_and_login(self, c: WorkyClient, base: str, attempts: int = 6) -> str:
+        """產號→register→confirm→把 token 灌進 client，回成功的手機號。撞號/失敗自動換號重試。"""
+        last = "未知錯誤"
+        for _ in range(attempts):
+            phone = self._gen_phone()
+            rd = c.post(f"{base}/register", body={"phone": phone}).json()
+            code = (rd.get("data") or {}).get("code")
+            if not rd.get("success") or not code:
+                last = rd.get("message") or "register 未回 code（撞號或非測試環境）"
+                continue
+            cf = c.post(f"{base}/register/confirm",
+                        body={"phone": phone, "password": md5(str(code))}).json()
+            d = cf.get("data") or {}
+            tok = d.get("accessToken") or d.get("access_token")
+            if not cf.get("success") or not tok:
+                last = cf.get("message") or "confirm 失敗 / 無 accessToken"
+                continue
+            c.set_access_token(token=tok, expired_at=d.get("accessTokenExpiredAt", 0),
+                               refresh_token=d.get("refreshToken", ""),
+                               refresh_expired_at=d.get("refreshTokenExpiredAt", 0))
+            return phone
+        raise RuntimeError(f"註冊失敗（試 {attempts} 次）：{last}")
+
+    def _complete_labor_demographics(self, c: WorkyClient) -> None:
+        """補 labor 強制輪廓資料（性別/出生年/居住地）；縣市/區域取自 /labor/options（代碼環境相關）。"""
+        opt = (c.get("/labor/options").json().get("data") or {})
+        cds = opt.get("city_districts") or []
+        if not cds or not (cds[0].get("districts")):
+            raise RuntimeError("取不到縣市/區域選項，無法補輪廓資料")
+        city = cds[0]
+        dist = city["districts"][0]
+        r = c.post("/labor/demographics/create", body={
+            "gender": random.choice(["male", "female"]),
+            "birth_year": random.randint(1985, 2002),
+            "city": city["id"], "district": dist["id"],
+        }).json()
+        if not r.get("success"):
+            raise RuntimeError(f"demographics 失敗：{r.get('message')}")
+
+    @staticmethod
+    def _profile(c: WorkyClient, base: str) -> dict:
+        """讀 /labor|/employer/profile，回 data（含真實 id / status / valid_status）。"""
+        r = c.get(f"{base}/profile").json()
+        d = r.get("data") if isinstance(r.get("data"), dict) else None
+        if not r.get("success") or not d or not d.get("id"):
+            raise RuntimeError(f"profile 查詢失敗：{r.get('message')}")
+        return d
+
+    @staticmethod
+    def _caps_from_profile(role: str, prof: dict) -> list[str]:
+        """由 profile 推 caps（只標純 API 能確認的基本能力）。status==10 為已啟用(active)。"""
+        caps: list[str] = []
+        if prof.get("status") == 10:
+            caps.append("active")
+        if role == "labor":
+            caps.append("clean")             # 新號無違規記點
+            caps.append("profile_complete")  # 已補過 demographics 才到這步
+            if prof.get("valid_status") == 1:
+                caps.append("verified")      # 一般新號為 0(未認證)，此處保險判斷
+        return caps
+
+    def register_via_api(self, role: str, n: int = 1) -> list[dict[str, Any]]:
+        """純 API 自助建 n 個 role 帳號入池。逐筆隔離，單筆失敗不中斷其餘。
+
+        回 [{role, ok, phone?, account_id?, caps?, error?}, …]。
+        """
+        if role not in ("labor", "employer"):
+            raise ValueError("role 只能 labor / employer")
+        user_type = 2 if role == "labor" else 1
+        base = "/labor" if role == "labor" else "/employer"
+        out: list[dict[str, Any]] = []
+        for _ in range(max(1, n)):
+            res: dict[str, Any] = {"role": role, "ok": False}
+            try:
+                c = WorkyClient(self.s, user_type=user_type)
+                phone = self._register_and_login(c, base)
+                res["phone"] = phone
+                shop_id = None
+                note = "api"
+                if role == "labor":
+                    self._complete_labor_demographics(c)
+                else:
+                    # employer 預設建一個店鋪並提交審核（純 API）；失敗不影響帳號入池
+                    shop_id, shop_note = self._provision_employer_shop(c, phone)
+                    res["shop_id"] = shop_id
+                    res["shop"] = shop_note
+                    note = f"api;{shop_note}"
+                prof = self._profile(c, base)
+                acc_id = int(prof["id"])
+                caps = self._caps_from_profile(role, prof)
+                self._upsert_api_account(account_id=acc_id, role=role, user_type=user_type,
+                                         phone=phone, username=prof.get("username"),
+                                         shop_id=shop_id, caps=caps, note=note)
+                res.update(ok=True, account_id=acc_id, caps=caps)
+            except Exception as e:  # noqa: BLE001 — 單筆失敗收集後續顯示，不打斷整批
+                res["error"] = f"{type(e).__name__}: {e}"
+            out.append(res)
+        return out
+
+    @staticmethod
+    def _gen_tax_id() -> str:
+        """產一個通過檢查碼的台灣統一編號（8 位；2023 新制除數 5，含第 7 位為 7 的特例）。"""
+        w = [1, 2, 1, 2, 1, 2, 4, 1]
+        while True:
+            d = [random.randint(0, 9) for _ in range(8)]
+            sm = sum((d[i] * w[i]) // 10 + (d[i] * w[i]) % 10 for i in range(8))
+            if sm % 5 == 0 or (d[6] == 7 and (sm + 1) % 5 == 0):
+                return "".join(map(str, d))
+
+    def _provision_employer_shop(self, c: WorkyClient, phone: str) -> tuple[int | None, str]:
+        """employer 預設建店鋪 + 送審（純 API）。回 (shop_id, note)；任一步失敗回 (None, 失敗說明)。
+
+        步驟：上傳 logo → /employer/shop/create → 上傳審核圖 → 產統編 → /employer/shop/validation/request
+        (is_draft=false 即送審)。verified_shop 仍需後台核准，本步只到「已送審」。
+        """
+        try:
+            opt = c.get("/employer/options").json().get("data") or {}
+            cds = opt.get("city_districts") or []
+            if not cds or not cds[0].get("districts"):
+                return None, "shop_failed:無縣市/區域選項"
+            city = cds[0]
+            dist = city["districts"][0]
+            jt = (opt.get("job_types") or [{}])[0]
+            suffix = phone[-4:]
+            logo = self._upload_image(c, "shop_company_logo_image")
+            sc = c.post("/employer/shop/create", body={
+                "name": f"QA測試店鋪{suffix}", "city": city["id"], "district": dist["id"],
+                "address": "測試路1號", "job_type_level1": jt.get("id"),
+                "email": f"qa{phone[-6:]}@worky.local", "mobile_phone": phone,
+                "company_logo": logo,
+            }).json()
+            if not sc.get("success"):
+                return None, f"shop_failed:{sc.get('message')}"
+            shop_id = (sc.get("data") or {}).get("shop_id") or sc.get("shopId")
+            vpic = self._upload_image(c, "shop_verify_image")
+            sub = c.post("/employer/shop/validation/request", body={
+                "shop_id": shop_id, "verify_name": f"QA測試店鋪{suffix}",
+                "verify_city": city["id"], "verify_district": dist["id"], "verify_address": "測試路1號",
+                "tax_id_number": self._gen_tax_id(), "id_number": "", "validation_type": 1,
+                "is_draft": False, "verify_pic_1": vpic,
+            }).json()
+            if not sub.get("success"):
+                return shop_id, f"shop_submit_failed:{sub.get('message')}"
+            return shop_id, "shop_submitted"   # 已送審，待後台核准才得 verified_shop
+        except Exception as e:  # noqa: BLE001
+            return None, f"shop_error:{type(e).__name__}"
+
+    @staticmethod
+    def _upload_image(c: WorkyClient, file_type: str) -> str:
+        """上傳一張佔位圖，回網址；失敗則拋。"""
+        r = c.upload_file(file_type, _DUMMY_PNG).json()
+        uf = (r.get("data") or {}).get("uploadedFiles")
+        if not r.get("success") or not isinstance(uf, list) or not uf:
+            raise RuntimeError(f"上傳 {file_type} 失敗：{r.get('message')}")
+        return uf[0]
+
+    def _upsert_api_account(self, *, account_id: int, role: str, user_type: int, phone: str,
+                            username: str | None, shop_id: int | None, caps: list[str],
+                            note: str = "api") -> None:
+        """把 API 建出的帳號 upsert 進池；note 以 'api' 開頭與 audit 種子區分。"""
+        now = int(time.time())
+        with self._qa_engine.begin() as conn:
+            conn.execute(text("""
+                INSERT INTO qa_accounts
+                  (db_name, account_id, role, user_type, phone, username, shop_id, caps, state, note, synced_at)
+                VALUES (:db, :account_id, :role, :user_type, :phone, :username, :shop_id, :caps, 'available', :note, :now)
+                ON DUPLICATE KEY UPDATE
+                  user_type=VALUES(user_type), phone=VALUES(phone), username=VALUES(username),
+                  shop_id=VALUES(shop_id), caps=VALUES(caps), note=VALUES(note), synced_at=VALUES(synced_at)
+            """), {"db": self.db, "account_id": account_id, "role": role, "user_type": user_type,
+                   "phone": phone, "username": username, "shop_id": shop_id,
+                   "caps": json.dumps(caps), "note": note, "now": now})
 
     # ── 供給 + 同步（特權、偶發；連工作庫）──────────────────────────────────────
     def provision(self, *, heal: bool = True) -> dict[str, Any]:
@@ -212,6 +534,100 @@ class AccountPool:
             weng.dispose()
         return {"healed": healed, "synced": synced}
 
+    # ── 能力探測（單一真實來源：caps 一律由工作庫實況推出，供 sync_caps 與 sync_account_caps 共用）──
+    @staticmethod
+    def _probe_labor_caps(wc, uid: int) -> tuple[list[str], str | None] | None:
+        """探測 labor 工作庫能力 → (caps, note)；帳號不存在回 None。"""
+        now = int(time.time())
+        r = wc.execute(text(
+            "SELECT valid_status, is_profile_complete FROM s_labors WHERE id=:i"), {"i": uid}).first()
+        if not r:
+            return None
+        published = wc.execute(text(
+            "SELECT 1 FROM s_labor_roles WHERE labor_id=:i AND role_id=10 AND published=1"
+        ), {"i": uid}).first() is not None
+        suspended = wc.execute(text(
+            "SELECT 1 FROM s_labor_suspension WHERE labor_id=:i "
+            "AND suspend_start_at<=:n AND suspend_end_at>:n LIMIT 1"
+        ), {"i": uid, "n": now}).first() is not None
+        penalty = wc.execute(text(
+            "SELECT COUNT(*) FROM s_labor_penalty_point_logs WHERE labor_id=:i"
+        ), {"i": uid}).scalar() or 0
+        caps = []
+        if r.valid_status == 1: caps.append("verified")     # 後台審核通過 → valid_status=1
+        if r.is_profile_complete == 1: caps.append("profile_complete")
+        if published: caps.append("audit_role")
+        if not suspended: caps.append("active")
+        # clean = 無違規點數歷史。有違規的帳號(殘留停權/扣點)在 apply 會以泛用 10001 失敗，
+        # DB 欄位看不出來，故獨立成一個能力讓申請者用例避開。
+        if penalty == 0: caps.append("clean")
+        notes = []
+        if suspended: notes.append("suspended")
+        if penalty: notes.append(f"penalty_logs={penalty}")
+        return caps, (";".join(notes) or None)
+
+    @staticmethod
+    def _probe_employer_caps(wc, uid: int, shop_id: int | None) -> tuple[list[str], str | None] | None:
+        """探測 employer 工作庫能力 → (caps, note)；帳號不存在回 None。
+
+        verified_shop＝該店鋪為公司型(validation_type=2)；shop_approved＝店鋪已通過審核(validation_status=3)。
+        """
+        e = wc.execute(text("SELECT id FROM s_employers WHERE id=:i"), {"i": uid}).first()
+        if not e:
+            return None
+        caps = ["active"]
+        if shop_id:
+            shop = wc.execute(text(
+                "SELECT validation_type, validation_status FROM s_shops WHERE id=:s"),
+                {"s": shop_id}).first()
+            if shop:
+                if shop.validation_type == 2: caps.append("verified_shop")
+                if shop.validation_status == 3: caps.append("shop_approved")  # 後台審核通過
+        return caps, None
+
+    def sync_account_caps(self, account_id: int, role: str) -> dict | None:
+        """重探單一帳號的工作庫狀態重算 caps，寫回 qa_accounts。
+
+        供後台審核成功後即時更新（caps 真相＝工作庫實況，與 sync_caps 同源）。
+        僅當該帳號在「當前庫」的池中才更新；不在池中（多數被審核對象是隨機測試資料）回 None。
+        """
+        existing = self.get(account_id, role)
+        if existing is None:
+            return None
+        weng = self._worky_engine()
+        try:
+            with weng.connect() as wc:
+                probed = (self._probe_labor_caps(wc, int(account_id)) if role == "labor"
+                          else self._probe_employer_caps(wc, int(account_id), existing.get("shop_id")))
+        finally:
+            weng.dispose()
+        if probed is None:
+            caps, note = (existing.get("caps") or []), "missing_in_worky"
+        else:
+            caps, note = probed
+        now = int(time.time())
+        with self._qa_engine.begin() as conn:
+            conn.execute(text(
+                "UPDATE qa_accounts SET caps=:caps, note=:note, synced_at=:now "
+                "WHERE db_name=:db AND account_id=:a AND role=:r"),
+                {"caps": json.dumps(caps), "note": note, "now": now,
+                 "db": self.db, "a": int(account_id), "r": role})
+        return {"account_id": int(account_id), "role": role, "caps": caps, "note": note}
+
+    def resync_shop_owner(self, shop_id: int) -> dict | None:
+        """店鋪審核後用：找當前庫池中記錄該 shop_id 的商家，重探其 caps（更新 shop_approved 等）。
+
+        多數被審核店鋪不在池中 → 回 None（no-op）。
+        """
+        with self._qa_engine.connect() as conn:
+            r = conn.execute(text(
+                "SELECT account_id FROM qa_accounts "
+                "WHERE db_name=:db AND role='employer' AND shop_id=:s LIMIT 1"),
+                {"db": self.db, "s": int(shop_id)}).first()
+        if not r:
+            return None
+        return self.sync_account_caps(r.account_id, "employer")
+
     def sync_caps(self, weng=None) -> int:
         """探測各種子帳號能力，upsert 進 qa_accounts（保留既有租約）。回傳同步筆數。"""
         own_engine = weng is None
@@ -222,60 +638,34 @@ class AccountPool:
             with weng.connect() as wc:
                 # ── labor ──
                 for uid in SEED_LABOR_IDS:
-                    r = wc.execute(text(
-                        "SELECT id, phone, username, valid_status, is_profile_complete "
-                        "FROM s_labors WHERE id=:i"), {"i": uid}).first()
-                    if not r:
+                    info = wc.execute(text(
+                        "SELECT phone, username FROM s_labors WHERE id=:i"), {"i": uid}).first()
+                    if not info:
                         continue
-                    published = wc.execute(text(
-                        "SELECT 1 FROM s_labor_roles WHERE labor_id=:i AND role_id=10 AND published=1"
-                    ), {"i": uid}).first() is not None
-                    suspended = wc.execute(text(
-                        "SELECT 1 FROM s_labor_suspension WHERE labor_id=:i "
-                        "AND suspend_start_at<=:n AND suspend_end_at>:n LIMIT 1"
-                    ), {"i": uid, "n": now}).first() is not None
-                    penalty = wc.execute(text(
-                        "SELECT COUNT(*) FROM s_labor_penalty_point_logs WHERE labor_id=:i"
-                    ), {"i": uid}).scalar() or 0
-                    caps = []
-                    if r.valid_status == 1: caps.append("verified")
-                    if r.is_profile_complete == 1: caps.append("profile_complete")
-                    if published: caps.append("audit_role")
-                    if not suspended: caps.append("active")
-                    # clean = 無違規點數歷史。有違規的帳號(殘留停權/扣點)在 apply 會以泛用
-                    # 10001 失敗，DB 欄位看不出來，故獨立成一個能力讓申請者用例避開。
-                    if penalty == 0: caps.append("clean")
-                    notes = []
-                    if suspended: notes.append("suspended")
-                    if penalty: notes.append(f"penalty_logs={penalty}")
+                    caps, note = self._probe_labor_caps(wc, uid)
                     seeds.append(PooledAccount(
-                        account_id=uid, role="labor", user_type=2, phone=r.phone or "",
-                        username=r.username, shop_id=None, caps=caps,
-                        note=";".join(notes) or None))
+                        account_id=uid, role="labor", user_type=2, phone=info.phone or "",
+                        username=info.username, shop_id=None, caps=caps, note=note))
                 # ── employer（商家）──
                 for emp in SEED_EMPLOYERS:
                     uid = emp["account_id"]
-                    e = wc.execute(text("SELECT id FROM s_employers WHERE id=:i"), {"i": uid}).first()
-                    caps = ["active"]
-                    shop = wc.execute(text(
-                        "SELECT validation_type FROM s_shops WHERE id=:s"), {"s": emp["shop_id"]}).first()
-                    if shop and shop.validation_type == 2:
-                        caps.append("verified_shop")
+                    probed = self._probe_employer_caps(wc, uid, emp["shop_id"])
+                    caps, note = probed if probed else (["active"], "missing_in_worky")
                     seeds.append(PooledAccount(
                         account_id=uid, role="employer", user_type=1, phone=emp["phone"],
-                        username=emp["username"], shop_id=emp["shop_id"], caps=caps,
-                        note=None if e else "missing_in_worky"))
+                        username=emp["username"], shop_id=emp["shop_id"], caps=caps, note=note))
 
             with self._qa_engine.begin() as qc:
                 for a in seeds:
                     qc.execute(text("""
                         INSERT INTO qa_accounts
-                          (account_id, role, user_type, phone, username, shop_id, caps, state, note, synced_at)
-                        VALUES (:account_id, :role, :user_type, :phone, :username, :shop_id, :caps, 'available', :note, :now)
+                          (db_name, account_id, role, user_type, phone, username, shop_id, caps, state, note, synced_at)
+                        VALUES (:db, :account_id, :role, :user_type, :phone, :username, :shop_id, :caps, 'available', :note, :now)
                         ON DUPLICATE KEY UPDATE
                           user_type=VALUES(user_type), phone=VALUES(phone), username=VALUES(username),
                           shop_id=VALUES(shop_id), caps=VALUES(caps), note=VALUES(note), synced_at=VALUES(synced_at)
                     """), {
+                        "db": self.db,
                         "account_id": a.account_id, "role": a.role, "user_type": a.user_type,
                         "phone": a.phone, "username": a.username, "shop_id": a.shop_id,
                         "caps": json.dumps(a.caps), "note": a.note, "now": now,
@@ -291,13 +681,18 @@ def main(argv: list[str] | None = None) -> int:
 
         python -m worky_regression.qa_accounts provision   # 校正硬狀態 + 同步能力（特權）
         python -m worky_regression.qa_accounts sync         # 只同步能力，不校正
+        python -m worky_regression.qa_accounts topup        # 回收過期租約 + 可用不足才 provision
+        python -m worky_regression.qa_accounts register --role labor --n 3   # 純 API 自助建帳號入池
         python -m worky_regression.qa_accounts list         # 檢視池現況
     """
     import argparse
 
     ap = argparse.ArgumentParser(prog="worky-qa-accounts")
-    ap.add_argument("cmd", choices=["provision", "sync", "list"], default="list", nargs="?")
+    ap.add_argument("cmd", choices=["provision", "sync", "topup", "register", "list"], default="list", nargs="?")
     ap.add_argument("--no-heal", action="store_true", help="provision 時不校正硬狀態")
+    ap.add_argument("--min-available", type=int, default=3, help="topup 時每角色可用數低標（預設 3）")
+    ap.add_argument("--role", choices=["labor", "employer"], default="labor", help="register 的角色")
+    ap.add_argument("--n", type=int, default=1, help="register 要建立的帳號數")
     args = ap.parse_args(argv)
 
     pool = AccountPool(Settings.from_env())
@@ -305,6 +700,17 @@ def main(argv: list[str] | None = None) -> int:
         print(pool.provision(heal=not args.no_heal))
     elif args.cmd == "sync":
         print({"synced": pool.sync_caps()})
+    elif args.cmd == "topup":
+        print(pool.top_up(min_available=args.min_available, heal=not args.no_heal))
+    elif args.cmd == "register":
+        results = pool.register_via_api(args.role, args.n)
+        ok = sum(1 for r in results if r.get("ok"))
+        print(f"[register] {args.role}：{ok}/{len(results)} 成功")
+        for r in results:
+            if r.get("ok"):
+                print(f"  ✓ #{r['account_id']} {r['phone']} caps={r['caps']}")
+            else:
+                print(f"  ✗ {r.get('phone', '?')} 失敗：{r.get('error')}")
     for a in pool.list_all():
         print(f"  {a['role']:8} {a['account_id']:>5}  {a['state']:9} {a['caps']}  {a['note'] or ''}")
     return 0
