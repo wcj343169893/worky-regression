@@ -15,6 +15,11 @@ class Settings:
     # 預設由 api_base 的 host 推導；可用 WORKY_ACTIVITY_API_BASE 覆寫。
     activity_api_base: str
     api_secret: str
+    # 商家端可走獨立 base/secret（如 /qa-v1：QA 模式帶 shop_id 鎖店）；打工端仍走主 base
+    # （qa-v1 配 SOURCE_WEB，labor 的 APP 限定端點會被來源白名單擋掉，故分流）。
+    # 未設則沿用 api_base / api_secret。注意 /qa-v1 模組有專屬 apiSecret，base 與 secret 要成對。
+    employer_api_base: str
+    employer_api_secret: str
     audit_sms_code: str
 
     db_host: str
@@ -65,6 +70,9 @@ class Settings:
             api_base=api_base,
             activity_api_base=os.environ.get("WORKY_ACTIVITY_API_BASE", default_activity).rstrip("/"),
             api_secret=req("WORKY_API_SECRET"),
+            employer_api_base=os.environ.get("WORKY_EMPLOYER_API_BASE", api_base).rstrip("/"),
+            employer_api_secret=os.environ.get("WORKY_EMPLOYER_API_SECRET",
+                                               os.environ.get("WORKY_API_SECRET", "")),
             audit_sms_code=req("WORKY_AUDIT_SMS_CODE"),
             db_host=req("WORKY_DB_HOST"),
             db_port=int(os.environ.get("WORKY_DB_PORT", "3306")),
@@ -82,14 +90,13 @@ class Settings:
             deepseek_model=os.environ.get("DEEPSEEK_MODEL", "deepseek-chat"),
         )
 
-    @property
-    def qa_mode(self) -> bool:
-        """主 API 是否走 /qa-v1 等 QA 專用前綴。
+    def api_base_for(self, user_type: int) -> str:
+        """該 user_type 的主 API base：1=employer 可分流（如 /qa-v1），2=labor 走 api_base。"""
+        return self.employer_api_base if user_type == 1 else self.api_base
 
-        QA 模式下被測端允許 employer 請求帶 shop_id 鎖定店鋪（覆寫後端的
-        lastSelectedShopId，查詢不受切換店鋪影響）；client 據此自動補 shop_id。
-        """
-        return "qa-v1" in self.api_base
+    def api_secret_for(self, user_type: int) -> str:
+        """與 api_base_for 成對的 apiSecret（/qa-v1 模組有專屬 secret）。"""
+        return self.employer_api_secret if user_type == 1 else self.api_secret
 
     def for_system(self, system: str) -> "Settings":
         """回傳該系統要連的 DB 設定：contract 走 contract_db_name（若有設），其餘沿用。"""

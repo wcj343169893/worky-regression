@@ -33,6 +33,11 @@ class WorkyClient:
     def __init__(self, settings: Settings, user_type: int):
         self.settings = settings
         self.user_type = user_type
+        # 主 API base/secret 按 user_type 分流（employer 可走 /qa-v1，labor 走 /v1）；
+        # qa_mode＝本 client 的主 base 是 QA 專用前綴（決定是否自動補 shop_id）。
+        self.api_base = settings.api_base_for(user_type)
+        self.api_secret = settings.api_secret_for(user_type)
+        self.qa_mode = "qa-v1" in self.api_base
         self.access_token: str = ""
         self.refresh_token: str = ""
         self.access_token_expired_at: int = 0
@@ -58,18 +63,22 @@ class WorkyClient:
         # ensure_ascii=False 與 PHP json_encode 預設一致；separators 去除多餘空白
         return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
 
-    def _signature(self, query_string: str, body_str: str, common_vars: str) -> str:
-        return md5(query_string + body_str + common_vars + self.access_token + self.settings.api_secret)
+    def _signature(self, query_string: str, body_str: str, common_vars: str,
+                   secret: str | None = None) -> str:
+        return md5(query_string + body_str + common_vars + self.access_token
+                   + (secret if secret is not None else self.api_secret))
 
     def request(self, method: str, path: str, *, params: dict | None = None,
                 body: dict | None = None, base: str | None = None) -> requests.Response:
-        # base 可覆寫 API base（如營運活動走 /activity；不傳則用主 API /v1）
-        url = (base or self.settings.api_base) + path
+        # base 可覆寫 API base（如營運活動走 /activity；不傳則用本 client 的主 base）。
+        # 覆寫 base 的請求（activity 模組）簽名用預設 secret，不用 employer 分流的 qa-v1 secret。
+        url = (base or self.api_base) + path
+        secret = self.settings.api_secret if base is not None else self.api_secret
 
         # qa-v1 鎖店：employer 已登入、打主 API 且呼叫端沒給 shop_id 時自動補
         # （顯式給的 shop_id 不覆寫——負向用例要能帶錯誤店鋪；activity 等覆寫 base 的請求不補）
         if (self.shop_id and self.user_type == 1 and base is None
-                and self.access_token and self.settings.qa_mode):
+                and self.access_token and self.qa_mode):
             if method.upper() == "GET":
                 params = {"shop_id": self.shop_id, **(params or {})}
             else:
@@ -90,7 +99,7 @@ class WorkyClient:
             body_str = ""
 
         common_vars = self._common_vars_json()
-        sig = self._signature(query_string, body_str, common_vars)
+        sig = self._signature(query_string, body_str, common_vars, secret=secret)
 
         headers = {
             "Content-Type": "application/json",
@@ -126,12 +135,12 @@ class WorkyClient:
         common_vars = self._common_vars_json()
         # ksort：key 升序後 urlencode（http_build_query 等價），multipart 無 JSON body
         sig_str = urlencode(dict(sorted(fields.items())))
-        sig = md5(sig_str + common_vars + self.access_token + self.settings.api_secret)
+        sig = md5(sig_str + common_vars + self.access_token + self.api_secret)
         headers = {"X-Worky-Common-Variables": common_vars, "X-Worky-Signature": sig}
         if self.access_token:
             headers["Authorization"] = f"Bearer {self.access_token}"
         return self.session.post(
-            self.settings.api_base + "/file-upload",
+            self.api_base + "/file-upload",
             data=fields, files={"files": (filename, content, content_type)},
             headers=headers, timeout=30)
 

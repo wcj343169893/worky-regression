@@ -195,11 +195,15 @@ class AccountPool:
         ) for r in chosen]
 
     # ── 本地 token 快取（配發時「有效就用、到期才刷」）─────────────────────────
+    def _token_base(self, role: str) -> str:
+        """該角色 token 對應的 API base（employer 可分流 /qa-v1，其餘走主 base）。"""
+        return self.s.api_base_for(1 if role == "employer" else 2)
+
     def load_token(self, account_id: int, role: str) -> dict[str, Any] | None:
         """讀帳號池內保存的 token（不檢查是否過期，由呼叫端的 client 自行判斷）。
 
         token 與簽發時的 API base 綁定（/v1 與 /qa-v1 模組 requestSource 不同，token 互不
-        通用，混用會 10003）：存的 base 與當前 .env 不符（含舊資料的 NULL）→ 視為無快取。
+        通用，混用會 10003）：存的 base 與該角色當前 base 不符（含舊資料的 NULL）→ 視為無快取。
         """
         with self._qa_engine.connect() as conn:
             r = conn.execute(text(
@@ -210,7 +214,7 @@ class AccountPool:
         if not r:
             return None
         m = dict(r._mapping)
-        if m.pop("token_api_base", None) != self.s.api_base:
+        if m.pop("token_api_base", None) != self._token_base(role):
             return None
         return m
 
@@ -228,7 +232,7 @@ class AccountPool:
             """), {
                 "at": access_token, "rt": refresh_token,
                 "aexp": int(access_expired_at or 0), "rexp": int(refresh_expired_at or 0),
-                "now": now, "base": self.s.api_base,
+                "now": now, "base": self._token_base(role),
                 "db": self.db, "a": int(account_id), "r": role,
             })
 
