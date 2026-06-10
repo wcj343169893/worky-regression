@@ -1,7 +1,7 @@
 "use strict";
 // 測試用例（工作 / 任務）：列用例 + 執行 + AI 用例分解。
 
-import { $, api, apiPost, esc, fmtTs, resBadge, toast, PAGE, state } from "./util.js";
+import { $, api, apiPost, esc, fmtTs, resBadge, toast, PAGE, state, urlPager } from "./util.js";
 import { setupPager, openDrawer, openModal, closeModal } from "./widgets.js";
 
 export const CASES = {
@@ -129,6 +129,9 @@ export async function renderCases(key, tabKey, drillPath = []) {
   if (s.parentId !== newParent) s.page = 0;
   s.stack = drillPath.map((id) => ({ id, label: id }));
   s.parentId = newParent;
+  // URL 帶 ?page=N&limit=M（翻頁時寫入）→ 還原分頁狀態（刷新 / 分享連結停在同一頁）；
+  // 放在 tab / 下鑽歸零之後，確保「同頁刷新」時 URL 的 page 不被歸零蓋掉。
+  if (location.hash.includes("?")) { const up = urlPager(); s.page = up.page; s.limit = up.limit; }
   const cur = tabByKey(s.tab);
   // 內建 + 自訂 tab 依序渲染；自訂 tab 帶可移除的 ✕；末尾再接「＋新增」按鈕
   const tabsHtml = allTabs().map((t) =>
@@ -153,7 +156,8 @@ export async function renderCases(key, tabKey, drillPath = []) {
       <div class="card cases-list">
         <div class="crumbs" id="crumbs"></div>
         <div class="panel-head"><h3>用例清單</h3>
-          <input type="search" id="q" placeholder="搜尋 名稱 / 描述…" value="${esc(s.q)}" /></div>
+          <input type="search" id="q" placeholder="搜尋 名稱 / 描述…" value="${esc(s.q)}" />
+          <button class="btn ghost danger" id="clear-all" title="清空所有測試用例與執行紀錄，重新測試（不影響帳號池 / 設定 / 標記）">🗑 清空全部</button></div>
         <div class="table-wrap"><table>
           <thead><tr><th>用例 ID / 描述</th><th>來源</th><th>建立時間</th><th class="num">步驟</th><th>任務流</th><th>最近結果</th><th class="act">操作</th></tr></thead>
           <tbody id="rows"></tbody>
@@ -177,6 +181,9 @@ export async function renderCases(key, tabKey, drillPath = []) {
     }, 300);
   };
   $("uc-go").onclick = () => doDecompose(key);
+  // 清空全部：二次確認後清掉所有用例與執行紀錄（重新測試）；不動帳號池 / 設定 / 標記。
+  const clearBtn = $("clear-all");
+  if (clearBtn) clearBtn.onclick = () => confirmClearAll(key);
   // 切 tab（內建或自訂）：整頁重渲染，套用該 tab 的 system / 查詢內容 / placeholder
   $("view").querySelectorAll(".dc-tab[data-tab]").forEach((b) =>
     b.onclick = () => selectTab(key, b.dataset.tab));
@@ -252,6 +259,34 @@ function openAddTabModal(key) {
   const ta = $("nt-desc"); if (ta) ta.focus();
 }
 
+// 「清空全部」確認彈窗：二次確認 → POST /api/cases/clear → 重渲染清單。
+// 只清執行類數據（用例 / 執行 / 步驟），不動帳號池、後台設定、頁面標記。
+function confirmClearAll(key) {
+  openModal(`<div class="add-tab">
+    <h3>🗑 清空所有測試用例數據</h3>
+    <p class="sub2">將清空<b>所有用例與執行紀錄</b>（含每步結果），看板序號歸零、重新測試。<br>
+      此操作<b>不可復原</b>，但<b>不影響</b>帳號池、後台設定與頁面標記；用例定義仍在 YAML，下次載入會自動重新註冊。</p>
+    <div class="add-tab-actions">
+      <button class="btn ghost" id="ca-cancel">取消</button>
+      <button class="btn danger" id="ca-ok">確定清空</button>
+    </div>
+  </div>`);
+  $("ca-cancel").onclick = closeModal;
+  const ok = $("ca-ok");
+  ok.onclick = async () => {
+    const old = ok.textContent; ok.disabled = true; ok.textContent = "清空中…";
+    try {
+      const r = await apiPost("/api/cases/clear", {});
+      closeModal();
+      toast(`已清空 ${r.total} 筆數據，可重新測試`);
+      renderCases(key, state[key] ? state[key].tab : "all");
+    } catch (e) {
+      toast("清空失敗：" + e.message);
+      ok.disabled = false; ok.textContent = old;
+    }
+  };
+}
+
 // ── 主任務/子任務下鑽：堆疊 + 麵包屑 ────────────────────────────────────────
 // 回到頂層：清空下鑽堆疊與當前父 id，並回到第一頁
 function resetToRoot(s) { s.stack = []; s.parentId = null; s.page = 0; }
@@ -305,7 +340,8 @@ function renderCrumbs(key) {
 async function loadCases(key) {
   stepCache = {};  // 列表重載（含重跑後）→ 清掉步驟詳情快取，確保 modal 拿到最新結果
   const cfg = CASES[key], s = state[key];
-  const params = new URLSearchParams({ q: s.q || "", limit: PAGE, offset: s.page * PAGE });
+  const lim = s.limit || PAGE;
+  const params = new URLSearchParams({ q: s.q || "", limit: lim, offset: s.page * lim });
   if (s.system) params.set("system", s.system);  // 空 = 全部，不帶 system（後端支援 system=None）
   // 下鑽時帶當前層父 id；頂層帶 __root__（後端預設只回頂層用例）
   params.set("parent_id", s.parentId || "__root__");

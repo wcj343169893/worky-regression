@@ -263,6 +263,14 @@ class CaseStore:
         path, source, spec = found
         return self._run_spec(spec, source=source, file=path.name)
 
+    def clear_all(self, include_cases: bool = True) -> dict:
+        """清空所有測試用例執行數據（「重新測試」用）；不動帳號池 / 後台設定 / 頁面標記。
+
+        用例定義仍在 cases/*.yaml；清掉 qa_cases 後下次列出清單會自動重新註冊（seq 歸零）。
+        """
+        counts = self.qa.clear_runs(include_cases=include_cases)
+        return {"ok": True, "cleared": counts, "total": sum(counts.values())}
+
     def run_case_streaming(self, case_id: str, on_event) -> dict:
         """同 run_case，但逐步把執行事件回呼給 on_event（看板 SSE 用）。
 

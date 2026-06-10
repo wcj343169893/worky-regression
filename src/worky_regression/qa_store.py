@@ -113,6 +113,25 @@ class QAStore:
                     "observations": json.dumps(s.get("observations") or {}, ensure_ascii=False),
                 } for i, s in enumerate(steps)])
 
+    def clear_runs(self, *, include_cases: bool = True) -> dict[str, int]:
+        """清空所有執行類數據（「重新測試」用）：qa_run_steps + qa_runs；
+        include_cases=True（預設）連 qa_cases 一併清，顯示序號（seq）歸零重來。
+
+        刻意不動 qa_accounts（帳號池）/ qa_settings（後台帳密）/ qa_markups（頁面標記）。
+        用例定義仍在 cases/*.yaml，下次載入看板會 sync_cases 自動重新註冊。
+        用 TRUNCATE（順帶重置 AUTO_INCREMENT，序號從 1 起）；回傳各表清空前的列數。
+        """
+        # 子步驟 → 執行 → 用例 的順序清（無 FK 約束，順序僅為語意清楚）。
+        tables = ["qa_run_steps", "qa_runs"]
+        if include_cases:
+            tables.append("qa_cases")
+        counts: dict[str, int] = {}
+        with self._engine.begin() as conn:
+            for t in tables:
+                counts[t] = int(conn.execute(text(f"SELECT COUNT(*) FROM {t}")).scalar() or 0)
+                conn.execute(text(f"TRUNCATE TABLE {t}"))
+        return counts
+
     # ── 看板可編輯設定（qa_settings key-value）─────────────────────────────────
     def get_settings(self, keys: list[str] | None = None) -> dict[str, str]:
         """讀設定；keys 為 None 時回全部。`key` 為 MySQL 保留字，加反引號。"""

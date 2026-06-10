@@ -380,6 +380,11 @@ class Handler(BaseHTTPRequestHandler):
                     self._send_json({"error": "缺少 id"}, 400)
                 else:
                     self._send_json(_cases().run_case(cid))
+            elif path == "/api/cases/clear":
+                # 清空所有測試用例執行數據（runs/steps，預設連 cases 一併清以重置序號）；
+                # 不動帳號池 / 後台設定 / 頁面標記。用例定義仍在 YAML，下次載入自動重新註冊。
+                include_cases = bool((body or {}).get("include_cases", True))
+                self._send_json(_cases().clear_all(include_cases=include_cases))
             elif path == "/api/cases/copy":
                 # 以既有用例 spec 為範本快速再建一條新用例（新 id、新檔，不含執行歷史）
                 cid = (body or {}).get("id")

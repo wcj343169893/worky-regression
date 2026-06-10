@@ -292,6 +292,7 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
 .btn.mini{padding:3px 9px;font-size:12px;margin-right:5px}
 .btn.ok{border-color:var(--ok);color:var(--ok)} .btn.ok:hover{background:var(--ok);color:#fff;border-color:transparent}
 .btn.no{border-color:var(--danger);color:var(--danger)} .btn.no:hover{background:var(--danger);color:#fff;border-color:transparent}
+.btn.danger{border-color:var(--danger);color:var(--danger)} .btn.danger:hover{background:var(--danger);color:#fff;border-color:transparent}
 
 /* 詳情區塊（右欄內嵌）*/
 .sec{margin-bottom:20px}
