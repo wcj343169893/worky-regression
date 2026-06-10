@@ -44,6 +44,9 @@ class PooledAccount:
     shop_id: int | None
     caps: list[str]
     note: str | None = None
+    # 姓名只在拿得到解密值的時點寫（API 註冊讀 /profile）；gender 工作庫明文可同步探回。
+    display_name: str | None = None
+    gender: int | None = None
 
 
 # 已知測試帳號種子（id 與登入資料）。能力(caps)由 sync 探測，不寫死在這裡。
@@ -294,8 +297,8 @@ class AccountPool:
         now = int(time.time())
         with self._qa_engine.connect() as conn:
             rows = conn.execute(text(
-                "SELECT account_id, role, user_type, phone, username, shop_id, caps, state, "
-                "note, lease_owner, lease_expires_at, last_used_at "
+                "SELECT account_id, role, user_type, phone, username, display_name, gender, "
+                "shop_id, caps, state, note, lease_owner, lease_expires_at, last_used_at "
                 "FROM qa_accounts WHERE db_name=:db ORDER BY role, account_id"),
                 {"db": self.db}).all()
         out = []
@@ -310,7 +313,8 @@ class AccountPool:
     def get(self, account_id: int, role: str) -> dict[str, Any] | None:
         with self._qa_engine.connect() as conn:
             r = conn.execute(text(
-                "SELECT account_id, role, user_type, phone, username, shop_id, caps, state, note "
+                "SELECT account_id, role, user_type, phone, username, display_name, gender, "
+                "shop_id, caps, state, note "
                 "FROM qa_accounts WHERE db_name=:db AND account_id=:a AND role=:r"),
                 {"db": self.db, "a": int(account_id), "r": role}).first()
         if not r:
@@ -521,7 +525,9 @@ class AccountPool:
                 caps = self._caps_from_profile(role, prof)
                 self._upsert_api_account(account_id=acc_id, role=role, user_type=user_type,
                                          phone=phone, username=prof.get("username"),
-                                         shop_id=shop_id, caps=caps, note=note)
+                                         shop_id=shop_id, caps=caps, note=note,
+                                         display_name=prof.get("display_name"),
+                                         gender=prof.get("gender"))
                 res.update(ok=True, account_id=acc_id, caps=caps)
             except Exception as e:  # noqa: BLE001 — 單筆失敗收集後續顯示，不打斷整批
                 res["error"] = f"{type(e).__name__}: {e}"
@@ -592,19 +598,28 @@ class AccountPool:
 
     def _upsert_api_account(self, *, account_id: int, role: str, user_type: int, phone: str,
                             username: str | None, shop_id: int | None, caps: list[str],
-                            note: str = "api") -> None:
-        """把 API 建出的帳號 upsert 進池；note 以 'api' 開頭與 audit 種子區分。"""
+                            note: str = "api", display_name: str | None = None,
+                            gender: int | None = None) -> None:
+        """把 API 建出的帳號 upsert 進池；note 以 'api' 開頭與 audit 種子區分。
+
+        display_name/gender 來自 /profile（解密後明文）；COALESCE 保留既有值，沒拿到不抹掉。
+        """
         now = int(time.time())
         with self._qa_engine.begin() as conn:
             conn.execute(text("""
                 INSERT INTO qa_accounts
-                  (db_name, account_id, role, user_type, phone, username, shop_id, caps, state, note, synced_at)
-                VALUES (:db, :account_id, :role, :user_type, :phone, :username, :shop_id, :caps, 'available', :note, :now)
+                  (db_name, account_id, role, user_type, phone, username, display_name, gender,
+                   shop_id, caps, state, note, synced_at)
+                VALUES (:db, :account_id, :role, :user_type, :phone, :username, :display_name,
+                        :gender, :shop_id, :caps, 'available', :note, :now)
                 ON DUPLICATE KEY UPDATE
                   user_type=VALUES(user_type), phone=VALUES(phone), username=VALUES(username),
+                  display_name=COALESCE(VALUES(display_name), display_name),
+                  gender=COALESCE(VALUES(gender), gender),
                   shop_id=VALUES(shop_id), caps=VALUES(caps), note=VALUES(note), synced_at=VALUES(synced_at)
             """), {"db": self.db, "account_id": account_id, "role": role, "user_type": user_type,
-                   "phone": phone, "username": username, "shop_id": shop_id,
+                   "phone": phone, "username": username, "display_name": display_name,
+                   "gender": gender, "shop_id": shop_id,
                    "caps": json.dumps(caps), "note": note, "now": now})
 
     # ── 供給 + 同步（特權、偶發；連工作庫）──────────────────────────────────────
@@ -742,14 +757,16 @@ class AccountPool:
             with weng.connect() as wc:
                 # ── labor ──
                 for uid in SEED_LABOR_IDS:
+                    # gender 工作庫是明文可直接探回；display_name 加密讀不到，不在此同步
                     info = wc.execute(text(
-                        "SELECT phone, username FROM s_labors WHERE id=:i"), {"i": uid}).first()
+                        "SELECT phone, username, gender FROM s_labors WHERE id=:i"), {"i": uid}).first()
                     if not info:
                         continue
                     caps, note = self._probe_labor_caps(wc, uid)
                     seeds.append(PooledAccount(
                         account_id=uid, role="labor", user_type=2, phone=info.phone or "",
-                        username=info.username, shop_id=None, caps=caps, note=note))
+                        username=info.username, shop_id=None, caps=caps, note=note,
+                        gender=info.gender))
                 # ── employer（商家）──
                 for emp in SEED_EMPLOYERS:
                     uid = emp["account_id"]
@@ -766,8 +783,12 @@ class AccountPool:
                         "SELECT account_id, role, user_type, phone, username, shop_id FROM qa_accounts "
                         "WHERE db_name=:db AND note LIKE 'api%'"), {"db": self.db}).all()
                 for r in api_rows:
+                    gender = None
                     if r.role == "labor":
                         probed = self._probe_labor_caps(wc, int(r.account_id))
+                        g = wc.execute(text("SELECT gender FROM s_labors WHERE id=:i"),
+                                       {"i": int(r.account_id)}).first()
+                        gender = g.gender if g else None
                     else:
                         probed = self._probe_employer_caps(wc, int(r.account_id), r.shop_id)
                     if probed is None:
@@ -779,21 +800,23 @@ class AccountPool:
                     seeds.append(PooledAccount(
                         account_id=int(r.account_id), role=r.role, user_type=r.user_type,
                         phone=r.phone or "", username=r.username, shop_id=r.shop_id,
-                        caps=caps, note=note))
+                        caps=caps, note=note, gender=gender))
 
             with self._qa_engine.begin() as qc:
                 for a in seeds:
                     qc.execute(text("""
                         INSERT INTO qa_accounts
-                          (db_name, account_id, role, user_type, phone, username, shop_id, caps, state, note, synced_at)
-                        VALUES (:db, :account_id, :role, :user_type, :phone, :username, :shop_id, :caps, 'available', :note, :now)
+                          (db_name, account_id, role, user_type, phone, username, gender, shop_id, caps, state, note, synced_at)
+                        VALUES (:db, :account_id, :role, :user_type, :phone, :username, :gender, :shop_id, :caps, 'available', :note, :now)
                         ON DUPLICATE KEY UPDATE
                           user_type=VALUES(user_type), phone=VALUES(phone), username=VALUES(username),
+                          gender=COALESCE(VALUES(gender), gender),
                           shop_id=VALUES(shop_id), caps=VALUES(caps), note=VALUES(note), synced_at=VALUES(synced_at)
                     """), {
                         "db": self.db,
                         "account_id": a.account_id, "role": a.role, "user_type": a.user_type,
-                        "phone": a.phone, "username": a.username, "shop_id": a.shop_id,
+                        "phone": a.phone, "username": a.username, "gender": a.gender,
+                        "shop_id": a.shop_id,
                         "caps": json.dumps(a.caps), "note": a.note, "now": now,
                     })
             return len(seeds)

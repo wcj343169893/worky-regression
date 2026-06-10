@@ -20,6 +20,14 @@ const SELECTABLE_CAPS = {
 };
 const BASE_CAPS = { labor: ["active", "clean"], employer: ["active"] };
 
+// 兩池欄位不同：labor 顯示姓名/性別（店鋪欄對 labor 恆空無意義）；employer 維持店鋪。
+// 姓名來自 API 註冊時讀回的 profile（工作庫 display_name 加密，種子帳號拿不到則顯示 —）。
+const HEAD_COLS = {
+  labor: ["ID", "手機", "姓名", "性別", "能力 caps", "狀態", "最近使用"],
+  employer: ["ID", "手機", "店鋪", "能力 caps", "狀態", "最近使用"],
+};
+const GENDER_LABEL = { 0: "不分", 1: "男", 2: "女" };   // 工作庫 gender int 對照
+
 // 渲染當前角色的能力勾選框
 function capsCheckboxesHtml(role) {
   return (SELECTABLE_CAPS[role] || []).map(([cap, label]) =>
@@ -43,11 +51,14 @@ async function showShops(aid) {
     const d = await api(`/api/shops?employer_id=${aid}&limit=200`);
     const items = d.items || [];
     const rows = items.map((s) => [
-      `<div class="strong">${esc(s.name || "-")}</div>${s.branch_name ? `<div class="sub2">${esc(s.branch_name)}</div>` : ""}`,
+      `<span class="mono">#${s.id}</span>`,
+      `<div class="strong">${esc(s.name || "-")}</div>`,
+      esc(s.branch_name || "—"),
+      esc((s.city_name || "") + (s.district_name || "") || "—"),
       `<span class="pill">${esc(optLabel(OPT.shopValidStatus, s.validation_status))}</span>`,
     ]);
     openModal(`<h3>商家 #${aid} 的店鋪（${items.length}）</h3>` +
-      mini(["店名", "驗證狀態"], rows));
+      mini(["ID", "店名", "分店", "城市", "驗證狀態"], rows));
   } catch (err) { toast(err.message); }
 }
 
@@ -59,10 +70,15 @@ function stateBadge(it) {
 
 function rowHtml(it) {
   const caps = (it.caps || []).map((c) => `<span class="pill">${esc(c)}</span>`).join(" ") || `<span class="sub2">—</span>`;
+  // 中段欄位按角色：labor=姓名+性別、employer=店鋪（與 HEAD_COLS 對應）
+  const mid = it.role === "labor"
+    ? `<td>${it.display_name ? `<span class="acc-name" title="${esc(it.display_name)}">${esc(it.display_name)}</span>` : "—"}</td>
+       <td>${it.gender != null ? esc(GENDER_LABEL[it.gender] ?? String(it.gender)) : "—"}</td>`
+    : `<td>${it.shop_id != null ? "#" + it.shop_id : "—"}</td>`;
   return `<tr data-aid="${it.account_id}" data-role="${esc(it.role)}">
     <td><span class="mono">#${it.account_id}</span></td>
     <td>${esc(it.phone || "—")}</td>
-    <td>${it.shop_id != null ? "#" + it.shop_id : "—"}</td>
+    ${mid}
     <td>${caps}</td>
     <td>${stateBadge(it)}</td>
     <td><span class="sub2">${it.last_used_at ? fmtTs(it.last_used_at) : "—"}</span></td>
@@ -86,10 +102,14 @@ function paintRole() {
   $("view").querySelectorAll(".dc-tab[data-role]").forEach((b) =>
     b.classList.toggle("active", b.dataset.role === curRole));
 
+  // 表頭按角色重繪（labor 與 employer 欄位不同；+1 是操作欄）
+  const cols = HEAD_COLS[curRole] || HEAD_COLS.employer;
+  $("acc-head").innerHTML = cols.map((c) => `<th>${esc(c)}</th>`).join("") + `<th class="act">操作</th>`;
+
   if (!g || !g.count) {
     title.textContent = `${label}（0 個）`;
     warn.innerHTML = "";
-    tbody.innerHTML = `<tr class="norow"><td colspan="7"><div class="empty">此池是空的——請先 provision 種子帳號（或由補池 worker 自動補回）</div></td></tr>`;
+    tbody.innerHTML = `<tr class="norow"><td colspan="${cols.length + 1}"><div class="empty">此池是空的——請先 provision 種子帳號（或由補池 worker 自動補回）</div></td></tr>`;
     updateAccPager(1, 0);
     return;
   }
@@ -185,7 +205,7 @@ export async function renderAccounts(tabKey) {
           </span>
         </div>
         <div class="table-wrap"><table>
-          <thead><tr><th>ID</th><th>手機</th><th>店鋪</th><th>能力 caps</th><th>狀態</th><th>最近使用</th><th class="act">操作</th></tr></thead>
+          <thead><tr id="acc-head"></tr></thead>
           <tbody id="acc-rows"></tbody>
         </table></div>
         <div class="pager">

@@ -289,15 +289,20 @@ class QAStore:
                 "SELECT COUNT(*) FROM qa_runs WHERE case_id=:c"), {"c": case_id}).scalar() or 0)
 
     def latest_summary(self, case_id: str) -> dict | None:
-        """清單用：最近一次執行的彙總（含 transition_status 供 chip 著色）。"""
+        """清單用：最近一次執行的彙總（含 transition_status 供 chip 著色、error 供失敗徽章懸停提示）。"""
         with self._engine.connect() as conn:
             run = self._latest_run(conn, case_id)
             if not run:
                 return None
+            error = conn.execute(text(
+                "SELECT error FROM qa_run_steps WHERE run_id=:r AND status='failed' "
+                "AND error IS NOT NULL ORDER BY step_index LIMIT 1"
+            ), {"r": run["run_id"]}).scalar()
             return {
                 "run_id": run["run_id"], "status": run["status"], "started_at": run["started_at"],
                 "passed": run["passed"], "total": run["total"], "failed_at": run["failed_at"],
                 "transition_status": self._transition_status(conn, run["run_id"]),
+                "error": error,
             }
 
     def history(self, case_id: str, limit: int = 10) -> list[dict]:

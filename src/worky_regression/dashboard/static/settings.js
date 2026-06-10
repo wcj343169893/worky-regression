@@ -17,7 +17,7 @@ export async function renderSettings() {
     const hint = ok
       ? `被測倉分支與 .env 庫名相符。`
       : `<b>分支與 .env 庫名不符！</b>切分支＝換一套測試數據：請改 .env 的 WORKY_DB_NAME 為「預期庫」並重建帳號池，或切回對應分支。`;
-    return `<div class="set-card set-card-wide"><h3>被測庫一致性 ${badge}</h3>
+    return `<div class="set-card set-card-2x"><h3>被測庫一致性 ${badge}</h3>
       ${kv("被測倉分支", esc(c.branch || "（讀不到）"))}
       ${kv("分支推算庫", esc(c.expected_db || "—"))}
       ${kv(".env WORKY_DB_NAME", esc(c.configured_db || "—"))}

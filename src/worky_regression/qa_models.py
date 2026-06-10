@@ -127,6 +127,11 @@ class QAAccount(Base):
     user_type: Mapped[int] = mapped_column(Integer, nullable=False)        # 1 商家 / 2 打工夥伴
     phone: Mapped[str] = mapped_column(String(32), nullable=False, server_default="")
     username: Mapped[str | None] = mapped_column(String(64))
+    # 姓名/性別：工作庫 display_name 走 Cipher 加密、SQL 讀不到明文，只能在「拿得到解密值」
+    # 的時點寫入（API 註冊時讀 /profile）；gender 在工作庫是明文 int(0 不分/1 男/2 女)，
+    # 供給/同步(sync_caps)時可直接探回。兩欄都允許 NULL（拿不到就不顯示）。
+    display_name: Mapped[str | None] = mapped_column(String(64))
+    gender: Mapped[int | None] = mapped_column(Integer)
     shop_id: Mapped[int | None] = mapped_column(Integer)
     # 能力標籤（JSON 陣列），例：["verified","active","profile_complete","audit_role"]
     caps: Mapped[list | None] = mapped_column(JSON)

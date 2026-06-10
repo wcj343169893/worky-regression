@@ -56,7 +56,7 @@ export const TABLES = {
       ["ID", (r) => `<span class="mono">${r.id}</span>`],
       ["店鋪", (r) => `<div class="strong">${esc(r.name || "-")}</div><div class="sub2">${esc(r.branch_name || "")}</div>`],
       ["商家ID", (r) => `<span class="mono">${r.employer_id}</span>`],
-      ["地區", (r) => `${r.city || "-"} ${r.district || ""}`],
+      ["地區", (r) => esc((r.city_name || "") + (r.district_name || "")) || "-"],
       ["驗證", (r) => `<span class="pill">type ${r.validation_type} / st ${r.validation_status}</span>`],
       ["工作數", (r) => `${r.job_count} <span class="sub2">已發 ${r.published_job_count}</span>`, "num"],
       ["評分", (r) => `${stars(r.rating_stars)} <span class="sub2">(${r.evaluation_count})</span>`],

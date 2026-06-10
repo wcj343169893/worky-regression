@@ -334,7 +334,8 @@ function renderCaseRows(key, items) {
       ? `<div class="tflow">${c.transitions.map((x, i) =>
           `<span class="tchip clickable ${tchipCls(tss[i])}" data-cid="${esc(c.id)}" data-ti="${i}" title="點擊看詳情">${esc(x.split("_")[0])}</span>`).join("")}</div>`
       : `<span class="sub2">db / 混合</span>`;
-    const lrHtml = lr ? `${resBadge(lr.status)} <span class="sub2">${lr.passed}/${lr.total} · ${fmtTs(lr.started_at)}</span>`
+    // 失敗時把第一個失敗步驟的錯誤掛在 title——滑過徽章即可看到原因，不必下鑽
+    const lrHtml = lr ? `<span${lr.error ? ` title="${esc(lr.error)}"` : ""}>${resBadge(lr.status)}</span> <span class="sub2">${lr.passed}/${lr.total} · ${fmtTs(lr.started_at)}</span>`
       : `<span class="sub2">—</span>`;
     return `<tr>
       <td><div class="cid">${c.seq != null ? `<span class="seq">#${c.seq}</span>` : ""}<code>${esc(c.id)}</code></div><div class="sub2">${esc((c.description || "").slice(0, 50))}</div></td>

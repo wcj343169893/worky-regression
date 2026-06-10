@@ -47,24 +47,31 @@ class ManageMixin:
         return {"total": total, "count": len(rows), "limit": limit, "offset": offset,
                 "items": rows}
 
-    SHOP_FILTERS = {"validation_status": ("validation_status", "eq"),
-                    "validation_type": ("validation_type", "eq"),
-                    "employer_id": ("employer_id", "eq")}
+    SHOP_FILTERS = {"validation_status": ("s.validation_status", "eq"),
+                    "validation_type": ("s.validation_type", "eq"),
+                    "employer_id": ("s.employer_id", "eq")}
 
     def list_shops(self, *, q: str = "", filters: dict | None = None,
                    limit: int = 50, offset: int = 0) -> dict:
         where, params = [], []
         if q:
-            where.append("(name LIKE %s OR branch_name LIKE %s OR CAST(id AS CHAR)=%s)")
+            where.append("(s.name LIKE %s OR s.branch_name LIKE %s OR CAST(s.id AS CHAR)=%s)")
             params += [f"%{q}%", f"%{q}%", q]
         apply_filters(where, params, filters, self.SHOP_FILTERS)
         wsql = ("WHERE " + " AND ".join(where)) if where else ""
-        total = self.db.query_one(f"SELECT COUNT(*) c FROM s_shops {wsql}", tuple(params))["c"]
+        total = self.db.query_one(f"SELECT COUNT(*) c FROM s_shops s {wsql}", tuple(params))["c"]
+        # city / district 存的是 s_option_city_district_source.id（同主倉
+        # OptionCityDistrict::findOneCity 的對法），JOIN 出中文名稱
         rows = self.db.query_all(
-            f"""SELECT id, name, branch_name, employer_id, city, district,
-                       validation_type, validation_status, job_count, published_job_count,
-                       canceled_count, rating_stars, evaluation_count, created_at
-                FROM s_shops {wsql} ORDER BY id DESC LIMIT %s OFFSET %s""",
+            f"""SELECT s.id, s.name, s.branch_name, s.employer_id, s.city, s.district,
+                       oc.text AS city_name, od.text AS district_name,
+                       s.validation_type, s.validation_status, s.job_count,
+                       s.published_job_count, s.canceled_count, s.rating_stars,
+                       s.evaluation_count, s.created_at
+                FROM s_shops s
+                LEFT JOIN s_option_city_district_source oc ON oc.id = s.city
+                LEFT JOIN s_option_city_district_source od ON od.id = s.district
+                {wsql} ORDER BY s.id DESC LIMIT %s OFFSET %s""",
             tuple(params) + (int(limit), int(offset)))
         return {"total": total, "count": len(rows), "limit": limit, "offset": offset,
                 "items": rows}
