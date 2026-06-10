@@ -138,6 +138,32 @@ def ensure_publisher_invoice(actor: Actor) -> None:
         )
 
 
+def ensure_employer_invoice(actor: Actor) -> None:
+    """確保 job 商家已設定發票資訊，否則非企業支付的 /employer/shop/job/publish 會 20017。
+
+    呼叫 /employer/invoice/update 寫入最小設定（type=0 捐贈發票）。Idempotent。
+    API 自建的池商家沒有發票資訊（種子帳號 129 是手工設的），配發後一律補一次。
+    """
+    resp = actor.client.post(
+        "/employer/invoice/update",
+        body={
+            "type": 0,                          # 捐贈發票
+            "name": "regression",
+            "phone": actor.phone,
+            "email": "regression@worky.local",
+            "e_invoice_carrier_type": 0,        # 無載具（捐贈用）
+            "mobile_carrier_number": "",
+            "citizen_carrier_number": "",
+            "tax_id_number": "",
+            "tax_id_number_title": "",
+        },
+    )
+    if resp.status_code != 200 or resp.json().get("success") is False:
+        raise RuntimeError(
+            f"failed to setup invoice for employer id={actor.user_id}: {resp.text[:300]}"
+        )
+
+
 def _actors_for(system: str, s: Settings,
                 exclude: dict[str, list[str]] | None = None) -> dict[str, Actor]:
     """依系統登入對應角色（承攬制 publisher 會做發票 preflight）。
@@ -149,14 +175,17 @@ def _actors_for(system: str, s: Settings,
     exclude = exclude or {}
     if system == "job":
         # 從帳號池按「能力」配發，不再寫死 id：labor1/2/3 為三個合格夥伴（bind 切換身份），
-        # employer 為已驗證店鋪商家。執行期只讀 qa_accounts，不直連工作庫挖帳號。
+        # employer 為店鋪已過審商家。執行期只讀 qa_accounts，不直連工作庫挖帳號。
         pool = AccountPool(s)
         labor_caps = ["verified", "profile_complete", "audit_role", "active", "clean"]
         # 登入失敗自動換號（#2）：配 2 個「可登入」的全 caps 夥伴 + 1 個可登入的商家。
+        # employer 要 shop_approved（店鋪 validation_status=3 已過審）才能發佈工作；
+        # verified_shop 只代表「公司型已送審」，未過審發佈會 20022（JobForm::validateCanCreateJob）。
+        emp = _login_from_pool(s, pool, "employer", ["active", "shop_approved"], 1,
+                               owner="job-actors", exclude=exclude.get("employer"))[0]
+        ensure_employer_invoice(emp)   # 無發票資訊發佈會 20017（非企業支付都檢查）
         la = _login_from_pool(s, pool, "labor", labor_caps, 2, owner="job-actors",
                               exclude=exclude.get("labor"))
-        emp = _login_from_pool(s, pool, "employer", ["active", "verified_shop"], 1,
-                               owner="job-actors", exclude=exclude.get("employer"))[0]
         actors = {
             "employer": emp,
             "labor": la[0],

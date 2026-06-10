@@ -38,6 +38,9 @@ class WorkyClient:
         self.access_token_expired_at: int = 0
         self.refresh_token_expired_at: int = 0
         self.udid = uuid.uuid4().hex  # 32 chars
+        # employer 鎖定店鋪用（qa-v1 限定）：設定後，已登入的主 API 請求未帶 shop_id 時自動補上，
+        # 後端 QA 模式會以此覆寫 lastSelectedShopId，查驗不受其他端「切換店鋪」影響。
+        self.shop_id: int | None = None
         self.session = requests.Session()
         # 內網/dev domain bypass 系統 proxy（Privoxy 會吞 .worky.com.tw）
         self.session.trust_env = False
@@ -62,6 +65,15 @@ class WorkyClient:
                 body: dict | None = None, base: str | None = None) -> requests.Response:
         # base 可覆寫 API base（如營運活動走 /activity；不傳則用主 API /v1）
         url = (base or self.settings.api_base) + path
+
+        # qa-v1 鎖店：employer 已登入、打主 API 且呼叫端沒給 shop_id 時自動補
+        # （顯式給的 shop_id 不覆寫——負向用例要能帶錯誤店鋪；activity 等覆寫 base 的請求不補）
+        if (self.shop_id and self.user_type == 1 and base is None
+                and self.access_token and self.settings.qa_mode):
+            if method.upper() == "GET":
+                params = {"shop_id": self.shop_id, **(params or {})}
+            else:
+                body = {"shop_id": self.shop_id, **(body or {})}
 
         # GET query string: 參數名稱正序排列
         if method.upper() == "GET" and params:

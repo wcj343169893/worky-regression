@@ -455,11 +455,14 @@ task_units:
       job_sn: job_sn_list.0
     push: null
     guards:
-      - need: 商家已登入且店鋪已驗證（validation_type=2）
-        satisfy: {caps: [active, verified_shop]}
+      - need: 商家已登入且店鋪已通過審核（validation_status=3；只送審未過審發佈會 20022）
+        satisfy: {caps: [active, shop_approved]}
       - need: 時薪、工時、招募人數等發佈參數合法
         satisfy: {note: "happy 用 request 預設值；非法值見 branches"}
     branches:
+      - when: 店鋪未通過審核（含公司型已送審未過審）
+        expect_fail: {code: 20022}                  # SHOP_VALIDATION_NOT_PASS
+        arrange: {note: "employer 用「有 verified_shop 但無 shop_approved」的帳號"}
       - when: 時薪低於下限（230）
         expect_fail: {code: 20011}                  # HOURLY_WAGE_TOO_LOW
         arrange: {note: "request.hourly_wage 設 < 230"}

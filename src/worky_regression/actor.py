@@ -21,6 +21,11 @@ class Actor:
     display_name: str = ""
     _logged_in: bool = field(default=False, init=False)
 
+    def __post_init__(self) -> None:
+        # 把店鋪同步給 client：qa-v1 模式下 employer 請求自動帶 shop_id 鎖店
+        if self.shop_id and self.user_type == 1:
+            self.client.shop_id = self.shop_id
+
     @property
     def login_path(self) -> str:
         return "/employer/login/confirm" if self.user_type == 1 else "/labor/login/confirm"

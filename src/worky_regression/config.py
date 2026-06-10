@@ -82,6 +82,15 @@ class Settings:
             deepseek_model=os.environ.get("DEEPSEEK_MODEL", "deepseek-chat"),
         )
 
+    @property
+    def qa_mode(self) -> bool:
+        """主 API 是否走 /qa-v1 等 QA 專用前綴。
+
+        QA 模式下被測端允許 employer 請求帶 shop_id 鎖定店鋪（覆寫後端的
+        lastSelectedShopId，查詢不受切換店鋪影響）；client 據此自動補 shop_id。
+        """
+        return "qa-v1" in self.api_base
+
     def for_system(self, system: str) -> "Settings":
         """回傳該系統要連的 DB 設定：contract 走 contract_db_name（若有設），其餘沿用。"""
         if system == "contract" and self.contract_db_name:

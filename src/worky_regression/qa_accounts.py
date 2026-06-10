@@ -196,14 +196,23 @@ class AccountPool:
 
     # ── 本地 token 快取（配發時「有效就用、到期才刷」）─────────────────────────
     def load_token(self, account_id: int, role: str) -> dict[str, Any] | None:
-        """讀帳號池內保存的 token（不檢查是否過期，由呼叫端的 client 自行判斷）。"""
+        """讀帳號池內保存的 token（不檢查是否過期，由呼叫端的 client 自行判斷）。
+
+        token 與簽發時的 API base 綁定（/v1 與 /qa-v1 模組 requestSource 不同，token 互不
+        通用，混用會 10003）：存的 base 與當前 .env 不符（含舊資料的 NULL）→ 視為無快取。
+        """
         with self._qa_engine.connect() as conn:
             r = conn.execute(text(
                 "SELECT access_token, refresh_token, access_token_expired_at, "
-                "refresh_token_expired_at FROM qa_accounts "
+                "refresh_token_expired_at, token_api_base FROM qa_accounts "
                 "WHERE db_name=:db AND account_id=:a AND role=:r"),
                 {"db": self.db, "a": int(account_id), "r": role}).first()
-        return dict(r._mapping) if r else None
+        if not r:
+            return None
+        m = dict(r._mapping)
+        if m.pop("token_api_base", None) != self.s.api_base:
+            return None
+        return m
 
     def save_token(self, account_id: int, role: str, *, access_token: str,
                    refresh_token: str, access_expired_at: int, refresh_expired_at: int) -> None:
@@ -214,12 +223,13 @@ class AccountPool:
                 UPDATE qa_accounts SET
                   access_token=:at, refresh_token=:rt,
                   access_token_expired_at=:aexp, refresh_token_expired_at=:rexp,
-                  token_updated_at=:now
+                  token_updated_at=:now, token_api_base=:base
                 WHERE db_name=:db AND account_id=:a AND role=:r
             """), {
                 "at": access_token, "rt": refresh_token,
                 "aexp": int(access_expired_at or 0), "rexp": int(refresh_expired_at or 0),
-                "now": now, "db": self.db, "a": int(account_id), "r": role,
+                "now": now, "base": self.s.api_base,
+                "db": self.db, "a": int(account_id), "r": role,
             })
 
     def release(self, owner: str) -> int:

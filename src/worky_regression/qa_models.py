@@ -151,6 +151,9 @@ class QAAccount(Base):
     access_token_expired_at: Mapped[int] = mapped_column(BigInteger, nullable=False, server_default="0")
     refresh_token_expired_at: Mapped[int] = mapped_column(BigInteger, nullable=False, server_default="0")
     token_updated_at: Mapped[int] = mapped_column(BigInteger, nullable=False, server_default="0")
+    # token 簽發時的 API base（如 .../v1、.../qa-v1）。不同模組（requestSource）簽出的 token
+    # 互不通用——切 base 後舊 token 會 10003，故 load_token 比對不符（含 NULL）即視為無快取。
+    token_api_base: Mapped[str | None] = mapped_column(String(255))
 
     __table_args__ = (
         Index("uq_db_account_role", "db_name", "account_id", "role", unique=True),
