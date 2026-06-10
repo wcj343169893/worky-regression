@@ -25,11 +25,40 @@ class Actor:
     def login_path(self) -> str:
         return "/employer/login/confirm" if self.user_type == 1 else "/labor/login/confirm"
 
-    def login(self, audit_code: str) -> None:
-        """以 audit user 固定碼登入。直接打 confirm，不需要先發碼。"""
+    @property
+    def login_send_path(self) -> str:
+        return "/employer/login" if self.user_type == 1 else "/labor/login"
+
+    def login(self) -> None:
+        """真實登入流程（對所有帳號統一，不用固定碼）：
+        先 POST /labor|/employer/login 發碼（測試環境 response 帶 data.code），
+        再以 md5(code) 打 confirm。
+        """
+        resp = self.client.post(self.login_send_path, body={"phone": self.phone})
+        if resp.status_code != 200:
+            raise LoginFailedError(
+                f"{self.role} login(send) failed: HTTP {resp.status_code} "
+                f"body={resp.text[:500]}"
+            )
+        payload = resp.json()
+        if payload.get("success") is False:
+            raise LoginFailedError(
+                f"{self.role} login(send) API error code={payload.get('code')} "
+                f"message={payload.get('message')!r} data={payload.get('data')}"
+            )
+        data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+        code = (data or {}).get("code")
+        if not code:
+            raise LoginFailedError(
+                f"{self.role} login(send): response 無 code（僅測試環境會回 code）：{data}"
+            )
+        self._confirm_login(str(code))
+
+    def _confirm_login(self, code: str) -> None:
+        """打 login/confirm，password=md5(驗證碼)；成功則寫入 token。"""
         body = {
             "phone": self.phone,
-            "password": md5(audit_code),
+            "password": md5(code),
         }
         resp = self.client.post(self.login_path, body=body)
         if resp.status_code != 200:

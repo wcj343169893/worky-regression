@@ -12,6 +12,26 @@ const ROLE_LABEL = { labor: "打工夥伴", employer: "商家" };
 const DEFAULT_ROLE = "employer";   // 預設池（對應乾淨的 #accounts）
 const optLabel = (opts, v) => (opts.find(([k]) => k === String(v)) || [null, v])[1];
 
+// 註冊時「可選賦予」的進階能力（基本 active/clean 一律自動帶上，不列）。
+// audit_role 純 API 達不到（需 provision 種子），故不在註冊選項。
+const SELECTABLE_CAPS = {
+  labor: [["verified", "已認證(後台核准)"], ["profile_complete", "資料完整(完整送審)"]],
+  employer: [["shop_approved", "店鋪已核准(後台)"], ["verified_shop", "店鋪身分證送審(type2)"]],
+};
+const BASE_CAPS = { labor: ["active", "clean"], employer: ["active"] };
+
+// 渲染當前角色的能力勾選框
+function capsCheckboxesHtml(role) {
+  return (SELECTABLE_CAPS[role] || []).map(([cap, label]) =>
+    `<label class="acc-cap"><input type="checkbox" class="acc-cap-cb" value="${cap}" /> ${esc(label)}</label>`
+  ).join("");
+}
+// 收集勾選的進階能力 + 基本能力（恆非空，確保後端 need_approve 判定正確）
+function selectedRegisterCaps(role) {
+  const adv = [...document.querySelectorAll(".acc-cap-cb:checked")].map((c) => c.value);
+  return [...(BASE_CAPS[role] || []), ...adv];
+}
+
 let curRole = "employer";   // 當前選中的池（跨重渲染保留）
 let groupsByRole = {};      // 最近一次抓到的各角色分組（切 tab 不重抓）
 const ACC_PAGE_SIZE = 20;   // 每頁筆數（前端切片分頁；/api/accounts 已回各角色完整清單）
@@ -158,8 +178,10 @@ export async function renderAccounts(tabKey) {
       <div class="card cases-list">
         <div class="panel-head"><h3 id="acc-title"></h3><span id="acc-warn"></span>
           <span class="acc-reg">
+            <button class="btn ghost" id="acc-init-btn" title="全清當前庫池列，按能力分群各建 3 個（含 provision 種子補 audit_role）。耗時較長">⟳ 初始化</button>
+            <span class="acc-reg-caps" title="選擇要賦予的能力（未勾＝僅基本 active/clean）；verified/shop_approved 需後台帳密核准">${capsCheckboxesHtml(curRole)}</span>
             <input type="number" id="acc-reg-n" class="flt" min="1" max="20" value="1" title="要註冊的帳號數（最多 20）" />
-            <button class="btn primary" id="acc-reg-btn" title="產 09 手機號自動註冊並補資料入池（只標基本 caps）">＋ 註冊入池</button>
+            <button class="btn primary" id="acc-reg-btn" title="產 09 手機號自動註冊並依所選能力補資料/送審/核准入池">＋ 註冊入池</button>
           </span>
         </div>
         <div class="table-wrap"><table>
@@ -179,17 +201,41 @@ export async function renderAccounts(tabKey) {
   $("view").querySelectorAll(".dc-tab[data-role]").forEach((b) =>
     b.onclick = () => selectRole(b.dataset.role));
 
-  // 註冊入池：對當前角色純 API 建 N 個帳號（產 09 手機號→註冊→補資料），完成後重抓清單
+  // 註冊入池：對當前角色純 API 建 N 個帳號，依所選能力補資料/送審/核准，完成後重抓清單
   $("acc-reg-btn").onclick = async () => {
     const n = Math.max(1, Math.min(20, Number($("acc-reg-n").value) || 1));
+    const caps = selectedRegisterCaps(curRole);   // 含基本 active/clean；勾選的進階能力決定步驟
     const btn = $("acc-reg-btn"); const old = btn.textContent;
-    btn.disabled = true; btn.textContent = `註冊中… (0/${n})`;
+    btn.disabled = true; btn.textContent = `註冊中…`;
     try {
-      const r = await apiPost("/api/accounts/register", { role: curRole, n });
-      const fails = (r.results || []).filter((x) => !x.ok);
-      toast(`註冊入池：${r.ok}/${r.total} 成功${fails.length ? `；失敗 ${fails.length}（${esc(fails[0].error || "")}）` : ""}`);
+      const r = await apiPost("/api/accounts/register", { role: curRole, n, caps });
+      const rows = r.results || [];
+      const fails = rows.filter((x) => !x.ok);
+      let msg = `註冊入池：${r.ok}/${r.total} 成功`;
+      if (fails.length) msg += `；失敗 ${fails.length}（${esc(fails[0].error || "")}）`;
+      if (r.auto_review) {
+        const skipped = rows.find((x) => x.ok && String(x.review || "").startsWith("skipped:"));
+        const revFail = rows.find((x) => x.ok && String(x.review || "").startsWith("failed:"));
+        msg += `；審核通過 ${r.reviewed || 0}`;
+        if (skipped) msg += `（跳過：${esc((skipped.review || "").slice(8))}）`;
+        else if (revFail) msg += `（有審核失敗：${esc((revFail.review || "").slice(7))}）`;
+      }
+      toast(msg);
       renderAccounts(curRole);   // 重抓清單，新帳號入列
     } catch (e) { toast("註冊失敗：" + e.message); btn.disabled = false; btn.textContent = old; }
+  };
+
+  // 初始化：全清重建（按能力分群各建 3 個 + provision 種子）。耗時較長，需二次確認
+  $("acc-init-btn").onclick = async () => {
+    if (!confirm("將【全清】當前庫的帳號池追蹤列（不動後端真實帳號），再按能力分群各建 3 個並送審/核准。\n耗時較長，確定執行？")) return;
+    const btn = $("acc-init-btn"); const old = btn.textContent;
+    btn.disabled = true; btn.textContent = "初始化中…（數十秒～數分鐘）";
+    try {
+      const r = await apiPost("/api/accounts/init", { per_cap: 3 });
+      const g = (r.groups || []).map((x) => `${x.role}[${(x.target_caps || []).join("+")}]:${x.ok}/${x.total}`).join("，");
+      toast(`初始化完成：清 ${r.cleared} 列；分群 ${g}`);
+      renderAccounts(curRole);
+    } catch (e) { toast("初始化失敗：" + e.message); btn.disabled = false; btn.textContent = old; }
   };
 
   // 翻頁：改 pageByRole[curRole] 後重繪當前頁（前端切片，不重抓）

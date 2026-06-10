@@ -43,7 +43,7 @@ def _build_actor(s: Settings, accounts: dict, role: str, key: str, user_type: in
     client = WorkyClient(s, user_type=user_type)
     actor = Actor(role=role, user_type=user_type, phone=cfg["phone"],
                   user_id=cfg["id"], client=client, shop_id=cfg.get("shop_id"))
-    actor.login(audit_code=s.audit_sms_code)
+    actor.login()
     return actor
 
 
@@ -80,7 +80,7 @@ def _actor_from_pool(s: Settings, pa: PooledAccount, role: str,
                             access_expired_at=client.access_token_expired_at,
                             refresh_expired_at=client.refresh_token_expired_at)
     else:
-        actor.login(audit_code=s.audit_sms_code)  # ③ 完整登入
+        actor.login()                             # ③ 完整登入：發碼→確認（不用固定碼）
         if pool:
             pool.save_token(pa.account_id, role, access_token=client.access_token,
                             refresh_token=client.refresh_token,

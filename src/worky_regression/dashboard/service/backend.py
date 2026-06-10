@@ -44,6 +44,18 @@ class BackendMixin:
             password=cfg.get("backend_password") or "",
         )
 
+    def _logged_in_client(self) -> tuple[BackendAdminClient | None, str | None]:
+        """建 client 並登入一次；成功回 (client, None)，未設帳密/連不上/登入失敗回 (None, 原因)。
+
+        供批次自動審核共用：只檢查一次可用性、之後重用同一 session（免每筆重新登入）。
+        """
+        try:
+            client = self._backend_client()
+            client.login()
+            return client, None
+        except BackendError as e:   # 含 BackendLoginError（帳密未設 / 帳密錯）
+            return None, str(e)
+
     # ── 登入測試 ───────────────────────────────────────────────────────────
     def backend_login_test(self) -> dict:
         try:
@@ -57,20 +69,63 @@ class BackendMixin:
                      reasons: dict | None = None) -> dict:
         client = self._backend_client()
         client.login()
-        result = client.review_labor(int(labor_id), approve, reasons=reasons)
-        # 審核改了工作庫硬狀態 → 若該帳號在池中，重探重算 caps（labor 通過→補 verified）
-        result["caps_synced"] = self._sync_caps_safe(int(labor_id), "labor")
-        return result
+        return self._do_review_labor(client, int(labor_id), approve, reasons=reasons)
 
     def review_shop(self, shop_id: int, approve: bool,
                     reason_ids: list | None = None, other_reason: str = "") -> dict:
         client = self._backend_client()
         client.login()
-        result = client.review_shop(int(shop_id), approve,
+        return self._do_review_shop(client, int(shop_id), approve,
+                                    reason_ids=reason_ids, other_reason=other_reason)
+
+    # ── 審核核心（已登入 client；公開方法與批次自動審核共用，免重複登入）──────────
+    def _do_review_labor(self, client: BackendAdminClient, labor_id: int, approve: bool,
+                         reasons: dict | None = None) -> dict:
+        result = client.review_labor(labor_id, approve, reasons=reasons)
+        # 審核改了工作庫硬狀態 → 若該帳號在池中，重探重算 caps（labor 通過→補 verified）
+        result["caps_synced"] = self._sync_caps_safe(labor_id, "labor")
+        return result
+
+    def _do_review_shop(self, client: BackendAdminClient, shop_id: int, approve: bool,
+                        reason_ids: list | None = None, other_reason: str = "") -> dict:
+        result = client.review_shop(shop_id, approve,
                                     reason_ids=reason_ids, other_reason=other_reason)
         # 店鋪歸屬商家：若在池中，重探重算 caps（通過→補 shop_approved）
-        result["caps_synced"] = self._sync_shop_owner_caps_safe(int(shop_id))
+        result["caps_synced"] = self._sync_shop_owner_caps_safe(shop_id)
         return result
+
+    # ── 批次自動審核（註冊建號順帶通過：labor→驗證、employer→店鋪核准）────────────
+    def auto_review_registered(self, results: list[dict]) -> list[dict]:
+        """對 register_via_api 的成功結果自動審核通過，就地補上 review/caps 後回傳 results。
+
+        後台帳密未設 / 連不上 / 登入失敗 → 全部跳過（標 review='skipped:<原因>'），帳號照常留池。
+        單筆審核失敗只標該筆 review='failed:<原因>'，不影響其餘。整批共用一個已登入 session。
+        """
+        oks = [r for r in results if r.get("ok")]
+        if not oks:
+            return results
+        client, reason = self._logged_in_client()
+        if client is None:
+            for r in oks:
+                r["review"] = f"skipped:{reason}"
+            return results
+        for r in oks:
+            try:
+                if r.get("role") == "labor":
+                    res = self._do_review_labor(client, int(r["account_id"]), True)
+                else:
+                    sid = r.get("shop_id")
+                    if not sid:
+                        r["review"] = "skipped:無 shop_id（店鋪未建成）"
+                        continue
+                    res = self._do_review_shop(client, int(sid), True)
+                r["review"] = "approved"
+                synced = res.get("caps_synced")
+                if isinstance(synced, dict) and isinstance(synced.get("caps"), list):
+                    r["caps"] = synced["caps"]   # 以重探後的最新 caps 覆蓋（含 verified/shop_approved）
+            except BackendError as e:
+                r["review"] = f"failed:{e}"
+        return results
 
     # ── caps 重探（best-effort：失敗不影響審核結果回報）────────────────────────
     def _sync_caps_safe(self, account_id: int, role: str):

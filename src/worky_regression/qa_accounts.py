@@ -61,6 +61,12 @@ SEED_CAPACITY = {"labor": len(SEED_LABOR_IDS), "employer": len(SEED_EMPLOYERS)}
 _DUMMY_PNG = base64.b64decode(
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+M8AAAMBAQDJ/pLvAAAAAElFTkSuQmCC")
 
+# 身分證英文字母加權對照（worky common/validators/IdNumberValidator.php）。
+_ID_LETTER = {'A': 10, 'B': 11, 'C': 12, 'D': 13, 'E': 14, 'F': 15, 'G': 16, 'H': 17,
+              'I': 34, 'J': 18, 'K': 19, 'L': 20, 'M': 21, 'N': 22, 'O': 35, 'P': 23,
+              'Q': 24, 'R': 25, 'S': 26, 'T': 27, 'U': 28, 'V': 29, 'W': 32, 'X': 30,
+              'Y': 31, 'Z': 33}
+
 
 class AccountPool:
     """帳號池存取層。執行期(acquire/release)只碰 QA 庫；供給/同步才連工作庫。"""
@@ -304,7 +310,7 @@ class AccountPool:
     def get(self, account_id: int, role: str) -> dict[str, Any] | None:
         with self._qa_engine.connect() as conn:
             r = conn.execute(text(
-                "SELECT account_id, role, user_type, phone, username, shop_id, caps, state "
+                "SELECT account_id, role, user_type, phone, username, shop_id, caps, state, note "
                 "FROM qa_accounts WHERE db_name=:db AND account_id=:a AND role=:r"),
                 {"db": self.db, "a": int(account_id), "r": role}).first()
         if not r:
@@ -322,6 +328,21 @@ class AccountPool:
                 "UPDATE qa_accounts SET state=:s WHERE db_name=:db AND account_id=:a AND role=:r"),
                 {"s": state, "db": self.db, "a": int(account_id), "r": role})
             return res.rowcount
+
+    def clear(self, role: str | None = None) -> int:
+        """清空當前庫的池**追蹤列**（qa_accounts），不動後端真實帳號。回刪除列數。
+
+        role 省略＝labor+employer 全清；種子可事後 provision()/sync_caps() 重新探測補回。
+        """
+        sql = "DELETE FROM qa_accounts WHERE db_name=:db"
+        params: dict[str, Any] = {"db": self.db}
+        if role is not None:
+            if role not in ("labor", "employer"):
+                raise ValueError("role 只能 labor / employer")
+            sql += " AND role=:r"
+            params["r"] = role
+        with self._qa_engine.begin() as conn:
+            return conn.execute(text(sql), params).rowcount
 
     # ── 純 API 自助建帳號入池（不連工作庫；09 手機號自動註冊 + 補資料）──────────────
     # 動機：框架無讀工作庫權限時，靠 API 自己造帳號。dev/測試環境註冊回應會帶驗證碼(code)，
@@ -373,6 +394,63 @@ class AccountPool:
             raise RuntimeError(f"demographics 失敗：{r.get('message')}")
 
     @staticmethod
+    def _gen_id_number(second_choices: str) -> str:
+        """產通過 IdNumberValidator 的身分證號（10 碼，含檢查碼）。
+
+        labor 第二碼限 '12'（`_gen_id_number("12")`）；employer 限 '1289ABCD'。
+        驗證器把第二碼 A–D 視為 0–3 後加權，故 sec_val 需相應換算。
+        """
+        while True:
+            first = random.choice(list(_ID_LETTER))
+            second = random.choice(second_choices)
+            sec_val = (ord(second) - ord('A')) if 'A' <= second <= 'D' else int(second)
+            mids = [random.randint(0, 9) for _ in range(7)]   # idArray[2..8]
+            num = _ID_LETTER[first]
+            point = num // 10 + (num % 10) * 9                 # 字母加權
+            point += sec_val * 8                               # idArray[1] 權重 (9-1)
+            for i, d in enumerate(mids):                       # idArray[2..8] 權重 7..1
+                point += d * (7 - i)
+            check = (10 - point % 10) % 10                     # idArray[9] 檢查碼
+            idn = first + second + "".join(map(str, mids)) + str(check)
+            if len(idn) == 10:
+                return idn
+
+    def _complete_labor_full_profile(self, c: WorkyClient, phone: str) -> None:
+        """填齊送審必填三分群（個人/聯繫/薪資帳戶）+ `is_submitted_for_review=true`。
+
+        成功後工作庫 `is_profile_complete=1`、`valid_status=2`(待認證)；再經後台核准才得 verified。
+        身分證正反面 / 存摺封面用佔位圖上傳（uploader type 須對）。
+        """
+        opt = (c.get("/labor/options").json().get("data") or {})
+        cds = opt.get("city_districts") or []
+        if not cds or not cds[0].get("districts"):
+            raise RuntimeError("取不到縣市/區域選項，無法送審")
+        city = cds[0]; dist = city["districts"][0]
+        banks = opt.get("banks") or []
+        if not banks:
+            raise RuntimeError("取不到銀行選項，無法填薪資帳戶")
+        bank_code = banks[0]["code"]
+        suffix = phone[-4:]
+        front = self._upload_image(c, "labor_id_card_image")
+        back = self._upload_image(c, "labor_id_card_image")
+        book = self._upload_image(c, "labor_passbook_cover_image")
+        r = c.post("/labor/update", body={
+            "display_name": f"QA{suffix}", "gender": random.choice(["male", "female"]),
+            "birthday": f"{random.randint(1985, 2002)}-05-05",
+            "id_number": self._gen_id_number("12"),
+            "id_card_front_image": front, "id_card_back_image": back,
+            "email": f"qa{phone[-6:]}@worky.local",
+            "city": city["id"], "district": dist["id"], "address": "測試路1號",
+            "emergency_contact_person": "測試聯絡人", "emergency_contact_relation": "親屬",
+            "emergency_contact_phone": "0933123123",
+            "bank_account_name": f"QA{suffix}", "bank_code": bank_code,
+            "bank_branch_code": f"{bank_code}0011", "bank_account": "012345678901",
+            "passbook_cover_image": book, "is_submitted_for_review": True,
+        }).json()
+        if not r.get("success"):
+            raise RuntimeError(f"完整資料送審失敗：{r.get('message')}")
+
+    @staticmethod
     def _profile(c: WorkyClient, base: str) -> dict:
         """讀 /labor|/employer/profile，回 data（含真實 id / status / valid_status）。"""
         r = c.get(f"{base}/profile").json()
@@ -383,24 +461,38 @@ class AccountPool:
 
     @staticmethod
     def _caps_from_profile(role: str, prof: dict) -> list[str]:
-        """由 profile 推 caps（只標純 API 能確認的基本能力）。status==10 為已啟用(active)。"""
+        """由 profile 推 caps，一律**依實際欄位查證**（不假設）。
+
+        與工作庫探測 _probe_labor_caps 同義，避免 caps 標了卻名不副實：
+          active=status==10 / profile_complete=is_profile_complete==1 /
+          verified=valid_status==1 / clean=無違規點數(penalty_points 為 0)。
+        注意 demographics/create 不等於 is_profile_complete=1（後端另有完整度判定），故必須讀回實況。
+        """
         caps: list[str] = []
         if prof.get("status") == 10:
             caps.append("active")
         if role == "labor":
-            caps.append("clean")             # 新號無違規記點
-            caps.append("profile_complete")  # 已補過 demographics 才到這步
+            if prof.get("is_profile_complete") == 1:
+                caps.append("profile_complete")
             if prof.get("valid_status") == 1:
-                caps.append("verified")      # 一般新號為 0(未認證)，此處保險判斷
+                caps.append("verified")
+            if not prof.get("penalty_points"):   # 0 / None → 無違規點數
+                caps.append("clean")
         return caps
 
-    def register_via_api(self, role: str, n: int = 1) -> list[dict[str, Any]]:
+    def register_via_api(self, role: str, n: int = 1,
+                         caps: list[str] | None = None) -> list[dict[str, Any]]:
         """純 API 自助建 n 個 role 帳號入池。逐筆隔離，單筆失敗不中斷其餘。
 
+        caps＝**目標能力**，決定 API 端要做到哪一步（後台核准類 verified/shop_approved 仍由
+        service 的 auto_review 串接，這裡只負責 API 能造出的前置資料）：
+          · labor 含 'profile_complete' → 走完整資料送審（否則只補 demographics）
+          · employer 含 'verified_shop' → 店鋪以 validation_type=2 送審（否則統編 type=1）
         回 [{role, ok, phone?, account_id?, caps?, error?}, …]。
         """
         if role not in ("labor", "employer"):
             raise ValueError("role 只能 labor / employer")
+        want = set(caps or [])
         user_type = 2 if role == "labor" else 1
         base = "/labor" if role == "labor" else "/employer"
         out: list[dict[str, Any]] = []
@@ -413,10 +505,14 @@ class AccountPool:
                 shop_id = None
                 note = "api"
                 if role == "labor":
-                    self._complete_labor_demographics(c)
+                    if "profile_complete" in want:
+                        self._complete_labor_full_profile(c, phone)   # → is_profile_complete=1, 待認證
+                    else:
+                        self._complete_labor_demographics(c)
                 else:
-                    # employer 預設建一個店鋪並提交審核（純 API）；失敗不影響帳號入池
-                    shop_id, shop_note = self._provision_employer_shop(c, phone)
+                    # employer 建店鋪並送審（純 API）；verified_shop 目標 → validation_type=2。失敗不影響入池
+                    shop_id, shop_note = self._provision_employer_shop(
+                        c, phone, vtype2=("verified_shop" in want))
                     res["shop_id"] = shop_id
                     res["shop"] = shop_note
                     note = f"api;{shop_note}"
@@ -442,11 +538,14 @@ class AccountPool:
             if sm % 5 == 0 or (d[6] == 7 and (sm + 1) % 5 == 0):
                 return "".join(map(str, d))
 
-    def _provision_employer_shop(self, c: WorkyClient, phone: str) -> tuple[int | None, str]:
-        """employer 預設建店鋪 + 送審（純 API）。回 (shop_id, note)；任一步失敗回 (None, 失敗說明)。
+    def _provision_employer_shop(self, c: WorkyClient, phone: str,
+                                 vtype2: bool = False) -> tuple[int | None, str]:
+        """employer 建店鋪 + 送審（純 API）。回 (shop_id, note)；任一步失敗回 (None, 失敗說明)。
 
-        步驟：上傳 logo → /employer/shop/create → 上傳審核圖 → 產統編 → /employer/shop/validation/request
-        (is_draft=false 即送審)。verified_shop 仍需後台核准，本步只到「已送審」。
+        步驟：上傳 logo → /employer/shop/create → 上傳審核圖 → /employer/shop/validation/request
+        (is_draft=false 即送審)。仍需後台核准才得 shop_approved，本步只到「已送審」。
+        vtype2=True → validation_type=2（身分證號送審），對應 caps 的 **verified_shop**（探測以 type==2 認定）；
+        否則 validation_type=1（統一編號）。
         """
         try:
             opt = c.get("/employer/options").json().get("data") or {}
@@ -468,15 +567,17 @@ class AccountPool:
                 return None, f"shop_failed:{sc.get('message')}"
             shop_id = (sc.get("data") or {}).get("shop_id") or sc.get("shopId")
             vpic = self._upload_image(c, "shop_verify_image")
+            ident = ({"validation_type": 2, "id_number": self._gen_id_number("1289ABCD"),
+                      "tax_id_number": ""} if vtype2 else
+                     {"validation_type": 1, "tax_id_number": self._gen_tax_id(), "id_number": ""})
             sub = c.post("/employer/shop/validation/request", body={
                 "shop_id": shop_id, "verify_name": f"QA測試店鋪{suffix}",
                 "verify_city": city["id"], "verify_district": dist["id"], "verify_address": "測試路1號",
-                "tax_id_number": self._gen_tax_id(), "id_number": "", "validation_type": 1,
-                "is_draft": False, "verify_pic_1": vpic,
+                "is_draft": False, "verify_pic_1": vpic, **ident,
             }).json()
             if not sub.get("success"):
                 return shop_id, f"shop_submit_failed:{sub.get('message')}"
-            return shop_id, "shop_submitted"   # 已送審，待後台核准才得 verified_shop
+            return shop_id, ("shop_submitted_v2" if vtype2 else "shop_submitted")
         except Exception as e:  # noqa: BLE001
             return None, f"shop_error:{type(e).__name__}"
 
@@ -605,6 +706,9 @@ class AccountPool:
             caps, note = (existing.get("caps") or []), "missing_in_worky"
         else:
             caps, note = probed
+        # 保留 'api' 標記（api 自助註冊帳號）：否則重探會抹掉 → 下次 reload(note LIKE 'api%') 找不到
+        if str(existing.get("note") or "").strip().lower().startswith("api"):
+            note = "api" if not note else f"api;{note}"
         now = int(time.time())
         with self._qa_engine.begin() as conn:
             conn.execute(text(
@@ -655,6 +759,28 @@ class AccountPool:
                         account_id=uid, role="employer", user_type=1, phone=emp["phone"],
                         username=emp["username"], shop_id=emp["shop_id"], caps=caps, note=note))
 
+                # ── 既有 api 自助註冊帳號：同樣依工作庫實況重探 caps（種子以外，note 以 'api' 開頭）──
+                # 否則 register 當下標的 caps 永遠不會被「重載」修正（如 #1569 誤標 profile_complete）。
+                with self._qa_engine.connect() as qc:
+                    api_rows = qc.execute(text(
+                        "SELECT account_id, role, user_type, phone, username, shop_id FROM qa_accounts "
+                        "WHERE db_name=:db AND note LIKE 'api%'"), {"db": self.db}).all()
+                for r in api_rows:
+                    if r.role == "labor":
+                        probed = self._probe_labor_caps(wc, int(r.account_id))
+                    else:
+                        probed = self._probe_employer_caps(wc, int(r.account_id), r.shop_id)
+                    if probed is None:
+                        caps, pnote = ["active"], "missing_in_worky"
+                    else:
+                        caps, pnote = probed
+                    # 保留 'api' 前綴（下次重載仍認得；並附帶探測註記）
+                    note = "api" if not pnote else f"api;{pnote}"
+                    seeds.append(PooledAccount(
+                        account_id=int(r.account_id), role=r.role, user_type=r.user_type,
+                        phone=r.phone or "", username=r.username, shop_id=r.shop_id,
+                        caps=caps, note=note))
+
             with self._qa_engine.begin() as qc:
                 for a in seeds:
                     qc.execute(text("""
@@ -693,6 +819,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--min-available", type=int, default=3, help="topup 時每角色可用數低標（預設 3）")
     ap.add_argument("--role", choices=["labor", "employer"], default="labor", help="register 的角色")
     ap.add_argument("--n", type=int, default=1, help="register 要建立的帳號數")
+    ap.add_argument("--review", action="store_true",
+                    help="register 後順帶用後台管理員審核通過（帳密未設則跳過）")
     args = ap.parse_args(argv)
 
     pool = AccountPool(Settings.from_env())
@@ -704,11 +832,16 @@ def main(argv: list[str] | None = None) -> int:
         print(pool.top_up(min_available=args.min_available, heal=not args.no_heal))
     elif args.cmd == "register":
         results = pool.register_via_api(args.role, args.n)
+        if args.review:
+            # 審核串接點集中在看板 service（後台管理員 client + caps 重探）；CLI 借用同一邏輯
+            from .dashboard.service import DashboardService
+            DashboardService(pool.s).auto_review_registered(results)
         ok = sum(1 for r in results if r.get("ok"))
         print(f"[register] {args.role}：{ok}/{len(results)} 成功")
         for r in results:
             if r.get("ok"):
-                print(f"  ✓ #{r['account_id']} {r['phone']} caps={r['caps']}")
+                rev = f" review={r['review']}" if r.get("review") else ""
+                print(f"  ✓ #{r['account_id']} {r['phone']} caps={r['caps']}{rev}")
             else:
                 print(f"  ✗ {r.get('phone', '?')} 失敗：{r.get('error')}")
     for a in pool.list_all():

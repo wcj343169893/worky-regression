@@ -422,10 +422,19 @@ class Handler(BaseHTTPRequestHandler):
                 # 帳號池：純 API 自助建帳號入池（產 09 手機號 → 註冊 → 補資料）
                 role = (body or {}).get("role")
                 n = (body or {}).get("n", 1)
+                # caps＝目標能力（指定時依此決定步驟與是否核准）；auto_review 僅在未指定 caps 時生效
+                caps = (body or {}).get("caps")
+                caps = [str(x) for x in caps] if isinstance(caps, list) and caps else None
+                auto_review = bool((body or {}).get("auto_review", True))
                 if not role:
                     self._send_json({"error": "缺少 role"}, 400)
                 else:
-                    self._send_json(_service().register_accounts(str(role), int(n)))
+                    self._send_json(_service().register_accounts(
+                        str(role), int(n), caps=caps, auto_review=auto_review))
+            elif path == "/api/accounts/init":
+                # 全清重建帳號池：按能力分群各建 per_cap 個（耗時較長，同步）
+                per_cap = (body or {}).get("per_cap", 3)
+                self._send_json(_service().init_pool(per_cap=int(per_cap)))
             # ── 頁面標記（mark up）──
             elif path == "/api/markups":
                 self._send_json(self._create_markup(body or {}))
