@@ -335,7 +335,7 @@ function renderCaseRows(key, items) {
           `<span class="tchip clickable ${tchipCls(tss[i])}" data-cid="${esc(c.id)}" data-ti="${i}" title="點擊看詳情">${esc(x.split("_")[0])}</span>`).join("")}</div>`
       : `<span class="sub2">db / 混合</span>`;
     // 失敗時把第一個失敗步驟的錯誤掛在 title——滑過徽章即可看到原因，不必下鑽
-    const lrHtml = lr ? `<span${lr.error ? ` title="${esc(lr.error)}"` : ""}>${resBadge(lr.status)}</span> <span class="sub2">${lr.passed}/${lr.total} · ${fmtTs(lr.started_at)}</span>`
+    const lrHtml = lr ? `<span${lr.error ? ` title="${esc(lr.error)}"` : ""}>${resBadge(lr.status)}</span>`
       : `<span class="sub2">—</span>`;
     return `<tr>
       <td><div class="cid">${c.seq != null ? `<span class="seq">#${c.seq}</span>` : ""}<code>${esc(c.id)}</code></div><div class="sub2">${esc((c.description || "").slice(0, 50))}</div></td>
@@ -427,7 +427,7 @@ function updateLastResultCell(row, e, startedAt) {
   const act = row.querySelector("td.act");
   const cell = act && act.previousElementSibling;
   if (!cell) return;
-  cell.innerHTML = `${resBadge(e.status)} <span class="sub2">${e.passed}/${e.total} · ${fmtTs(startedAt)}</span>`;
+  cell.innerHTML = resBadge(e.status);
 }
 
 // run_end 後開抽屜顯示完整步驟結果：直接抓該用例最新 steps（剛落地）渲染，與重試/換號收尾一致
@@ -514,6 +514,7 @@ function stepModalHtml(s, idx, total, runId) {
       <h4>失敗處理（AI 協助）</h4>
       <div class="sm-act-row">
         <button class="btn" id="sm-analyze">🔍 分析</button>
+        <button class="btn" id="sm-feedback">💬 意見反饋</button>
         <button class="btn" id="sm-retry">↻ 重試</button>
         <button class="btn" id="sm-swap">⇄ 換一個號</button>
       </div>
@@ -546,6 +547,50 @@ function showStep(key, cid, data, idx) {
   if (rBtn) rBtn.onclick = () => rerunStep(key, cid, idx, "/api/cases/run", { id: cid }, "重試");
   const sBtn = $("sm-swap");
   if (sBtn) sBtn.onclick = () => rerunStep(key, cid, idx, "/api/cases/swap-account", { id: cid, step_index: idx }, "換號");
+  // 意見反饋：輸入框 → 發送 → 帶用例關鍵信息建一條 feedback 標記，交後台 worker 自動修復流程
+  const fBtn = $("sm-feedback");
+  if (fBtn) fBtn.onclick = () => openFeedbackForm(cid, data, idx);
+}
+
+// 意見反饋：在 sm-fix 區展開輸入框；發送時把「用例關鍵信息 + 用戶意見」組成 content，
+// 建一條 kind=feedback 的標記（POST /api/markups），後台 markup worker 會以
+// 「修復測試流程」視角自動處理（改用例 YAML / endpoints 規格 / 框架代碼）。
+function openFeedbackForm(cid, data, idx) {
+  const fix = $("sm-fix");
+  if (!fix) return;
+  fix.innerHTML = `
+    <textarea id="sm-fb-text" rows="3" placeholder="描述這次失敗的問題或修復建議（將連同用例關鍵信息一併送出）…"></textarea>
+    <div class="sm-act-row" style="margin-top:8px">
+      <button class="btn primary" id="sm-fb-send">發送</button>
+      <button class="btn ghost" id="sm-fb-cancel">取消</button>
+    </div>`;
+  const ta = $("sm-fb-text"); ta?.focus();
+  $("sm-fb-cancel").onclick = () => { fix.innerHTML = ""; };
+  $("sm-fb-send").onclick = async () => {
+    const text = (ta.value || "").trim();
+    if (!text) { toast("請先填寫反饋內容"); ta.focus(); return; }
+    const s = data.steps[idx] || {}, r = s.result || {};
+    const content = [
+      "【用例執行失敗 — 意見反饋】",
+      `用例：${cid}`,
+      `失敗步驟：[${idx + 1}/${data.steps.length}] ${s.name || s.short || ""}`,
+      s.endpoint ? `端點：${s.method || ""} ${s.endpoint}` : "",
+      data.run_id ? `run_id：${data.run_id}` : "",
+      r.error ? `錯誤：${r.error}` : "",
+      "",
+      "── 用戶意見 ──",
+      text,
+    ].filter((x) => x !== "").join("\n");
+    const btn = $("sm-fb-send"); btn.disabled = true; btn.textContent = "發送中…";
+    try {
+      await apiPost("/api/markups", { kind: "feedback", route: "cases", content });
+      fix.innerHTML = `<div class="sub2">✓ 反饋已送出，後台 worker 會根據意見自動修復流程（可在「標記」頁追蹤進度）</div>`;
+      toast("意見反饋已送出");
+    } catch (e) {
+      toast("發送失敗：" + e.message);
+      btn.disabled = false; btn.textContent = "發送";
+    }
+  };
 }
 
 // AI 診斷結果渲染：根因 + 推理 + 建議 + 建議動作標籤（純顯示，不自動觸發）

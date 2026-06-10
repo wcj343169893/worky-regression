@@ -138,18 +138,18 @@ class QAStore:
     # ── 頁面標記（qa_markups）─────────────────────────────────────────────────
     def insert_markup(self, *, route: str, selector: str | None, element_text: str | None,
                       rect: dict | None, content: str, screenshot_path: str | None,
-                      created_at: int) -> int:
-        """新增一筆待處理標記，回傳自增 id。"""
+                      created_at: int, kind: str = "page", ip: str | None = None) -> int:
+        """新增一筆待處理標記，回傳自增 id。kind：page / feedback / global。"""
         sql = text("""
             INSERT INTO qa_markups
-              (route, selector, element_text, rect, content, screenshot_path, status, created_at)
-            VALUES (:route, :selector, :element_text, :rect, :content, :shot, 'pending', :ts)
+              (kind, route, selector, element_text, rect, content, screenshot_path, status, created_at, ip)
+            VALUES (:kind, :route, :selector, :element_text, :rect, :content, :shot, 'pending', :ts, :ip)
         """)
         with self._engine.begin() as conn:
             res = conn.execute(sql, {
-                "route": route, "selector": selector, "element_text": element_text,
+                "kind": kind, "route": route, "selector": selector, "element_text": element_text,
                 "rect": json.dumps(rect, ensure_ascii=False) if rect is not None else None,
-                "content": content, "shot": screenshot_path, "ts": created_at})
+                "content": content, "shot": screenshot_path, "ts": created_at, "ip": ip})
             return int(res.lastrowid)
 
     @staticmethod
@@ -170,8 +170,9 @@ class QAStore:
         """列標記（新到舊）；status 精確過濾、q 模糊搜尋；支援分頁 offset。rect 解回 dict。"""
         where, params = self._markup_filters(status, q)
         sql = text(f"""
-            SELECT id, route, selector, element_text, rect, content, screenshot_path,
-                   status, resolved, result, replies, created_at, updated_at
+            SELECT id, kind, route, selector, element_text, rect, content, screenshot_path,
+                   status, resolved, result, replies, created_at, updated_at,
+                   ip, elapsed_ms, files_changed, commit_sha, rolled_back
             FROM qa_markups {where}
             ORDER BY id DESC LIMIT :lim OFFSET :off
         """)
@@ -183,6 +184,7 @@ class QAStore:
             d = dict(r._mapping)
             d["rect"] = _json_or(d.get("rect"), None)
             d["replies"] = _json_or(d.get("replies"), []) or []
+            d["files_changed"] = _json_or(d.get("files_changed"), []) or []
             out.append(d)
         return out
 
@@ -200,7 +202,13 @@ class QAStore:
                 return d
         with self._engine.connect() as conn:
             r = conn.execute(text("SELECT * FROM qa_markups WHERE id=:i"), {"i": markup_id}).first()
-        return dict(r._mapping) if r else None
+        if not r:
+            return None
+        d = dict(r._mapping)
+        d["rect"] = _json_or(d.get("rect"), None)
+        d["replies"] = _json_or(d.get("replies"), []) or []
+        d["files_changed"] = _json_or(d.get("files_changed"), []) or []
+        return d
 
     def claim_pending_markup(self) -> dict | None:
         """原子領取最舊一筆 pending 標記，標記為 processing 後回傳；無則回 None。
@@ -220,19 +228,36 @@ class QAStore:
             if not updated:
                 return None  # 被別的 worker 搶先
             r = conn.execute(text(
-                "SELECT id, route, selector, element_text, rect, content, screenshot_path, "
+                "SELECT id, kind, route, selector, element_text, rect, content, screenshot_path, "
                 "status, result, replies, created_at FROM qa_markups WHERE id=:i"), {"i": mid}).first()
         d = dict(r._mapping)
         d["rect"] = _json_or(d.get("rect"), None)
         d["replies"] = _json_or(d.get("replies"), []) or []
         return d
 
-    def finish_markup(self, markup_id: int, *, status: str, result: str | None) -> None:
-        """worker 處理完回寫狀態與摘要（status = done | failed）。"""
+    def finish_markup(self, markup_id: int, *, status: str, result: str | None,
+                      elapsed_ms: int = 0, files_changed: list | None = None) -> None:
+        """worker 處理完回寫狀態與摘要（status = done | failed）+ 耗時 + 動到的檔案。"""
         with self._engine.begin() as conn:
             conn.execute(text(
-                "UPDATE qa_markups SET status=:s, result=:r WHERE id=:i"
-            ), {"s": status, "r": result, "i": markup_id})
+                "UPDATE qa_markups SET status=:s, result=:r, elapsed_ms=:ms, files_changed=:fc "
+                "WHERE id=:i"
+            ), {"s": status, "r": result, "ms": int(elapsed_ms),
+                "fc": json.dumps(files_changed or [], ensure_ascii=False), "i": markup_id})
+
+    def set_markup_commit(self, markup_id: int, sha: str) -> None:
+        """記錄「已解決」時提交的 commit sha（回滾時 git revert 用）。"""
+        with self._engine.begin() as conn:
+            conn.execute(text(
+                "UPDATE qa_markups SET commit_sha=:sha WHERE id=:i"), {"sha": sha, "i": markup_id})
+
+    def set_markup_rolled_back(self, markup_id: int, note: str) -> None:
+        """標記已回滾：rolled_back=1、resolved 清回 0，並把回滾說明附到 result 尾。"""
+        with self._engine.begin() as conn:
+            conn.execute(text(
+                "UPDATE qa_markups SET rolled_back=1, resolved=0, "
+                "result=CONCAT(COALESCE(result,''), :note) WHERE id=:i"
+            ), {"note": f"\n\n── 回滾記錄 ──\n{note}", "i": markup_id})
 
     def reply_markup(self, markup_id: int, reply: str, *, at: int) -> bool:
         """追加一則使用者回覆並把 status 打回 pending，讓 worker 帶脈絡再次優化。

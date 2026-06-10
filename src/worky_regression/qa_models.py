@@ -173,12 +173,17 @@ class QAMarkup(Base):
     __tablename__ = "qa_markups"
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    # 標記類型：page=頁面元素標記（預設）；feedback=用例執行失敗的意見反饋（content 內含用例
+    # 關鍵信息，worker 以「修復測試流程」視角處理）；global=系統全局修改指令（無頁面定位）。
+    kind: Mapped[str] = mapped_column(String(16), nullable=False, server_default="page")
     route: Mapped[str] = mapped_column(String(64), nullable=False, server_default="")   # 雜湊路由，如 jobs/cases
     selector: Mapped[str | None] = mapped_column(Text)            # 被選元素的 CSS 選擇器路徑
     element_text: Mapped[str | None] = mapped_column(Text)        # 被選元素的可見文字（截斷）
     rect: Mapped[dict | None] = mapped_column(JSON)               # {x,y,w,h,vw,vh,scrollX,scrollY}
     content: Mapped[str] = mapped_column(Text, nullable=False)    # 使用者填寫的標記內容
     screenshot_path: Mapped[str | None] = mapped_column(String(255))  # 截圖相對路徑（results/markups/*.png）
+    ip: Mapped[str | None] = mapped_column(String(64))            # 建立者來源 IP（X-Forwarded-For 優先）
+    elapsed_ms: Mapped[int] = mapped_column(BigInteger, nullable=False, server_default="0")  # worker 處理耗時
     status: Mapped[str] = mapped_column(String(16), nullable=False, server_default="pending")  # pending|processing|done|failed
     # 使用者「已解決」開關（獨立於 worker 處理狀態 status）：1=已解決 → 源頁面不再畫框；
     # 取消解決（改回 0）源頁面重新顯示。純前端可視化的隱藏/顯示，不影響 worker 處理。
@@ -187,6 +192,12 @@ class QAMarkup(Base):
     # 使用者對處理結果的追加回覆串 [{text,at}]；送出回覆會把 status 打回 pending，worker 帶著
     # 「上次 result + 回覆串」重新處理（針對同一問題再次優化）。
     replies: Mapped[list | None] = mapped_column(JSON)
+    # ── 修改追蹤（提交 / 回滾）──
+    # worker 處理本標記時實際動到的檔案（git status 前後差集）；「已解決」時據此提交，
+    # 「回滾」時據此撤銷（未提交→還原工作區檔案；已提交→git revert）。
+    files_changed: Mapped[list | None] = mapped_column(JSON)
+    commit_sha: Mapped[str | None] = mapped_column(String(64))    # 已解決時提交的 commit（回滾用）
+    rolled_back: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")  # 1=已回滾
     created_at: Mapped[int] = mapped_column(BigInteger, nullable=False, server_default="0")
     updated_at: Mapped[datetime] = mapped_column(
         server_default=func.current_timestamp(), onupdate=func.current_timestamp())

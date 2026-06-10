@@ -273,11 +273,24 @@ class Handler(BaseHTTPRequestHandler):
                 except (BrokenPipeError, ConnectionResetError):
                     pass
 
+    def _client_ip(self) -> str:
+        """建立者來源 IP：經邊緣代理時取 X-Forwarded-For 第一跳，否則用 socket 對端。"""
+        fwd = self.headers.get("X-Forwarded-For", "")
+        if fwd:
+            return fwd.split(",")[0].strip()[:64]
+        return str(self.client_address[0])[:64]
+
     def _create_markup(self, body: dict) -> dict:
-        """落地一筆標記：截圖 dataURL 解碼存檔，其餘欄位入庫。"""
+        """落地一筆標記：截圖 dataURL 解碼存檔，其餘欄位入庫。
+
+        kind：page=頁面元素標記（預設）；feedback=用例失敗意見反饋；global=系統全局修改指令。
+        """
         content = str(body.get("content", "")).strip()
         if not content:
             return {"error": "缺少標記內容 content"}
+        kind = str(body.get("kind", "page"))
+        if kind not in ("page", "feedback", "global"):
+            kind = "page"
         shot_rel = self._save_markup_shot(body.get("screenshot"))
         ts = int(time.time())
         mid = _cases().qa.insert_markup(
@@ -287,8 +300,44 @@ class Handler(BaseHTTPRequestHandler):
             rect=body.get("rect") if isinstance(body.get("rect"), dict) else None,
             content=content[:8000],
             screenshot_path=shot_rel,
-            created_at=ts)
+            created_at=ts, kind=kind, ip=self._client_ip())
         return {"ok": True, "id": mid}
+
+    @staticmethod
+    def _commit_markup_changes(mid: int) -> dict:
+        """「已解決」時把該標記動到的檔案提交成獨立 commit；無變動/失敗不擋解決，回警告。"""
+        from . import gitops
+        m = _cases().qa.get_markup(mid) or {}
+        files = m.get("files_changed") or []
+        if m.get("commit_sha") or m.get("rolled_back") or not files:
+            return {}
+        # 只提交「目前仍有變動」的檔案——之後的標記可能又動過同檔，已被提交/還原者跳過
+        pending = [f for f in files if f in gitops.dirty_files()]
+        if not pending:
+            return {"commit_warning": "該標記記錄的檔案目前無未提交變動（可能已被提交或還原）"}
+        try:
+            sha = gitops.commit_markup(mid, pending, (m.get("content") or "").replace("\n", " "))
+            _cases().qa.set_markup_commit(mid, sha)
+            return {"commit_sha": sha, "committed_files": pending}
+        except Exception as e:  # noqa: BLE001 — 提交失敗不擋「已解決」，但要讓使用者知道
+            return {"commit_warning": f"提交失敗：{e}"}
+
+    @staticmethod
+    def _rollback_markup(mid: int) -> dict:
+        """回滾某標記的修改（revert 已提交 / 還原未提交），並回寫 rolled_back 標記。"""
+        from . import gitops
+        m = _cases().qa.get_markup(mid)
+        if not m:
+            return {"error": f"找不到標記 #{mid}"}
+        if m.get("rolled_back"):
+            return {"error": "此標記已回滾過"}
+        try:
+            note = gitops.rollback_markup(
+                commit_sha=m.get("commit_sha"), files=m.get("files_changed") or [])
+        except Exception as e:  # noqa: BLE001
+            return {"error": str(e)}
+        _cases().qa.set_markup_rolled_back(mid, note)
+        return {"ok": True, "id": mid, "note": note}
 
     @staticmethod
     def _save_markup_shot(data_url) -> str | None:
@@ -455,15 +504,26 @@ class Handler(BaseHTTPRequestHandler):
                 else:
                     self._send_json({"error": f"找不到標記 #{mid}"}, 404)
             elif path == "/api/markups/resolve":
-                # 已解決開關：resolved=1 → 源頁面不再畫框；0 → 重新顯示（純可視化，不動 status）
+                # 已解決開關：resolved=1 → 源頁面不再畫框 + 把 worker 動到的檔案提交成
+                # 獨立 commit（sha 回寫，供回滾 revert）；0 → 重新顯示（不撤 commit，回滾另有按鈕）
                 mid = _review_id(body)
                 resolved = bool((body or {}).get("resolved", True))
                 if mid is None:
                     self._send_json({"error": "缺少 id"}, 400)
                 elif _cases().qa.set_markup_resolved(mid, resolved):
-                    self._send_json({"ok": True, "id": mid, "resolved": resolved})
+                    out = {"ok": True, "id": mid, "resolved": resolved}
+                    if resolved:
+                        out.update(self._commit_markup_changes(mid))
+                    self._send_json(out)
                 else:
                     self._send_json({"error": f"找不到標記 #{mid}"}, 404)
+            elif path == "/api/markups/rollback":
+                # 撤銷某標記的代碼修改：已提交 → git revert；未提交 → 還原工作區檔案
+                mid = _review_id(body)
+                if mid is None:
+                    self._send_json({"error": "缺少 id"}, 400)
+                else:
+                    self._send_json(self._rollback_markup(mid))
             elif path == "/api/labors/review":
                 rid = _review_id(body)
                 if rid is None:

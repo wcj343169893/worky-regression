@@ -198,7 +198,8 @@ textarea:focus{outline:none;border-color:var(--accent)}
 .modal-body{padding:20px 22px 26px;overflow:auto}
 @keyframes fade{from{opacity:0}to{opacity:1}}
 .sm-head{border-bottom:1px solid var(--line);padding-bottom:12px;margin-bottom:4px}
-.sm-nav{display:flex;align-items:center;gap:12px;margin-bottom:10px}
+/* 右側留出 modal 關閉鈕（絕對定位 top:12 right:14）的寬度，避免「下一步」被 ✕ 壓住 */
+.sm-nav{display:flex;align-items:center;gap:12px;margin-bottom:10px;padding-right:48px}
 .sm-nav .sub2{margin-left:auto;margin-right:auto}
 .step-modal .sec code{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px;color:var(--accent)}
 /* 失敗步驟的「分析 / 重試 / 換一個號」工具列 + AI 診斷面板 */
@@ -318,6 +319,7 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
   padding:13px 16px;border-bottom:1px solid var(--line);flex-wrap:wrap}
 .panel-head h3{margin:0;font-size:15px}
 .panel-head .filters input[type=search]{min-width:170px}
+.mq-tools{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
 /* 帳號池「註冊入池」控制：靠右，數字框 + 按鈕 */
 .acc-reg{margin-left:auto;display:flex;align-items:center;gap:8px}
 .acc-reg input[type=number]{min-width:64px;width:72px}

@@ -28,9 +28,14 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
+import json
 import subprocess
 import sys
+import threading
 import time
+import urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 # 讓 `python scripts/markup_worker.py` 直接可 import 套件
@@ -39,30 +44,78 @@ sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 from worky_regression.config import Settings          # noqa: E402
 from worky_regression.qa_store import QAStore          # noqa: E402
+from worky_regression.dashboard import gitops          # noqa: E402
 
 CLAUDE_BIN = "claude"
 DEFAULT_TIMEOUT = 1800  # 單筆標記給 Claude 的上限（秒）
+LOCK_FILE = PROJECT_ROOT / "logs" / "markup_worker.lock"
+DASHBOARD_URL = "http://127.0.0.1:8765"
+FIX_PORT = 8766         # 緊急修復入口（獨立於看板，看板掛了也能呼叫）
+
+
+def acquire_singleton_lock():
+    """單例鎖：flock 不阻塞搶占；搶不到表示已有 worker 在跑（防代碼交叉修改），直接退出。
+
+    回傳鎖檔 handle（須保持開啟，行程結束自動釋放）。
+    """
+    LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
+    fh = open(LOCK_FILE, "w")  # noqa: SIM115 — handle 要活到行程結束
+    try:
+        fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        print("[markup-worker] 已有另一個 markup_worker 在跑（單例鎖被持有），本實例退出。")
+        raise SystemExit(1)
+    fh.write(f"{time.time()}\n")
+    fh.flush()
+    return fh
 
 
 def build_prompt(m: dict) -> str:
-    """把一筆標記組成給 Claude 的指令。位置資訊讓它能定位到看板的哪個頁/元素。"""
-    rect = m.get("rect") or {}
-    lines = [
-        "你正在維護「worky-regression」測試看板（純 stdlib HTTP server + 原生 JS 前端，",
-        "前端在 src/worky_regression/dashboard/static/，後端在 src/worky_regression/dashboard/）。",
-        "一位使用者在看板頁面上用「標記(mark up)」功能圈了一個元素並留下需求，請依需求動手處理。",
-        "",
-        "── 標記內容（使用者需求）──",
-        (m.get("content") or "").strip(),
-        "",
-        "── 元素定位資訊 ──",
-        f"頁面路由(hash)：#{m.get('route') or ''}",
-        f"CSS 選擇器：{m.get('selector') or '(無)'}",
-        f"元素可見文字：{(m.get('element_text') or '(無)')[:300]}",
-        f"元素位置(px)：x={rect.get('x')} y={rect.get('y')} w={rect.get('w')} h={rect.get('h')} "
-        f"視窗={rect.get('vw')}x{rect.get('vh')}",
-    ]
-    if m.get("screenshot_path"):
+    """把一筆標記組成給 Claude 的指令。依 kind 給不同視角：
+
+    page（預設）—— 看板頁面元素標記：位置資訊讓它定位到哪個頁/元素，改看板前後端。
+    feedback —— 用例執行失敗的意見反饋：content 內含用例關鍵信息，以「修復測試流程」
+                視角處理（可改 cases/ YAML、cases/_specs/endpoints.yaml、框架代碼）。
+    global —— 系統全局修改指令：無頁面定位，對本倉整體生效。
+    """
+    kind = m.get("kind") or "page"
+    if kind == "feedback":
+        lines = [
+            "你正在維護「worky-regression」迴歸測試框架（用例 YAML 在 cases/，端點規格在",
+            "cases/_specs/endpoints.yaml，框架代碼在 src/worky_regression/）。",
+            "一位使用者對「某條測試用例的執行失敗」提交了意見反饋，內含用例關鍵信息與失敗現場。",
+            "請依反饋修復測試流程：常見手段是修正用例 YAML（步驟/expect/guard）、校正 endpoints.yaml",
+            "規格、或修框架選號/執行邏輯。注意：被測主倉 worky 的 bug 不要修，在結論中說明回報即可。",
+            "",
+            "── 意見反饋（含用例關鍵信息）──",
+            (m.get("content") or "").strip(),
+        ]
+    elif kind == "global":
+        lines = [
+            "你正在維護「worky-regression」測試看板與迴歸框架（本倉根目錄）。",
+            "一位使用者提交了「系統全局修改指令」（不針對特定頁面元素），請依指令對本倉動手處理。",
+            "",
+            "── 全局修改指令 ──",
+            (m.get("content") or "").strip(),
+        ]
+    else:
+        rect = m.get("rect") or {}
+        lines = [
+            "你正在維護「worky-regression」測試看板（純 stdlib HTTP server + 原生 JS 前端，",
+            "前端在 src/worky_regression/dashboard/static/，後端在 src/worky_regression/dashboard/）。",
+            "一位使用者在看板頁面上用「標記(mark up)」功能圈了一個元素並留下需求，請依需求動手處理。",
+            "",
+            "── 標記內容（使用者需求）──",
+            (m.get("content") or "").strip(),
+            "",
+            "── 元素定位資訊 ──",
+            f"頁面路由(hash)：#{m.get('route') or ''}",
+            f"CSS 選擇器：{m.get('selector') or '(無)'}",
+            f"元素可見文字：{(m.get('element_text') or '(無)')[:300]}",
+            f"元素位置(px)：x={rect.get('x')} y={rect.get('y')} w={rect.get('w')} h={rect.get('h')} "
+            f"視窗={rect.get('vw')}x{rect.get('vh')}",
+        ]
+    if kind == "page" and m.get("screenshot_path"):
         lines += ["", f"當下截圖：{m['screenshot_path']}（相對本倉根，PNG）。如需視覺脈絡可讀取它。"]
     # 這是「再次優化」：曾處理過、使用者看了結果後追加回覆 → 帶上次結果 + 回覆串讓它迭代。
     replies = m.get("replies") or []
@@ -104,16 +157,136 @@ def run_claude(prompt: str, *, skip_permissions: bool, timeout: int) -> tuple[bo
 
 
 def process_one(qa: QAStore, *, skip_permissions: bool, timeout: int) -> bool:
-    """領取並處理一筆 pending 標記；無待處理回 False。"""
+    """領取並處理一筆 pending 標記；無待處理回 False。
+
+    處理前後各拍一次 git 髒檔快照，差集＝本標記實際動到的檔案（files_changed），
+    供「已解決→提交」「回滾」精準定位；同時記錄處理耗時 elapsed_ms。
+    """
     m = qa.claim_pending_markup()
     if not m:
         return False
     mid = m["id"]
-    print(f"[markup-worker] 領取 #{mid}（#{m.get('route')}）：{(m.get('content') or '')[:60]}")
+    print(f"[markup-worker] 領取 #{mid}（{m.get('kind') or 'page'}/#{m.get('route')}）："
+          f"{(m.get('content') or '')[:60]}")
+    before = gitops.dirty_files()
+    t0 = time.monotonic()
     ok, output = run_claude(build_prompt(m), skip_permissions=skip_permissions, timeout=timeout)
-    qa.finish_markup(mid, status="done" if ok else "failed", result=output[:60000])
-    print(f"[markup-worker] #{mid} → {'done' if ok else 'failed'}")
+    elapsed_ms = int((time.monotonic() - t0) * 1000)
+    changed = sorted(gitops.dirty_files() - before)
+    qa.finish_markup(mid, status="done" if ok else "failed", result=output[:60000],
+                     elapsed_ms=elapsed_ms, files_changed=changed)
+    print(f"[markup-worker] #{mid} → {'done' if ok else 'failed'}（{elapsed_ms}ms，"
+          f"改檔 {len(changed)} 個）")
+    # 改了檔就巡檢一次看板健康（worker 改壞看板代碼要及時發現並修復）
+    if changed:
+        ensure_dashboard_healthy(auto_heal=True)
     return True
+
+
+# ── 看板健康巡檢與緊急修復 ───────────────────────────────────────────────────
+def dashboard_alive(timeout: float = 5.0) -> bool:
+    try:
+        with urllib.request.urlopen(f"{DASHBOARD_URL}/api/stats", timeout=timeout) as resp:
+            return resp.status == 200
+    except Exception:  # noqa: BLE001 — 連不上/非200 都視為不健康
+        return False
+
+
+def restart_dashboard() -> None:
+    """重啟看板：殺舊進程（精確匹配模組名）→ nohup 重新拉起 → 等待端口就緒。"""
+    subprocess.run(["pkill", "-f", "worky_regression[.]dashboard"], check=False)
+    time.sleep(1)
+    subprocess.Popen(
+        "nohup .venv/bin/python -u -m worky_regression.dashboard --host 0.0.0.0 --port 8765 "
+        ">> logs/dashboard.log 2>&1 &",
+        shell=True, cwd=str(PROJECT_ROOT))
+    for _ in range(15):
+        time.sleep(1)
+        if dashboard_alive(2):
+            return
+
+
+def ensure_dashboard_healthy(auto_heal: bool = False) -> dict:
+    """檢測看板是否正常；不正常且 auto_heal 時逐級修復，回傳各步驟記錄。
+
+    修復階梯（每步後重測，好了就停）：
+      ① 重啟看板（代碼可能改了但沒生效 / 進程死了）
+      ② git stash 未提交變動（worker 改壞了還沒提交的代碼；stash 可救回不丟工作）再重啟
+      ③ revert 最近一筆 fix(markup#…) commit（已提交的壞修改）再重啟
+    """
+    steps: list[str] = []
+    if dashboard_alive():
+        return {"healthy": True, "steps": ["服務正常"]}
+    steps.append("健康檢查失敗")
+    if not auto_heal:
+        return {"healthy": False, "steps": steps}
+
+    restart_dashboard()
+    steps.append("① 已重啟看板")
+    if dashboard_alive():
+        return {"healthy": True, "steps": steps}
+
+    r = subprocess.run(["git", "stash", "push", "-u", "-m", "emergency-fix 自動暫存"],
+                       cwd=str(PROJECT_ROOT), capture_output=True, text=True)
+    steps.append(f"② git stash 未提交變動：{(r.stdout or r.stderr).strip()[:120]}")
+    restart_dashboard()
+    steps.append("② 已重啟看板")
+    if dashboard_alive():
+        return {"healthy": True, "steps": steps}
+
+    log = subprocess.run(["git", "log", "-5", "--pretty=%H %s"], cwd=str(PROJECT_ROOT),
+                         capture_output=True, text=True).stdout
+    target = next((ln.split()[0] for ln in log.splitlines() if "fix(markup#" in ln), None)
+    if target:
+        r = subprocess.run(["git", "revert", "--no-edit", target], cwd=str(PROJECT_ROOT),
+                           capture_output=True, text=True)
+        if r.returncode != 0:
+            subprocess.run(["git", "revert", "--abort"], cwd=str(PROJECT_ROOT), check=False)
+            steps.append(f"③ revert {target[:10]} 衝突，已中止")
+        else:
+            steps.append(f"③ 已 revert 最近的標記 commit {target[:10]}")
+            restart_dashboard()
+            steps.append("③ 已重啟看板")
+            if dashboard_alive():
+                return {"healthy": True, "steps": steps}
+    else:
+        steps.append("③ 找不到 fix(markup#…) commit 可 revert")
+    steps.append("✗ 自動修復未能恢復服務，需人工介入")
+    return {"healthy": False, "steps": steps}
+
+
+class _FixHandler(BaseHTTPRequestHandler):
+    """緊急修復入口（GET /fix 觸發檢測+修復；GET /health 只檢測）。
+
+    跑在 worker 行程內、與看板完全解耦——看板代碼被改壞起不來時，這個入口仍然可用。
+    """
+
+    def do_GET(self):  # noqa: N802
+        if self.path.split("?")[0] not in ("/fix", "/health"):
+            self.send_response(404); self.end_headers()
+            return
+        result = ensure_dashboard_healthy(auto_heal=self.path.startswith("/fix"))
+        body = json.dumps(result, ensure_ascii=False, indent=1).encode("utf-8")
+        self.send_response(200 if result.get("healthy") else 503)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+        print(f"[markup-worker] 緊急修復入口 {self.path} → {result}")
+
+    def log_message(self, *_):  # 安靜，避免刷爆 worker log
+        pass
+
+
+def start_fix_server() -> None:
+    """背景執行緒起緊急修復 HTTP 入口（0.0.0.0:8766）。端口被占（如另一實例殘留）則略過。"""
+    try:
+        srv = ThreadingHTTPServer(("0.0.0.0", FIX_PORT), _FixHandler)
+    except OSError as e:
+        print(f"[markup-worker] 緊急修復入口端口 {FIX_PORT} 不可用，略過：{e}")
+        return
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    print(f"[markup-worker] 緊急修復入口：GET http://<host>:{FIX_PORT}/fix（/health 只檢測）")
 
 
 def main() -> int:
@@ -126,12 +299,16 @@ def main() -> int:
     ap.set_defaults(skip=True)
     args = ap.parse_args()
 
+    _lock = acquire_singleton_lock()  # noqa: F841 — handle 須存活到行程結束（持鎖）
+
     settings = Settings.from_env()
     qa = QAStore(settings)
     qa.migrate()  # 確保 qa_markups 等表存在
 
-    print(f"[markup-worker] 啟動。QA DB={settings.qa_db_name}@{settings.db_host} "
+    print(f"[markup-worker] 啟動（單例鎖已持有）。QA DB={settings.qa_db_name}@{settings.db_host} "
           f"skip_permissions={args.skip} interval={args.interval}s")
+    if not args.once:
+        start_fix_server()
     if args.once:
         did = process_one(qa, skip_permissions=args.skip, timeout=args.timeout)
         if not did:

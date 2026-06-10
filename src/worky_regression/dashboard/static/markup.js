@@ -181,6 +181,9 @@ function openMarkupForm(info, shot) {
 
 // ── 標記管理頁（nav: 標記）──────────────────────────────────────────────────
 const ST_LABEL = { pending: "待處理", processing: "處理中", done: "已完成", failed: "失敗" };
+const KIND_LABEL = { feedback: "意見反饋", global: "全局指令" };   // page（預設）不顯示標籤
+const fmtMs = (ms) => !ms ? "" : ms >= 60000 ? `${Math.round(ms / 60000)}m${Math.round((ms % 60000) / 1000)}s`
+  : ms >= 1000 ? `${(ms / 1000).toFixed(1)}s` : `${ms}ms`;
 // 狀態篩選 tab（"" = 全部）+ 分頁。管理頁是「分頁查詢」：和 overlay/輪詢用的全量抓取分開，
 // 後者仍需所有標記才能在各頁畫框；前者只取當前頁切片，附 status / q 條件。
 const MARKUP_STATUSES = [["", "全部"], ["pending", "待處理"], ["processing", "處理中"], ["done", "已完成"], ["failed", "失敗"]];
@@ -190,6 +193,8 @@ let mqTotal = 0;                            // 最近一次查詢的符合總筆
 
 function markupCardHtml(m) {
   const resolved = !!m.resolved;
+  // 回滾：worker 有記錄改檔（或已解決時提交了 commit）且尚未回滾過，才可撤銷
+  const canRollback = !m.rolled_back && ((m.files_changed && m.files_changed.length) || m.commit_sha);
   return `
       <div class="markup-card${resolved ? " is-resolved" : ""}" data-id="${m.id}">
         <div class="markup-card-shot">${m.screenshot_path
@@ -198,12 +203,18 @@ function markupCardHtml(m) {
         <div class="markup-card-body">
           <div class="markup-card-top">
             <span class="badge b-${m.status}">${ST_LABEL[m.status] || m.status}</span>
+            ${KIND_LABEL[m.kind] ? `<span class="pill">${KIND_LABEL[m.kind]}</span>` : ""}
             <code>#${esc(m.route)}</code>
             <span class="sub2">${fmtTs(m.created_at)}</span>
+            ${m.ip ? `<span class="sub2">IP ${esc(m.ip)}</span>` : ""}
+            ${m.elapsed_ms ? `<span class="sub2">耗時 ${fmtMs(m.elapsed_ms)}</span>` : ""}
             ${resolved ? `<span class="pill pill-ok">已解決（源頁不顯示）</span>` : ""}
+            ${m.rolled_back ? `<span class="pill">已回滾</span>` : ""}
+            ${m.commit_sha ? `<code class="sub2" title="已解決時提交的 commit">${esc(m.commit_sha.slice(0, 10))}</code>` : ""}
           </div>
           <div class="markup-card-content">${esc(m.content)}</div>
           <code class="markup-sel">${esc(m.selector || "-")}</code>
+          ${(m.files_changed && m.files_changed.length) ? `<details class="markup-result"><summary>改動檔案（${m.files_changed.length}）</summary><pre>${esc(m.files_changed.join("\n"))}</pre></details>` : ""}
           ${m.result ? `<details class="markup-result"><summary>處理結果</summary><pre>${esc(m.result)}</pre></details>` : ""}
           ${(m.replies && m.replies.length) ? `<div class="markup-replies">${m.replies.map((rp) =>
             `<div class="markup-reply"><span class="markup-reply-k">↳ 回覆</span> <span class="sub2">${fmtTs(rp.at)}</span>
@@ -215,6 +226,7 @@ function markupCardHtml(m) {
           </div>
           <div class="markup-card-act">
             <button class="btn ${resolved ? "ok" : ""} markup-resolve" data-id="${m.id}" data-resolved="${resolved ? 1 : 0}">${resolved ? "取消解決" : "已解決"}</button>
+            ${canRollback ? `<button class="btn ghost markup-rollback" data-id="${m.id}" title="撤銷此標記的代碼修改（已提交→revert；未提交→還原檔案）">⤺ 回滾</button>` : ""}
             <button class="btn ghost markup-del" data-id="${m.id}">刪除</button>
           </div>
         </div>
@@ -238,17 +250,30 @@ function wireMarkupListHandlers(box) {
       b.disabled = false; b.textContent = "送出回覆並重新優化";
     }
   });
-  // 已解決開關：切換後源頁面框即時隱藏/恢復（scheduleOverlayRefresh 重畫，refreshOverlays 會略過已解決）
+  // 已解決開關：切換後源頁面框即時隱藏/恢復；標為解決時後端會把該標記動到的檔案
+  // 提交成獨立 commit（回應帶 commit_sha / commit_warning），供之後回滾 revert。
   box.querySelectorAll(".markup-resolve").forEach((b) => b.onclick = async () => {
     const want = b.dataset.resolved !== "1";   // 目前未解決 → 設為已解決；反之取消
     b.disabled = true;
     try {
-      await apiPost("/api/markups/resolve", { id: Number(b.dataset.id), resolved: want });
+      const r = await apiPost("/api/markups/resolve", { id: Number(b.dataset.id), resolved: want });
       invalidateMarkupCache();
       scheduleOverlayRefresh();
-      toast(want ? "已標為解決，源頁面不再顯示" : "已取消解決，源頁面恢復顯示");
+      if (want && r.commit_sha) toast(`已解決，代碼已提交 ${r.commit_sha.slice(0, 10)}`);
+      else if (want && r.commit_warning) toast(`已解決（${r.commit_warning}）`);
+      else toast(want ? "已標為解決，源頁面不再顯示" : "已取消解決，源頁面恢復顯示");
       loadMarkupPage({ preserveDrafts: true });
     } catch (e) { toast("操作失敗：" + e.message); b.disabled = false; }
+  });
+  // 回滾：撤銷該標記的代碼修改（已提交→git revert；未提交→還原工作區檔案）
+  box.querySelectorAll(".markup-rollback").forEach((b) => b.onclick = async () => {
+    if (!confirm("確定撤銷此標記的代碼修改？\n已提交者會產生一筆 revert commit；未提交者直接還原檔案。")) return;
+    b.disabled = true; b.textContent = "回滾中…";
+    try {
+      const r = await apiPost("/api/markups/rollback", { id: Number(b.dataset.id) });
+      toast("回滾完成：" + (r.note || ""));
+      invalidateMarkupCache(); pollSoon(); loadMarkupPage();
+    } catch (e) { toast("回滾失敗：" + e.message); b.disabled = false; b.textContent = "⤺ 回滾"; }
   });
   box.querySelectorAll(".markup-del").forEach((b) => b.onclick = async () => {
     try { await apiPost("/api/markups/delete", { id: Number(b.dataset.id) }); invalidateMarkupCache(); pollSoon(); loadMarkupPage(); }
@@ -336,7 +361,10 @@ export async function renderMarkups(tabKey) {
     <div class="dc-tabs">${tabs}</div>
     <div class="card cases-list">
       <div class="panel-head"><h3>標記清單</h3>
-        <input type="search" id="mq-q" placeholder="搜尋 內容 / 路由 / 選擇器…" value="${esc(mq.q)}" /></div>
+        <div class="mq-tools">
+          <input type="search" id="mq-q" placeholder="搜尋 內容 / 路由 / 選擇器…" value="${esc(mq.q)}" />
+          <button class="btn primary" id="mq-new" title="不綁定頁面元素，給系統全局添加修改指令">＋ 新增</button>
+        </div></div>
       <div id="markup-list" class="markup-list"><div class="empty">載入中…</div></div>
       <div class="pager">
         <button class="btn ghost" id="mq-first">« 首頁</button>
@@ -350,6 +378,32 @@ export async function renderMarkups(tabKey) {
   // 狀態 tab：點擊寫入雜湊（同步網址、可刷新還原）
   view.querySelectorAll(".dc-tab[data-st]").forEach((b) =>
     b.onclick = () => selectMarkupStatus(b.dataset.st));
+  // 「＋新增」：給系統全局添加修改指令（kind=global，無頁面定位，worker 對整倉生效）
+  $("mq-new").onclick = () => {
+    openModal(`
+      <h3 class="modal-title">新增全局修改指令</h3>
+      <div class="markup-form">
+        <p class="sub2">不綁定頁面元素，直接對看板 / 框架整體下修改指令，交後台 worker 處理。</p>
+        <textarea id="mq-new-text" rows="5" placeholder="描述要對系統做的修改，例：所有列表頁的分頁器加上「跳到第 N 頁」輸入框…"></textarea>
+        <div class="markup-actions">
+          <button class="btn" id="mq-new-cancel">取消</button>
+          <button class="btn primary" id="mq-new-send">發送</button>
+        </div>
+      </div>`);
+    const ta = $("mq-new-text"); ta?.focus();
+    $("mq-new-cancel").onclick = closeModal;
+    $("mq-new-send").onclick = async () => {
+      const content = (ta.value || "").trim();
+      if (!content) { toast("請先填寫指令內容"); ta.focus(); return; }
+      const btn = $("mq-new-send"); btn.disabled = true; btn.textContent = "發送中…";
+      try {
+        await apiPost("/api/markups", { kind: "global", route: "markups", content });
+        closeModal();
+        invalidateMarkupCache(); pollSoon(); loadMarkupPage();
+        toast("全局指令已送出，交由 worker 處理");
+      } catch (e) { toast("發送失敗：" + e.message); btn.disabled = false; btn.textContent = "發送"; }
+    };
+  };
   // 搜尋（debounce 300ms）：回第一頁重抓
   let t; $("mq-q").oninput = (e) => {
     clearTimeout(t); mq.q = e.target.value;
@@ -496,14 +550,31 @@ function openMarkupDetail(m) {
         <span class="badge b-${m.status}">${ST_LABEL[m.status] || m.status}</span>
         <code>#${esc(m.route)}</code>
         <span class="sub2">${fmtTs(m.created_at)}</span>
+        ${m.ip ? `<span class="sub2">IP ${esc(m.ip)}</span>` : ""}
+        ${m.elapsed_ms ? `<span class="sub2">耗時 ${fmtMs(m.elapsed_ms)}</span>` : ""}
       </div>
       <div class="markup-card-content">${esc(m.content)}</div>
       <code class="markup-sel">${esc(m.selector || "-")}</code>
       ${m.screenshot_path ? `<img class="markup-shot-preview" src="/api/markups/${m.id}/screenshot" alt="截圖" />` : ""}
       ${m.result ? `<details class="markup-result" open><summary>處理結果</summary><pre>${esc(m.result)}</pre></details>` : ""}
-      <div class="markup-actions"><button class="btn" id="mo-detail-close">關閉</button></div>
+      <div class="markup-actions">
+        <button class="btn ok" id="mo-detail-resolve">已解決</button>
+        <button class="btn" id="mo-detail-close">關閉</button>
+      </div>
     </div>`);
   $("mo-detail-close").onclick = closeModal;
+  // 已解決：隱藏源頁面的框 + 後端提交該標記的代碼修改（回應帶 commit 信息）
+  $("mo-detail-resolve").onclick = async () => {
+    const btn = $("mo-detail-resolve"); btn.disabled = true; btn.textContent = "處理中…";
+    try {
+      const r = await apiPost("/api/markups/resolve", { id: m.id, resolved: true });
+      closeModal();
+      invalidateMarkupCache(); scheduleOverlayRefresh(); pollSoon();
+      if (r.commit_sha) toast(`已解決，代碼已提交 ${r.commit_sha.slice(0, 10)}`);
+      else if (r.commit_warning) toast(`已解決（${r.commit_warning}）`);
+      else toast("已標為解決，源頁面不再顯示");
+    } catch (e) { toast("操作失敗：" + e.message); btn.disabled = false; btn.textContent = "已解決"; }
+  };
 }
 
 function scheduleOverlayRefresh() {
