@@ -113,6 +113,59 @@ class QAStore:
                     "observations": json.dumps(s.get("observations") or {}, ensure_ascii=False),
                 } for i, s in enumerate(steps)])
 
+    # ── 逐步落庫（崩潰留痕）────────────────────────────────────────────────
+    # begin_run / append_step 是執行期的即時記錄；正常跑完仍由 insert_run（冪等
+    # 刪後重插）收尾，順帶修復任何漏寫的步驟。進程中途死掉時 run 會停在
+    # status='running'，由看板啟動時 mark_dangling_runs() 收斂成 'interrupted'。
+
+    def begin_run(self, *, run_id: str, case_id: str, system: str, description: str,
+                  started_at: int, total: int, source: str = "run") -> None:
+        """執行開始即落一筆 status='running' 的 run（先清同 run_id 殘留，冪等）。"""
+        with self._engine.begin() as conn:
+            conn.execute(text("DELETE FROM qa_run_steps WHERE run_id=:r"), {"r": run_id})
+            conn.execute(text("DELETE FROM qa_runs WHERE run_id=:r"), {"r": run_id})
+            conn.execute(text("""
+                INSERT INTO qa_runs
+                  (run_id, case_id, `system`, status, description, started_at, passed, total, failed_at, source, actors)
+                VALUES (:run_id, :case_id, :system, 'running', :description, :started_at, 0, :total, NULL, :source, '{}')
+            """), {
+                "run_id": run_id, "case_id": case_id, "system": system,
+                "description": description, "started_at": int(started_at),
+                "total": int(total), "source": source,
+            })
+
+    def append_step(self, run_id: str, step: dict[str, Any]) -> None:
+        """逐步落一筆步驟結果，同步刷新 run 列的 passed / failed_at。"""
+        with self._engine.begin() as conn:
+            conn.execute(text("""
+                INSERT INTO qa_run_steps
+                  (run_id, step_index, kind, name, status, elapsed_ms, error, observations)
+                VALUES (:run_id, :step_index, :kind, :name, :status, :elapsed_ms, :error, :observations)
+            """), {
+                "run_id": run_id, "step_index": int(step.get("index", 0)),
+                "kind": step.get("kind", ""), "name": step.get("name", ""),
+                "status": step.get("status", ""), "elapsed_ms": int(step.get("elapsed_ms", 0)),
+                "error": step.get("error"),
+                "observations": json.dumps(step.get("observations") or {}, ensure_ascii=False),
+            })
+            if step.get("status") == "passed":
+                conn.execute(text("UPDATE qa_runs SET passed=passed+1 WHERE run_id=:r"),
+                             {"r": run_id})
+            elif step.get("status") == "failed":
+                conn.execute(text("UPDATE qa_runs SET failed_at=:i WHERE run_id=:r"),
+                             {"i": int(step.get("index", 0)), "r": run_id})
+
+    def mark_dangling_runs(self) -> int:
+        """把殘留在 'running' 的 run 標成 'interrupted'，回傳筆數。
+
+        run 跑在看板進程內的 thread，看板啟動時還停在 running 的必然是
+        上次進程死掉留下的（CLI autotest 與看板同時跑的極端情況除外）。
+        """
+        with self._engine.begin() as conn:
+            res = conn.execute(text(
+                "UPDATE qa_runs SET status='interrupted' WHERE status='running'"))
+            return int(res.rowcount or 0)
+
     def clear_runs(self, *, include_cases: bool = True) -> dict[str, int]:
         """清空所有執行類數據（「重新測試」用）：qa_run_steps + qa_runs；
         include_cases=True（預設）連 qa_cases 一併清，顯示序號（seq）歸零重來。
@@ -398,6 +451,16 @@ class QAStore:
         with self._engine.connect() as conn:
             v = conn.execute(text("SELECT seq FROM qa_cases WHERE id=:c"), {"c": case_id}).scalar()
             return int(v) if v is not None else None
+
+    def case_seqs(self, case_ids: list[str]) -> dict[str, int]:
+        """批次取多個用例的數字序號（{id: seq}），供清單一次查齊後按 seq 排序。"""
+        if not case_ids:
+            return {}
+        sql = text("SELECT id, seq FROM qa_cases WHERE id IN :ids").bindparams(
+            bindparam("ids", expanding=True))
+        with self._engine.connect() as conn:
+            rows = conn.execute(sql, {"ids": case_ids}).all()
+        return {str(r[0]): int(r[1]) for r in rows if r[1] is not None}
 
     def case_id_exists(self, case_id: str) -> bool:
         with self._engine.connect() as conn:
