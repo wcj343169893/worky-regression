@@ -165,9 +165,20 @@ def run_claude(prompt: str, *, skip_permissions: bool, timeout: int) -> tuple[bo
 
     用 `--output-format json` 取得結構化結果，順帶拿到 token 消耗與 total_cost_usd。
     成本資訊 = {tokens_in, tokens_out, cost_usd}（失敗或非 JSON 時為 0）。
+
+    降本旗標（每筆都是冷啟動的新會話，故省的是「固定底座」那 ~20k token）：
+    - --exclude-dynamic-system-prompt-sections：把 cwd/git/env 移出 system prompt 到首則訊息。
+      worker 會改檔、git status 每筆都變，移出後 system prompt 前綴保持穩定，下一筆更易命中
+      快取 cache_read（訂閱認證 TTL 1h，相鄰標記 < 1h 即省下 cache_creation）。
+    - --strict-mcp-config：不另給 --mcp-config 即零 MCP 載入，砍掉對「修本倉代碼」無用的
+      MCP 工具 schema。
+    刻意不加 --allowedTools：本 worker 修復任意使用者標記（可能 grep/改檔/跑測試/重啟服務），
+    白名單漏列會讓正當修復失敗，風險大於省下的 token。如確定只動檔可自行加：
+        cmd += ["--allowedTools", "Read,Edit,Write,Bash,Grep,Glob"]
     """
     zero = {"tokens_in": 0, "tokens_out": 0, "cost_usd": 0.0}
-    cmd = [CLAUDE_BIN, "-p", prompt, "--output-format", "json"]
+    cmd = [CLAUDE_BIN, "-p", prompt, "--output-format", "json",
+           "--exclude-dynamic-system-prompt-sections", "--strict-mcp-config"]
     if skip_permissions:
         cmd.insert(1, "--dangerously-skip-permissions")
     try:
