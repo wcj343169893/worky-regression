@@ -13,6 +13,8 @@ import json
 import secrets
 from typing import Any
 
+import yaml
+
 from sqlalchemy import bindparam, text
 
 from .config import Settings
@@ -119,19 +121,26 @@ class QAStore:
     # status='running'，由看板啟動時 mark_dangling_runs() 收斂成 'interrupted'。
 
     def begin_run(self, *, run_id: str, case_id: str, system: str, description: str,
-                  started_at: int, total: int, source: str = "run") -> None:
-        """執行開始即落一筆 status='running' 的 run（先清同 run_id 殘留，冪等）。"""
+                  started_at: int, total: int, source: str = "run",
+                  actors: dict | None = None) -> None:
+        """執行開始即落一筆 status='running' 的 run（先清同 run_id 殘留，冪等）。
+
+        actors 開頭就帶上：進程被 SIGTERM/kill 殺死時不會有收尾，這筆會被看板啟動
+        收斂成 interrupted——沒有 actors 的話，配對史就看不見這次錄取了誰，
+        被佔用的時段（30207）也推算不出來。
+        """
         with self._engine.begin() as conn:
             conn.execute(text("DELETE FROM qa_run_steps WHERE run_id=:r"), {"r": run_id})
             conn.execute(text("DELETE FROM qa_runs WHERE run_id=:r"), {"r": run_id})
             conn.execute(text("""
                 INSERT INTO qa_runs
                   (run_id, case_id, `system`, status, description, started_at, passed, total, failed_at, source, actors)
-                VALUES (:run_id, :case_id, :system, 'running', :description, :started_at, 0, :total, NULL, :source, '{}')
+                VALUES (:run_id, :case_id, :system, 'running', :description, :started_at, 0, :total, NULL, :source, :actors)
             """), {
                 "run_id": run_id, "case_id": case_id, "system": system,
                 "description": description, "started_at": int(started_at),
                 "total": int(total), "source": source,
+                "actors": json.dumps(actors or {}, ensure_ascii=False),
             })
 
     def append_step(self, run_id: str, step: dict[str, Any]) -> None:
@@ -165,6 +174,93 @@ class QAStore:
             res = conn.execute(text(
                 "UPDATE qa_runs SET status='interrupted' WHERE status='running'"))
             return int(res.rowcount or 0)
+
+    def job_allocation_history(self, system: str, since: int) -> dict[str, Any]:
+        """執行史 → 配號避撞（只讀看板庫，執行期不碰工作庫）。
+
+        後端有一批「夥伴×商家×日」類限制（30229/30213 同企業/同商家每日僅限工作一次、
+        30207 該時段已有確認工作、20009 商家單日發佈上限、dev 600s 發佈間隔），帳號池的
+        單帳號 LRU 看不見「配對」維度，小池很快踩回燒過的組合。本方法從今天的
+        qa_runs/qa_run_steps 還原三組事實供配發避讓：
+
+        - accepted_pairs：{(employer_id, labor_id)} 今天有 J3 錄取成功的配對。被錄取的
+          labor 從用例 YAML 的 J3 步驟 bind 解出（bind: {labor: laborN}，無 bind 即預設
+          labor），對回 run.actors 取 user_id——錄取即觸發每日一次限制，當日不可再配同對。
+        - occupied：{labor_id: 佔用截止 ts}（30207 該時段已有確認工作——錄取即佔住
+          表定時段直到 end_at，跨商家、run 死掉沒人打卡也一樣；截止由用例 vars 的
+          start 偏移＋工時推算，硬避讓）。
+        - publish：{employer_id: {count, last_at}} 今天 J1 發佈成功統計。
+        """
+        empty: dict[str, Any] = {"accepted_pairs": set(), "recent_accepts": {}, "publish": {}}
+        with self._engine.begin() as conn:
+            runs = conn.execute(text(
+                "SELECT run_id, case_id, started_at, actors FROM qa_runs "
+                "WHERE `system`=:s AND started_at>=:t"), {"s": system, "t": int(since)}).all()
+            if not runs:
+                return empty
+            steps = conn.execute(text(
+                "SELECT run_id, name FROM qa_run_steps WHERE run_id IN :ids "
+                "AND kind='transition' AND status='passed' "
+                "AND (name LIKE 'J1%' OR name LIKE 'J3%')"
+            ).bindparams(bindparam("ids", expanding=True)),
+                {"ids": [r.run_id for r in runs]}).all()
+            marks: dict[str, set[str]] = {}
+            for s_ in steps:
+                marks.setdefault(s_.run_id, set()).add(s_.name[:2])
+            case_ids = sorted({r.case_id for r in runs if "J3" in (marks.get(r.run_id) or set())})
+            specs = conn.execute(text(
+                "SELECT id, yaml FROM qa_cases WHERE id IN :ids"
+            ).bindparams(bindparam("ids", expanding=True)),
+                {"ids": case_ids}).all() if case_ids else []
+        # 各用例 J3 步驟錄取的 actor 角色（bind: {labor: laborN}；無 bind 即 labor）
+        # ＋時段參數（start 偏移 / 工時）——錄取即佔用該表定時段直到 end_at（30207），
+        # 就算 run 中途死掉、沒人打卡，佔用仍然在。
+        accept_roles: dict[str, set[str]] = {}
+        slot_vars: dict[str, tuple[int, int]] = {}   # case_id -> (after_minutes, work_minutes)
+        for sp in specs:
+            try:
+                spec = yaml.safe_load(sp.yaml) or {}
+                roles = {((st.get("bind") or {}).get("labor") or "labor")
+                         for st in (spec.get("path") or [])
+                         if str(st.get("transition", "")).startswith("J3")}
+                v = spec.get("vars") or {}
+                if v.get("job_start_after_minutes") is not None:
+                    slot_vars[sp.id] = (int(v["job_start_after_minutes"]),
+                                       int(v.get("job_work_minutes", 120)))
+            except Exception:  # noqa: BLE001 — 解析不了的用例保守當「錄取了所有 labor 角色」
+                roles = {"*"}
+            accept_roles[sp.id] = roles
+        out = {"accepted_pairs": set(), "occupied": {}, "publish": {}}
+        for r in runs:
+            mk = marks.get(r.run_id) or set()
+            a = r.actors
+            a = json.loads(a) if isinstance(a, str) else (a or {})
+            emp = str(((a.get("employer") or {}).get("user_id")) or "")
+            if not emp:
+                continue
+            if "J1" in mk:
+                p = out["publish"].setdefault(emp, {"count": 0, "last_at": 0})
+                p["count"] += 1
+                p["last_at"] = max(p["last_at"], int(r.started_at))
+            if "J3" in mk:
+                roles = accept_roles.get(r.case_id) or {"*"}
+                # 佔用截止：發佈(≈started_at) + start 偏移 + 工時 + 10min 緩衝。
+                # 只有近時段用例（帶 job_start_after_minutes）會佔近期時段；
+                # 其他用例的工作排在 +3 天外，與近時段新工作不衝突。
+                sv = slot_vars.get(r.case_id)
+                until = (int(r.started_at) + (sv[0] + sv[1] + 10) * 60) if sv else 0
+                for role, info in a.items():
+                    if not (role.startswith("labor") and isinstance(info, dict)):
+                        continue
+                    if "*" not in roles and role not in roles:
+                        continue
+                    lid = str(info.get("user_id") or "")
+                    if not lid:
+                        continue
+                    out["accepted_pairs"].add((emp, lid))
+                    if until:
+                        out["occupied"][lid] = max(out["occupied"].get(lid, 0), until)
+        return out
 
     def clear_runs(self, *, include_cases: bool = True) -> dict[str, int]:
         """清空所有執行類數據（「重新測試」用）：qa_run_steps + qa_runs；
@@ -225,8 +321,10 @@ class QAStore:
             return int(res.lastrowid)
 
     @staticmethod
-    def _markup_filters(status: str | None, q: str | None) -> tuple[str, dict]:
-        """組標記查詢的 WHERE 子句 + 參數（status 精確、q 對 content/route/selector LIKE）。"""
+    def _markup_filters(status: str | None, q: str | None, route: str | None = None,
+                        resolved: bool | None = None) -> tuple[str, dict]:
+        """組標記查詢的 WHERE 子句 + 參數（status/route 精確、q 對 content/route/selector
+        LIKE、resolved 布林——一般頁面畫框只拉「當前 route 的未解決標記」，不用全量）。"""
         clauses, params = [], {}
         if status:
             clauses.append("status=:st")
@@ -234,13 +332,20 @@ class QAStore:
         if q:
             clauses.append("(content LIKE :q OR route LIKE :q OR selector LIKE :q)")
             params["q"] = f"%{q}%"
+        if route:
+            clauses.append("route=:rt")
+            params["rt"] = route
+        if resolved is not None:
+            clauses.append("resolved=:rv")
+            params["rv"] = 1 if resolved else 0
         where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
         return where, params
 
     def list_markups(self, status: str | None = None, q: str | None = None,
-                     limit: int = 100, offset: int = 0) -> list[dict]:
-        """列標記（新到舊）；status 精確過濾、q 模糊搜尋；支援分頁 offset。rect 解回 dict。"""
-        where, params = self._markup_filters(status, q)
+                     limit: int = 100, offset: int = 0, route: str | None = None,
+                     resolved: bool | None = None) -> list[dict]:
+        """列標記（新到舊）；status/route/resolved 精確過濾、q 模糊搜尋；支援分頁 offset。"""
+        where, params = self._markup_filters(status, q, route, resolved)
         sql = text(f"""
             SELECT id, kind, route, selector, element_text, rect, content, screenshot_path,
                    status, resolved, result, replies, created_at, updated_at,
@@ -260,9 +365,10 @@ class QAStore:
             out.append(d)
         return out
 
-    def count_markups(self, status: str | None = None, q: str | None = None) -> int:
+    def count_markups(self, status: str | None = None, q: str | None = None,
+                      route: str | None = None, resolved: bool | None = None) -> int:
         """符合條件的標記總數（給分頁器算頁數）。"""
-        where, params = self._markup_filters(status, q)
+        where, params = self._markup_filters(status, q, route, resolved)
         with self._engine.connect() as conn:
             return int(conn.execute(
                 text(f"SELECT COUNT(*) FROM qa_markups {where}"), params).scalar() or 0)
@@ -395,12 +501,50 @@ class QAStore:
                 "SELECT error FROM qa_run_steps WHERE run_id=:r AND status='failed' "
                 "AND error IS NOT NULL ORDER BY step_index LIMIT 1"
             ), {"r": run["run_id"]}).scalar()
-            return {
+            out = {
                 "run_id": run["run_id"], "status": run["status"], "started_at": run["started_at"],
                 "passed": run["passed"], "total": run["total"], "failed_at": run["failed_at"],
                 "transition_status": self._transition_status(conn, run["run_id"]),
                 "error": error,
             }
+            if run["status"] == "running":   # 執行中：附帶「正在跑哪一步」推算（刷新頁面後續顯倒數）
+                out["live"] = self._live_progress(conn, run, case_id)
+            return out
+
+    def _live_progress(self, conn, run: dict, case_id: str) -> dict | None:
+        """執行中 run 的當前步驟推算——頁面整刷後（SSE 閉包已不在）前端靠它還原
+        「進行中閃爍 / 等待倒數」。
+
+        逐步落庫只在步驟結束時插列，故「已落庫的最後一步 +1」即正在跑的步驟；
+        步驟起點 ≈ started_at + Σelapsed_ms（執行串行，框架開銷可忽略）。
+        """
+        rows = conn.execute(text(
+            "SELECT step_index, kind, elapsed_ms FROM qa_run_steps WHERE run_id=:r "
+            "ORDER BY step_index"), {"r": run["run_id"]}).all()
+        nxt = (max(r.step_index for r in rows) + 1) if rows else 0
+        spec_yaml = conn.execute(text(
+            "SELECT yaml FROM qa_cases WHERE id=:c"), {"c": case_id}).scalar()
+        try:
+            path = (yaml.safe_load(spec_yaml) or {}).get("path") or []
+        except Exception:  # noqa: BLE001 — 用例 YAML 解析不了就不提供 live（只是顯示優化）
+            return None
+        if nxt >= len(path):
+            return None
+        cur = path[nxt]
+        tdone = sum(1 for r in rows if r.kind == "transition")   # 下一個 transition 的 chip 序號
+        elapsed = sum(int(r.elapsed_ms or 0) for r in rows) / 1000.0
+        base = {"index": nxt, "step_started_at": int(run["started_at"] + elapsed)}
+        if "wait_api" in cur:
+            w = cur["wait_api"] or {}
+            return {**base, "kind": "wait_api", "name": f"wait_api {w.get('query', '')}",
+                    "wait_secs": float(w.get("timeout", 30)), "next_tindex": tdone}
+        if "sleep" in cur:
+            return {**base, "kind": "sleep", "name": f"sleep {cur['sleep']}s",
+                    "wait_secs": float(cur["sleep"]), "next_tindex": tdone}
+        if "transition" in cur:
+            return {**base, "kind": "transition", "name": str(cur.get("transition", "?")),
+                    "cur_tindex": tdone}
+        return {**base, "kind": "other"}
 
     def history(self, case_id: str, limit: int = 10) -> list[dict]:
         with self._engine.connect() as conn:

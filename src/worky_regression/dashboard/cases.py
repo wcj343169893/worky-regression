@@ -119,6 +119,8 @@ class CaseStore:
             records.append((rec, spec))
         # 用例註冊：把（過濾後）用例 upsert 進 qa_cases，保證每筆用例都有 id
         self.qa.sync_cases([rec for rec, _ in records])
+        # 排序鍵：sync 後一次查齊所有 seq（看板顯示的 # 編號），供下方按 id（seq）倒序
+        seqs = self.qa.case_seqs([rec["id"] for rec, _ in records])
 
         items = [{
             "id": rec["id"],
@@ -130,15 +132,21 @@ class CaseStore:
             "step_count": rec["step_count"],
             "parent_id": rec["parent_id"],
             "transitions": _transitions(spec),
+            # 列表層帶上 skip 旗標與原因，讓「略過」徽章不必下鑽就能看到為什麼被略過
+            "skip": bool(spec.get("skip")),
+            "skip_reason": str(spec.get("skip_reason", "")).strip(),
         } for rec, spec in records]
-        # 依建立時間（檔案 mtime）倒序；同時間以 id 穩定排序
-        items.sort(key=lambda x: x["id"])
-        items.sort(key=lambda x: x["created_at"], reverse=True)
+        # 依 id（看板顯示的 # 序號，即 qa_cases.seq）倒序——新建用例排最前；
+        # 個別無 seq 者（理論上 sync 後不會發生）以建立時間倒序墊底。
+        for it in items:
+            it["seq"] = seqs.get(it["id"])
+        items.sort(key=lambda x: (x["seq"] is not None,
+                                  x["seq"] if x["seq"] is not None else x["created_at"]),
+                   reverse=True)
         total = len(items)
         page = items[offset:offset + limit] if limit else items
-        # 每頁項目的序號與執行彙總從 DB 取（只查當頁，避免大量查詢）
+        # 每頁項目的執行彙總從 DB 取（只查當頁，避免大量查詢；seq 已於排序時查齊）
         for it in page:
-            it["seq"] = self.qa.case_seq(it["id"])
             it["last_result"] = self.qa.latest_summary(it["id"])
             it["run_count"] = self.qa.run_count(it["id"])
             it["child_count"] = child_counts.get(it["id"], 0)
@@ -187,7 +195,16 @@ class CaseStore:
         path, source, spec = found
         last = self.qa.latest_full(case_id)
         # 最近結果中的 transition 步驟，依序對齊 path 內的 transition 步驟
-        res_trans = [s for s in (last or {}).get("steps", []) if s.get("kind") == "transition"]
+        all_steps = (last or {}).get("steps", [])
+        res_trans = [s for s in all_steps if s.get("kind") == "transition"]
+        # 每步執行時刻：DB 只存 run 起始時間 + 每步耗時，這裡用「run 起始 + 前面所有步驟
+        # （含 sleep / db_exec）累計耗時」推算各步開始時刻（忽略步間極小開銷，秒級足夠）。
+        run_t0 = (last or {}).get("started_at")
+        step_t0: dict[int, float | None] = {}
+        acc = 0
+        for s in all_steps:
+            step_t0[s["index"]] = (run_t0 + acc / 1000.0) if run_t0 else None
+            acc += int(s.get("elapsed_ms") or 0)
         steps = []
         ti = 0
         for st in spec.get("path", []):
@@ -215,6 +232,8 @@ class CaseStore:
                 "result": {
                     "status": rs.get("status"),
                     "elapsed_ms": rs.get("elapsed_ms"),
+                    # 略過的步驟沒真的執行，不給推算時刻（前端就不顯示「執行於」）
+                    "started_at": step_t0.get(rs["index"]) if rs.get("status") != "skipped" else None,
                     "error": rs.get("error"),
                     "observations": rs.get("observations"),
                 } if rs else None,
@@ -230,7 +249,7 @@ class CaseStore:
     # ── 執行 / 分解（會真的打被測 API）────────────────────────────────────────
     def _run_spec(self, spec: dict, *, source: str = "builtin", file: str = "",
                   actors: dict | None = None, on_event=None) -> dict:
-        from ..autotest import _actors_for
+        from ..autotest import _actors_for, required_actors
         from ..recorder import RecordingRunner
         from ..verifier import DBVerifier
 
@@ -249,9 +268,11 @@ class CaseStore:
             return RecordingRunner(None, qa_store=self.qa, system=system).run(
                 spec, actors={}, on_event=on_event).to_dict()
         db = DBVerifier(self.settings.for_system(system))   # contract/job dev 分庫
-        # actors 可由呼叫端覆蓋（換號時帶入「已排除原帳號」的 actors）；否則照常配發
+        # actors 可由呼叫端覆蓋（換號時帶入「已排除原帳號」的 actors）；否則照常配發。
+        # required：用例引用的具名 actor（labor3 / labor_lacking_*）升級為硬需求，
+        # 配不到在執行前就 PoolShortage，不會跑到中途 KeyError 白燒發佈。
         if actors is None:
-            actors = _actors_for(system, self.settings)
+            actors = _actors_for(system, self.settings, required=required_actors(spec))
         # on_event（可選）：透傳給 RecordingRunner 做逐步事件回呼（看板 SSE 即時刷新用）
         return RecordingRunner(db, qa_store=self.qa, system=system).run(
             spec, actors=actors, on_event=on_event).to_dict()
@@ -336,7 +357,7 @@ class CaseStore:
 
     def swap_account(self, case_id: str, step_index: int) -> dict:
         """排除失敗步驟 actor 目前用的帳號，配池中另一個同能力號，整支重跑。"""
-        from ..autotest import _actors_for
+        from ..autotest import _actors_for, required_actors
         from ..qa_accounts import PoolShortage
 
         found = self._find(case_id)
@@ -352,13 +373,14 @@ class CaseStore:
                 f"步驟 actor「{actor_name or '未知'}」非帳號池角色（{system} 系統），不支援換號；"
                 "contract 的 publisher/receiver 為固定 audit 帳號，請改用『重試』或回報主倉。")
         # 先以正常配發讀出「目前會用到」的帳號（acquire 對 role 的首選），再排除它重配
-        before = _actors_for(system, self.settings)
+        req = required_actors(spec)
+        before = _actors_for(system, self.settings, required=req)
         cur = before.get(actor_name) or before.get(role)
         cur_id = getattr(cur, "user_id", None)
         if cur_id is None:
             raise ValueError(f"無法判定 actor「{actor_name}」目前使用的帳號")
         try:
-            swapped = _actors_for(system, self.settings, exclude={role: [str(cur_id)]})
+            swapped = _actors_for(system, self.settings, exclude={role: [str(cur_id)]}, required=req)
         except PoolShortage as e:
             # 排除目前帳號後湊不齊本用例所需的合格帳號 —— 通常是合格號已全用於本用例、池無多餘替補。
             # 不把原始候選清單直接丟給使用者，改回可行動的指引。

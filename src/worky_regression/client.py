@@ -69,9 +69,15 @@ class WorkyClient:
                    + (secret if secret is not None else self.api_secret))
 
     def request(self, method: str, path: str, *, params: dict | None = None,
-                body: dict | None = None, base: str | None = None) -> requests.Response:
+                body: dict | None = None, base: str | None = None,
+                _retried: bool = False) -> requests.Response:
         # base 可覆寫 API base（如營運活動走 /activity；不傳則用本 client 的主 base）。
         # 覆寫 base 的請求（activity 模組）簽名用預設 secret，不用 employer 分流的 qa-v1 secret。
+        # 長用例（打卡類要等 60+ 分鐘）執行途中 access token 會過期（TTL≈1h）：
+        # 請求前主動檢查，快過期且可刷新就先刷新（刷新端點自身除外，避免遞迴）。
+        if (path != "/token/refresh" and self.access_token
+                and not self.access_valid() and self.refresh_valid()):
+            self.refresh()
         url = (base or self.api_base) + path
         secret = self.settings.api_secret if base is not None else self.api_secret
 
@@ -109,13 +115,30 @@ class WorkyClient:
         if self.access_token:
             headers["Authorization"] = f"Bearer {self.access_token}"
 
-        return self.session.request(
+        resp = self.session.request(
             method=method,
             url=url,
             data=body_str if body_str else None,
             headers=headers,
             timeout=30,
         )
+        # 兜底：仍收到 10003 AccessToken 已失效（expired_at 不可靠 / 被踢下線）
+        # → 就地刷新一次，用新 token 重簽重送；只重試一次，避免循環。
+        if (not _retried and path != "/token/refresh"
+                and self._token_expired_resp(resp) and self.refresh()):
+            return self.request(method, path, params=params, body=body, base=base, _retried=True)
+        return resp
+
+    @staticmethod
+    def _token_expired_resp(resp: requests.Response) -> bool:
+        """回應是否為「10003 AccessToken 已失效」業務錯（HTTP 200 + success=false）。"""
+        if not resp.headers.get("content-type", "").startswith("application/json"):
+            return False
+        try:
+            p = resp.json()
+        except ValueError:
+            return False
+        return p.get("success") is False and int(p.get("code") or 0) == 10003
 
     def post(self, path: str, body: dict | None = None) -> requests.Response:
         return self.request("POST", path, body=body)

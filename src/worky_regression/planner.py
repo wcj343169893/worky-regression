@@ -375,20 +375,20 @@ def analyze_failure(context: dict[str, Any], settings: Settings | None = None) -
 
 
 def _expect_from_unit(name: str) -> dict[str, Any]:
-    """從 spec 的 push / side_effects 自動推導一個 transition 步驟的 expect。"""
+    """從 spec 的 push / verify_api 自動推導一個 transition 步驟的 expect。
+
+    狀態驗證一律走查詢端點（unit 的 ``verify_api`` → expect.api），不再從 side_effects
+    合成 SELECT（expect 驗證不查 SQL；side_effects 保留作文件/對照用途）。
+    無 verify_api 的 transition 只驗 http（+push），不留 SQL 後門。
+    """
+    import copy
+
     u = unit_spec(name)
     expect: dict[str, Any] = {"http": 200}
     if u.get("push"):
         expect["push"] = {}                       # 空 → 只驗 type_id 落地
-    for se in (u.get("side_effects") or []):
-        become = se.get("become") or {}
-        if become:                                 # runner 一步只驗一個 state query
-            cols = ", ".join(become.keys())
-            expect["state"] = {
-                "sql": f"SELECT {cols} FROM {se['table']} WHERE {se['key']}",
-                "equals": dict(become),
-            }
-            break
+    if u.get("verify_api"):
+        expect["api"] = copy.deepcopy(u["verify_api"])
     return expect
 
 

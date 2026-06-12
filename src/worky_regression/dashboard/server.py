@@ -198,12 +198,16 @@ class Handler(BaseHTTPRequestHandler):
                 _qa = _cases().qa
                 _st = _one(query, "status", "") or None
                 _q = _one(query, "q", "") or None
+                _rt = _one(query, "route", "") or None
+                # resolved：空 = 不過濾；"0"/"false" = 只要未解決；其餘真值 = 只要已解決
+                _rvs = _one(query, "resolved", "")
+                _rv = None if _rvs == "" else _rvs not in ("0", "false")
                 self._send_json({
                     "items": _qa.list_markups(
-                        status=_st, q=_q,
+                        status=_st, q=_q, route=_rt, resolved=_rv,
                         limit=_int(query, "limit", 100),
                         offset=_int(query, "offset", 0)),
-                    "total": _qa.count_markups(status=_st, q=_q)})
+                    "total": _qa.count_markups(status=_st, q=_q, route=_rt, resolved=_rv)})
             elif path.startswith("/api/markups/") and path.endswith("/screenshot"):
                 mid = path[len("/api/markups/"):-len("/screenshot")]
                 self._send_markup_shot(mid)
@@ -617,6 +621,10 @@ def serve(host: str = "127.0.0.1", port: int = 8765) -> None:
     svc.db.max_notification_id()
     # 確保 QA 看板庫 schema 到最新（alembic upgrade head；建庫 + 建/改表）
     _cases().qa.migrate()
+    # run 跑在本進程的 thread 內：啟動時還停在 running 的必是上次進程死掉留下的，收斂成 interrupted
+    _dangling = _cases().qa.mark_dangling_runs()
+    if _dangling:
+        print(f"  ⚠️  上次進程死掉殘留 {_dangling} 筆執行中 run，已標記為「中斷」。")
 
     httpd = ThreadingHTTPServer((host, port), Handler)
     url = f"http://{host}:{port}"

@@ -425,7 +425,12 @@ class PathRunner:
         """打對應查詢接口比對回應欄位（取代 SELECT 驗 DB）。
 
         api: {query: <query_unit 名>, actor?: <覆寫呼叫者>, args?: {覆寫/補查詢參數},
-              http?: 預期狀態碼(預設 200), equals: {回應 data 內欄位路徑: 期望值}}
+              http?: 預期狀態碼(預設 200), equals: {回應 data 內欄位路徑: 期望值},
+              save?: {state 變數名: 回應欄位路徑}}
+
+        save：把回應欄位存進 state.vars 供後續步驟引用（路徑相對 data；有 find 時相對
+        find 命中的單筆）。例：打 Q_employer_schedule_info 把 labors[].start_code 存成
+        {{state.start_code}} 給 J5 打卡用。
         """
         q = query_unit(api["query"])
         actor_role = api.get("actor") or q["actor"]
@@ -471,10 +476,21 @@ class PathRunner:
                 raise AssertionError(
                     f"[expect.api {api['query']}] {path}: expected {expected!r}, got {actual!r}")
             checked[path] = actual
+        saved: dict[str, Any] = {}
+        for var_name, path in (api.get("save") or {}).items():
+            try:
+                val = self._dig(data, path)
+            except (KeyError, IndexError, TypeError):
+                raise AssertionError(
+                    f"[expect.api {api['query']}] save.{var_name}: 回應內找不到欄位路徑 {path!r}")
+            state.vars[var_name] = val
+            saved[var_name] = val
         print(f"  [expect.api] {api['query']} {q['endpoint']} as {actor_role}"
-              + (f" find={found_where}" if found_where else "") + f" → {checked}")
+              + (f" find={found_where}" if found_where else "") + f" → {checked}"
+              + (f" save={saved}" if saved else ""))
         return {"kind": "api", "query": api["query"], "endpoint": q["endpoint"],
-                "actor": actor_role, "find": found_where, "equals": checked}
+                "actor": actor_role, "find": found_where, "equals": checked,
+                **({"saved": saved} if saved else {})}
 
     def _run_assert_api(self, step: dict, state: PathExecutionState) -> dict[str, Any]:
         """獨立的接口斷言步驟（不綁 transition）：直接打查詢接口比對，取代 assert_state(SQL)。

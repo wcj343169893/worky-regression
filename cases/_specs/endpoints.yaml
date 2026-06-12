@@ -170,6 +170,24 @@ query_units:
       查得到該 job(success=true) 即證明已發佈（未發佈會回 INVALID_JOB_SN）。
       info 不對外暴露 status 欄，驗「媒合中」改用等價暴露欄位 recruited_count（剛發佈=0）。
       可比對欄位：recruited_count / recruit_count / start_at / hourly_wage / work_minutes 等。
+  Q_employer_schedule_info:
+    system: job
+    summary: 商家查日程內頁（驗工作進行狀態；labors[] 帶各夥伴打卡碼與打卡時間）
+    actor: employer
+    method: GET
+    endpoint: /employer/shop/schedule/info
+    doc_id: 115-2
+    request:
+      job_sn: '{{state.job_sn}}'
+    note: |
+      唯一能拿到每位夥伴打卡碼的查詢端點：labors[]（僅 status=1 上工者）每筆含
+      labor_id / start_code / end_code / actual_clock_in_at / actual_clock_out_at /
+      adjusted_clock_in_at / adjusted_clock_out_at；J3 錄取後立即可查（無時間門檻）。
+      頂層 working_status（0:未開始 1:進行中 2:已結束）依 now 對 start_at/end_at 即時推算，
+      可當 wait_api 條件等「工作開始」（J6 下班卡要求 start_at<=now，否則 40403）。
+      用法：J3 後 assert_api + save 把打卡碼存進 state——
+        {assert_api: {query: Q_employer_schedule_info,
+                      save: {start_code: labors.0.start_code, end_code: labors.0.end_code}}}
   Q_publisher_task_info:
     system: contract
     summary: 發案者查單一任務明細（驗證承攬任務對外狀態用）
@@ -195,6 +213,32 @@ query_units:
       回應 data.matching[] 為進行中的媒合，每筆含 job_sn + status（LaborMatchJob 狀態，與 DB 同值）：
       4=打工夥伴申請(STATUS_LABOR_APPLY)、6=商家錄取(STATUS_EMPLOYER_ACCEPT)、16=備取(STATUS_BACKUP)…
       用 expect.api / assert_api 的 find:{in: matching, where:{job_sn: ...}} 取單筆再驗 status。
+  Q_employer_evaluation_get:
+    system: job
+    summary: 商家查「自己對某夥伴在某工作」的評價（驗互評是否寫入用）
+    actor: employer
+    method: GET
+    endpoint: /employer/evaluation/get
+    doc_id: 126-2
+    request:
+      labor_id: '{{labor.user_id}}'
+      job_sn: '{{state.job_sn}}'
+    note: |
+      未評價時回應僅有 schedule_type；已評價才帶 labor_id/job_sn/professional_stars/
+      attitude_stars/cleanliness_stars/content/created_at（星等為 1~5 綜合換算，非輸入的 1~4）。
+      故驗「評價已寫入」用 equals:{job_sn: ...}（有此欄即代表評價存在），不比對星數。
+  Q_labor_evaluation_get:
+    system: job
+    summary: 打工夥伴查「自己對某工作」的評價（驗互評是否寫入用）
+    actor: labor
+    method: GET
+    endpoint: /labor/evaluation/get
+    doc_id: 219-2
+    request:
+      job_sn: '{{state.job_sn}}'
+    note: |
+      未評價時回應僅有 schedule_type；已評價才帶 job_sn/atmosphere_stars/environment_stars/
+      communication_stars/rating_stars/content/created_at。驗「已寫入」用 equals:{job_sn: ...}。
   # ── 推播通知查詢（驗推播改打 API，不再 SELECT s_notifications）──────────────
   # runner 的 push 驗證依「收件 actor 的 user_type」自動挑下面對應端點：1→employer、2→labor
   # （publisher/receiver 皆 user_type=2，走 labor 端點）。回應每筆含 id/type_id/title/content/created_at，
@@ -454,6 +498,11 @@ task_units:
     saves:
       job_sn: job_sn_list.0
     push: null
+    # expect 的狀態驗證走查詢端點（產生器自動帶進 expect.api）；info 不暴露 status，
+    # 查得到該 job 即已發佈，且剛發佈 recruited_count=0（媒合中、尚無人錄取）。
+    verify_api:
+      query: Q_employer_job_info
+      equals: {recruited_count: 0}
     guards:
       - need: 商家已登入且店鋪已通過審核（validation_status=3；只送審未過審發佈會 20022）
         satisfy: {caps: [active, shop_approved]}
@@ -492,8 +541,16 @@ task_units:
     endpoint: /labor/job-match/job-apply
     doc_id: 210-1
     event: common\components\Event\Events\LaborJobApplyFinishedEvent
-    request: {job_sn: "{{state.job_sn}}"}
+    # is_not_validate_time_interval=true：跳過「兩工作間隔過近」軟提醒（30303，APP 是彈確認框
+    # 後帶此旗標重送；框架等同「使用者已確認」）。負向用例要驗 30303 時用 args 覆寫成 false。
+    request: {job_sn: "{{state.job_sn}}", is_not_validate_time_interval: true}
     push: {to: employer, type: LABOR_JOB_APPLY_V2}   # 手動錄取路徑送 V2(10025)；舊 10021 僅 AUTO_ACCEPT
+    # 申請後該夥伴媒合清單 matching[] 該 job 的 status=4（STATUS_LABOR_APPLY）；
+    # query actor=labor 會解析到該步 bind 的夥伴（labor1/labor2 各驗各的）。
+    verify_api:
+      query: Q_labor_job_matches
+      find: {in: matching, where: {job_sn: "{{state.job_sn}}"}}
+      equals: {status: 4}
     # 對齊 worky JobMatchForm::validateCanApplyJob / validateRecruitJob（labor 端）
     guards:
       - need: 工作存在且在媒合中、招募未滿、未過截止
@@ -571,8 +628,16 @@ task_units:
     endpoint: /employer/shop/job-match/accept
     doc_id: 120-1
     event: common\components\Event\Events\AfterEmployerJobMatchAcceptEvent
-    request: {job_sn: "{{state.job_sn}}", labor_id: "{{labor.user_id}}"}
+    # is_not_validate_time_interval=true：跳過商家端「夥伴兩工作間隔過近」確認提醒
+    # （20325，SCENARIO_JOB_ACCEPT 同收此旗標；等同使用者在確認框按「仍要同意」）。
+    request: {job_sn: "{{state.job_sn}}", labor_id: "{{labor.user_id}}", is_not_validate_time_interval: true}
     push: {to: labor, type: EMPLOYER_ACCEPT_APPLY}
+    # 錄取後被錄取夥伴媒合清單該 job 的 status=6（STATUS_EMPLOYER_ACCEPT）；
+    # 以 bind 指定被錄取的夥伴（query actor=labor 解析到該夥伴）。
+    verify_api:
+      query: Q_labor_job_matches
+      find: {in: matching, where: {job_sn: "{{state.job_sn}}"}}
+      equals: {status: 6}
     # 對齊 worky employer/shop/JobMatchForm::validateJobAccept
     guards:
       - need: 該夥伴已申請（s_labor_match_jobs.status=4）且未取消/未被婉拒
@@ -673,13 +738,12 @@ task_units:
       - need: 已錄取且待上工（J3，job_status=1、actual_clock_in_at 空）
         satisfy: {by: J3_employer_accept}
       - need: 已知正確上班打卡碼 start_code
-        satisfy: {skip: "時間鎖：打卡碼需預寫、工作時段需壓縮到當下，禁 db_exec(#4) 後無 API 可替代"}
-      - need: 現在已進入可打卡時間（end_at-24h 之後）
-        # s_jobs 與 s_labor_jobs 兩張表的時段都要拉到當下：clock-in 看 s_jobs，
-        # clock-out 看 s_labor_jobs.start_at/end_at（否則 J6 回 40403 錯誤的下班打卡時間）。
-        satisfy: {skip: "時間鎖：打卡碼需預寫、工作時段需壓縮到當下，禁 db_exec(#4) 後無 API 可替代"}
-      - need: 夥伴的工作時段也拉到當下（clock-out 時間校驗看 s_labor_jobs）
-        satisfy: {skip: "時間鎖：打卡碼需預寫、工作時段需壓縮到當下，禁 db_exec(#4) 後無 API 可替代"}
+        # 打卡碼由商家日程內頁（115-2）labors[] 回傳，J3 錄取後立即可查。
+        satisfy: {note: "J3 後 assert_api Q_employer_schedule_info + save 把 labors[].start_code/end_code 存進 state"}
+      - need: 現在未超過可打卡時限（end_at + schedule.24_hours_after_work_end 之內；dev=600s）
+        # clock-in 沒有「太早」的下限——開工前即可打（adjusted_clock_in_at 會貼齊 start_at）。
+        # dev min_publish_interval_seconds=600：用 vars job_start_after_minutes≈13 發近時段工作即可。
+        satisfy: {note: "vars: {job_start_after_minutes: 13} 發 13 分鐘後開始的工作；發佈後立刻申請/錄取/打卡"}
     branches:
       - when: 打卡碼錯誤
         expect_fail: {message_contains: "打卡碼"}
@@ -703,7 +767,10 @@ task_units:
       - need: 已上班打卡（J5，job_status=2、actual_clock_out_at 空）
         satisfy: {by: J5_labor_clock_in}
       - need: 已知正確下班打卡碼 end_code
-        satisfy: {skip: "時間鎖：打卡碼需預寫、工作時段需壓縮到當下，禁 db_exec(#4) 後無 API 可替代"}
+        satisfy: {note: "同 J5：assert_api Q_employer_schedule_info + save（一次存齊 start_code/end_code）"}
+      - need: 工作已開始（start_at<=now，否則 40403 WRONG_TIME_TO_CLOCK_OUT）
+        # 下班卡與上班卡不同——有「太早」下限：須等到 start_at 過後。
+        satisfy: {note: "J6 前 wait_api Q_employer_schedule_info equals {working_status: 1}（timeout 依 job_start_after_minutes 抓 ~900s）"}
     branches:
       - when: 打卡碼錯誤
         expect_fail: {message_contains: "打卡碼"}
@@ -740,6 +807,95 @@ task_units:
         key: "job_id=(SELECT id FROM s_jobs WHERE job_sn='{{state.job_sn}}') AND labor_id={{labor.user_id}}"
         become: {status: 9}                         # STATUS_LABOR_CANCEL；s_jobs.recruited_count-1
     notes: 招募截止前的 push 改 LABOR_JOB_CANCELED_BEFORE_RECRUIT_DEADLINE(10026)。
+
+  J8_employer_evaluate_labor:
+    system: job
+    summary: 商家對打工夥伴 5 星好評
+    actor: employer
+    method: POST
+    endpoint: /employer/evaluation/evaluate
+    doc_id: 126-1
+    event: ""
+    # 三個維度星等範圍 1~4（worky EvaluationForm rules），5 星好評＝三維皆給滿分 4。
+    # evaluation_labels 必填且不可為空陣列（form validateEvaluationLabels），最多 3 個；
+    # 商家評夥伴用「描述夥伴」的標籤組（s_option_evaluation_labels.user_type=2 正面 impact_type=1）：
+    #   2=態度積極 7=準時上班 9=願意再次雇用。
+    request:
+      labor_id: "{{labor.user_id}}"
+      job_sn: "{{state.job_sn}}"
+      like_labor_stars: 4
+      cooperate_again_stars: 4
+      meet_expectation_stars: 4
+      evaluation_labels: [2, 7, 9]
+      content: "回歸測試 5 星好評 {{state.run_id}}"
+    # 評價成功僅丟 RabbitMQ（Producer::EMPLOYER_EVALUATE）做後續活動獎勵，
+    # 不在請求當下對夥伴發即時推播，故 happy path 不驗 push。
+    push: null
+    # 驗評價已寫入：改打 126-2 查回應帶 job_sn（未評價只回 schedule_type）。
+    verify_api:
+      query: Q_employer_evaluation_get
+      equals: {job_sn: "{{state.job_sn}}"}
+    guards:
+      - need: 該夥伴此工作已完成（J6 下班打卡後 s_labor_jobs.job_status=3 STATUS_WORK_FINISHED）
+        satisfy: {by: J6_labor_clock_out}
+      - need: 未超過評價時限（end_at + 72h 內；dev 預設 72 小時，剛下班必在期限內）
+        satisfy: {note: "緊接 J6 後評價即可"}
+    branches:
+      - when: 工作尚未完成（夥伴未下班打卡）
+        expect_fail: {message_contains: "完成"}
+        arrange: {note: "略過 J5/J6，工作未到 STATUS_WORK_FINISHED 即評價"}
+      - when: 重複評價（同單已評過）
+        expect_fail: {message_contains: "重複"}        # EVALUATION_IS_REPETITIVE
+        arrange: {by: [J8_employer_evaluate_labor]}
+      - when: evaluation_labels 為空 / 超過 3 個
+        expect_fail: {message_contains: "標籤"}
+        arrange: {note: "request.evaluation_labels 給 [] 或 4 個以上"}
+    side_effects:
+      - table: s_employer_evaluations
+        key: "job_sn='{{state.job_sn}}' AND labor_id={{labor.user_id}}"
+        note: 寫入商家對夥伴的評價（表名以主倉 Employer\\Evaluation 模型為準）
+
+  J9_labor_evaluate_employer:
+    system: job
+    summary: 打工夥伴對商家 5 星好評
+    actor: labor
+    method: POST
+    endpoint: /labor/evaluation/evaluate
+    doc_id: 219-1
+    event: ""
+    # 星等範圍同上 1~4，5 星好評＝三維皆 4。evaluation_labels 必填非空、最多 3 個；
+    # 夥伴評商家用「描述工作/商家」的標籤組（user_type=1 正面 impact_type=1）：
+    #   19=溝通順暢 22=準時上班 26=願意再次工作。
+    request:
+      job_sn: "{{state.job_sn}}"
+      cooperate_again_stars: 4
+      meet_expectation_stars: 4
+      recommend_employer_stars: 4
+      evaluation_labels: [19, 22, 26]
+      content: "回歸測試 5 星好評 {{state.run_id}}"
+    push: null
+    verify_api:
+      query: Q_labor_evaluation_get
+      equals: {job_sn: "{{state.job_sn}}"}
+    guards:
+      - need: 此工作已完成（J6 下班打卡後 job_status=3 STATUS_WORK_FINISHED）
+        satisfy: {by: J6_labor_clock_out}
+      - need: 未超過評價時限（end_at + 72h 內）
+        satisfy: {note: "緊接 J6 後評價即可"}
+    branches:
+      - when: 工作尚未完成
+        expect_fail: {message_contains: "完成"}
+        arrange: {note: "略過 J5/J6 即評價"}
+      - when: 重複評價（同單已評過）
+        expect_fail: {message_contains: "重複"}        # EVALUATION_IS_REPETITIVE
+        arrange: {by: [J9_labor_evaluate_employer]}
+      - when: evaluation_labels 為空 / 超過 3 個
+        expect_fail: {message_contains: "標籤"}
+        arrange: {note: "request.evaluation_labels 給 [] 或 4 個以上"}
+    side_effects:
+      - table: s_labor_evaluations
+        key: "job_sn='{{state.job_sn}}'"
+        note: 寫入夥伴對商家的評價（表名以主倉 Shop\\Evaluation 模型為準）
 
   # ===== 營運活動：點石成金爭奪戰（Activity API，唯讀查詢）=====
   A1_labor_ranking_init:

@@ -177,8 +177,13 @@ def process_one(qa: QAStore, *, skip_permissions: bool, timeout: int) -> bool:
                      elapsed_ms=elapsed_ms, files_changed=changed)
     print(f"[markup-worker] #{mid} → {'done' if ok else 'failed'}（{elapsed_ms}ms，"
           f"改檔 {len(changed)} 個）")
-    # 改了檔就巡檢一次看板健康（worker 改壞看板代碼要及時發現並修復）
+    # 改了檔就巡檢一次看板健康（worker 改壞看板代碼要及時發現並修復）。
+    # 動到 src/ 下的 .py（看板後端 / 框架）必須重啟看板才生效——靜態 JS 即改即生效，
+    # 但 Python 已載入進程，不重啟會出現「前端有按鈕、後端 404 not found」的半套狀態。
     if changed:
+        if any(f.endswith(".py") and f.startswith("src/") for f in changed):
+            print(f"[markup-worker] #{mid} 動到後端 .py，重啟看板使其生效")
+            restart_dashboard()
         ensure_dashboard_healthy(auto_heal=True)
     return True
 

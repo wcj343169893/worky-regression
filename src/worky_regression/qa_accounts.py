@@ -70,6 +70,13 @@ _ID_LETTER = {'A': 10, 'B': 11, 'C': 12, 'D': 13, 'E': 14, 'F': 15, 'G': 16, 'H'
               'Q': 24, 'R': 25, 'S': 26, 'T': 27, 'U': 28, 'V': 29, 'W': 32, 'X': 30,
               'Y': 31, 'Z': 33}
 
+# API 自建 labor 的姓名素材：常見姓氏 + 依性別的兩字名（看板/聊天室顯示用，無唯一性要求）。
+_SURNAMES = "陳林黃張李王吳劉蔡楊許鄭謝郭洪曾邱廖賴周徐蘇葉"
+_GIVEN_MALE = ["志明", "建宏", "俊傑", "宗翰", "家豪", "冠宇", "柏翰", "承翰",
+               "宇軒", "哲瑋", "明哲", "信宏", "彥廷", "庭瑋", "睿恩", "克勤"]
+_GIVEN_FEMALE = ["淑芬", "雅婷", "怡君", "佳穎", "詩涵", "宜蓁", "欣怡", "雅雯",
+                 "靜宜", "曉彤", "佩珊", "思妤", "子晴", "敏華", "依婷", "芷瑄"]
+
 
 class AccountPool:
     """帳號池存取層。執行期(acquire/release)只碰 QA 庫；供給/同步才連工作庫。"""
@@ -395,21 +402,50 @@ class AccountPool:
             return phone
         raise RuntimeError(f"註冊失敗（試 {attempts} 次）：{last}")
 
-    def _complete_labor_demographics(self, c: WorkyClient) -> None:
-        """補 labor 強制輪廓資料（性別/出生年/居住地）；縣市/區域取自 /labor/options（代碼環境相關）。"""
+    @staticmethod
+    def _gen_display_name(gender: str) -> str:
+        """產隨機中文姓名（姓 + 兩字名，名依性別取池），供 API 自建 labor 自動命名。"""
+        given = random.choice(_GIVEN_MALE if gender == "male" else _GIVEN_FEMALE)
+        return random.choice(_SURNAMES) + given
+
+    def _complete_labor_demographics(self, c: WorkyClient) -> str:
+        """補 labor 強制輪廓資料（性別/出生年/居住地）；縣市/區域取自 /labor/options（代碼環境相關）。
+
+        回傳所選 gender，供後續寫姓名（個人資訊分群）時保持性別一致。
+        """
         opt = (c.get("/labor/options").json().get("data") or {})
         cds = opt.get("city_districts") or []
         if not cds or not (cds[0].get("districts")):
             raise RuntimeError("取不到縣市/區域選項，無法補輪廓資料")
         city = cds[0]
         dist = city["districts"][0]
+        gender = random.choice(["male", "female"])
         r = c.post("/labor/demographics/create", body={
-            "gender": random.choice(["male", "female"]),
+            "gender": gender,
             "birth_year": random.randint(1985, 2002),
             "city": city["id"], "district": dist["id"],
         }).json()
         if not r.get("success"):
             raise RuntimeError(f"demographics 失敗：{r.get('message')}")
+        return gender
+
+    def _set_labor_display_name(self, c: WorkyClient, gender: str) -> None:
+        """為基本 labor 寫入自動生成的姓名（不送審）。
+
+        /labor/update 的「個人資訊」分群是條件必填：帶 display_name 就須連同
+        gender/birthday/id_number/身分證正反面一起給，故補佔位證件圖湊齊整群。
+        失敗不致命（姓名只是顯示用），由呼叫端決定是否吞掉。
+        """
+        front = self._upload_image(c, "labor_id_card_image")
+        back = self._upload_image(c, "labor_id_card_image")
+        r = c.post("/labor/update", body={
+            "display_name": self._gen_display_name(gender), "gender": gender,
+            "birthday": f"{random.randint(1985, 2002)}-05-05",
+            "id_number": self._gen_id_number("12"),
+            "id_card_front_image": front, "id_card_back_image": back,
+        }).json()
+        if not r.get("success"):
+            raise RuntimeError(f"寫入姓名失敗：{r.get('message')}")
 
     @staticmethod
     def _gen_id_number(second_choices: str) -> str:
@@ -448,12 +484,13 @@ class AccountPool:
         if not banks:
             raise RuntimeError("取不到銀行選項，無法填薪資帳戶")
         bank_code = banks[0]["code"]
-        suffix = phone[-4:]
+        gender = random.choice(["male", "female"])
+        name = self._gen_display_name(gender)
         front = self._upload_image(c, "labor_id_card_image")
         back = self._upload_image(c, "labor_id_card_image")
         book = self._upload_image(c, "labor_passbook_cover_image")
         r = c.post("/labor/update", body={
-            "display_name": f"QA{suffix}", "gender": random.choice(["male", "female"]),
+            "display_name": name, "gender": gender,
             "birthday": f"{random.randint(1985, 2002)}-05-05",
             "id_number": self._gen_id_number("12"),
             "id_card_front_image": front, "id_card_back_image": back,
@@ -461,7 +498,7 @@ class AccountPool:
             "city": city["id"], "district": dist["id"], "address": "測試路1號",
             "emergency_contact_person": "測試聯絡人", "emergency_contact_relation": "親屬",
             "emergency_contact_phone": "0933123123",
-            "bank_account_name": f"QA{suffix}", "bank_code": bank_code,
+            "bank_account_name": name, "bank_code": bank_code,
             "bank_branch_code": f"{bank_code}0011", "bank_account": "012345678901",
             "passbook_cover_image": book, "is_submitted_for_review": True,
         }).json()
@@ -526,7 +563,11 @@ class AccountPool:
                     if "profile_complete" in want:
                         self._complete_labor_full_profile(c, phone)   # → is_profile_complete=1, 待認證
                     else:
-                        self._complete_labor_demographics(c)
+                        g = self._complete_labor_demographics(c)
+                        try:
+                            self._set_labor_display_name(c, g)        # 自動生成姓名（顯示用，不送審）
+                        except Exception as ne:  # noqa: BLE001 — 姓名非必要，失敗不阻斷入池
+                            note = f"api;name_fail:{ne}"
                 else:
                     # employer 建店鋪並送審（純 API）；verified_shop 目標 → validation_type=2。失敗不影響入池
                     shop_id, shop_note = self._provision_employer_shop(
@@ -846,6 +887,8 @@ def main(argv: list[str] | None = None) -> int:
         python -m worky_regression.qa_accounts sync         # 只同步能力，不校正
         python -m worky_regression.qa_accounts topup        # 回收過期租約 + 可用不足才 provision
         python -m worky_regression.qa_accounts register --role labor --n 3   # 純 API 自助建帳號入池
+        python -m worky_regression.qa_accounts register --role labor --n 3 --caps profile_complete,verified
+                                                            # 完整送審 + 後台自動核准（全能力夥伴）
         python -m worky_regression.qa_accounts list         # 檢視池現況
     """
     import argparse
@@ -856,6 +899,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--min-available", type=int, default=3, help="topup 時每角色可用數低標（預設 3）")
     ap.add_argument("--role", choices=["labor", "employer"], default="labor", help="register 的角色")
     ap.add_argument("--n", type=int, default=1, help="register 要建立的帳號數")
+    ap.add_argument("--caps", default="",
+                    help="register 的目標能力（逗號分隔，如 profile_complete,verified）；"
+                         "labor 含 profile_complete 走完整資料送審，含 verified/shop_approved 自動後台審核")
     ap.add_argument("--review", action="store_true",
                     help="register 後順帶用後台管理員審核通過（帳密未設則跳過）")
     args = ap.parse_args(argv)
@@ -868,8 +914,10 @@ def main(argv: list[str] | None = None) -> int:
     elif args.cmd == "topup":
         print(pool.top_up(min_available=args.min_available, heal=not args.no_heal))
     elif args.cmd == "register":
-        results = pool.register_via_api(args.role, args.n)
-        if args.review:
+        want = [c.strip() for c in args.caps.split(",") if c.strip()]
+        results = pool.register_via_api(args.role, args.n, caps=want or None)
+        # 指定的目標 caps 含「需後台核准」的能力時自動審核（與看板 register_accounts 同邏輯）
+        if args.review or ({"verified", "shop_approved"} & set(want)):
             # 審核串接點集中在看板 service（後台管理員 client + caps 重探）；CLI 借用同一邏輯
             from .dashboard.service import DashboardService
             DashboardService(pool.s).auto_review_registered(results)

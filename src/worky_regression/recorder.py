@@ -112,16 +112,82 @@ class RecordingRunner:
         skip_reason = str(spec.get("skip_reason", "")).strip()
 
         steps: list[StepResult] = []
-        status = "passed"
-        failed_at: int | None = None
         stopped = skipped
-        tindex = -1  # transition 序號（與 chip 對應）；每遇 transition 步驟 +1
 
         emit("run_start", {"run_id": run_id, "started_at": ts, "total": len(spec["path"]),
                            "skipped": skipped, "skip_reason": skip_reason,
                            "transitions": [s.get("transition") for s in spec["path"]
                                            if s.get("transition")]})
 
+        desc = str(spec.get("description", "")).strip()
+        # 逐步落庫（崩潰留痕）：開頭先落 status='running'，每步結束即落一筆。
+        # 進程死掉時 QA 庫至少留有「跑到第幾步」；殘留的 running 列由看板啟動時收斂成
+        # interrupted。任何落庫失敗降級為「跑完一次性落地」，不可中斷執行；
+        # 正常結束仍由 _persist（冪等刪後重插）收尾，順帶修復漏寫。
+        live = write and self.qa_store is not None
+        if live:
+            try:
+                self.qa_store.begin_run(
+                    run_id=run_id, case_id=path_id, system=self.system,
+                    description=desc, started_at=ts, total=len(spec["path"]),
+                    actors=self._snapshot_actors(state))
+            except Exception as e:  # noqa: BLE001
+                live = False
+                print(f"[recorder] 逐步落庫失敗，降級為跑完一次性落地：{e}")
+
+        def live_step(sr: StepResult) -> None:
+            nonlocal live
+            if not live:
+                return
+            try:
+                self.qa_store.append_step(run_id, asdict(sr))
+            except Exception as e:  # noqa: BLE001
+                live = False
+                print(f"[recorder] 逐步落庫失敗，降級為跑完一次性落地：{e}")
+
+        try:
+            self._run_steps(spec, state, steps, emit, live_step, stopped)
+        except BaseException:
+            # 進程級中斷（Ctrl-C / SystemExit）：把已跑的部分收尾成 interrupted 再拋出。
+            # kill -9 連這裡都到不了——靠 begin_run 留下的 running 列 + 看板啟動收斂。
+            if write and self.qa_store is not None:
+                try:
+                    self._persist(RunResult(
+                        path_id=path_id, description=desc, started_at=ts,
+                        status="interrupted", steps=steps,
+                        failed_at=next((s.index for s in steps if s.status == "failed"), None),
+                        run_id=run_id, actors=self._snapshot_actors(state)))
+                except Exception:  # noqa: BLE001 — 收尾失敗不可吞掉原始中斷
+                    pass
+            raise
+        failed_at = next((s.index for s in steps if s.status == "failed"), None)
+        status = "failed" if failed_at is not None else "passed"
+
+        if skipped:
+            status = "skipped"   # 全程未執行，狀態獨立標記（前端顯示「略過」而非「失敗」）
+        result = RunResult(
+            path_id=path_id,
+            description=desc,
+            started_at=ts,
+            status=status,
+            steps=steps,
+            failed_at=failed_at,
+            run_id=run_id,
+            actors=self._snapshot_actors(state),
+        )
+        if write and self.qa_store is not None:
+            self._persist(result)
+        emit("run_end", {"status": status, "failed_at": failed_at,
+                        "skipped": skipped, "skip_reason": skip_reason,
+                        "passed": sum(1 for s in steps if s.status == "passed"),
+                        "total": len(steps)})
+        return result
+
+    def _run_steps(self, spec: dict, state, steps: list[StepResult],
+                   emit: Callable[[str, dict], None],
+                   live_step: Callable[[StepResult], None], stopped: bool) -> None:
+        """逐步執行主迴圈：結果 append 進 steps 並即時落庫（live_step）。"""
+        tindex = -1  # transition 序號（與 chip 對應）；每遇 transition 步驟 +1
         for i, step in enumerate(spec["path"]):
             is_db = "db_exec" in step
             is_sleep = "sleep" in step
@@ -143,10 +209,23 @@ class RecordingRunner:
             ti = (tindex := tindex + 1) if kind == "transition" else None
             if stopped:
                 steps.append(StepResult(i, kind, name, "skipped", 0))
+                live_step(steps[-1])
                 emit("step_end", {"index": i, "status": "skipped",
                                   "elapsed_ms": 0, "error": None, "tindex": ti})
                 continue
-            emit("step_start", {"index": i, "kind": kind, "name": name, "tindex": ti})
+            # 等待類步驟帶時長供前端倒計時：sleep 是精確秒數；wait_api 是逾時上限
+            # （條件滿足會提前結束），預設值與 runner._run_wait_api 一致。
+            # next_tindex = 下一個 transition 的 chip 序號——前端把「等待中 + 倒數」直接
+            # 疊在那顆 chip 上（如 J6 等待中 14:22）；等待在最後一個 transition 之後時
+            # 沒有下一顆，前端退回尾部掛暫時 chip。
+            wait_secs = None
+            if is_wait_api:
+                wait_secs = float(step["wait_api"].get("timeout", 30))
+            elif is_sleep:
+                wait_secs = float(step["sleep"])
+            emit("step_start", {"index": i, "kind": kind, "name": name, "tindex": ti,
+                                "wait_secs": wait_secs,
+                                "next_tindex": (None if ti is not None else tindex + 1)})
             t0 = time.time()
             try:
                 if is_db:
@@ -163,35 +242,17 @@ class RecordingRunner:
                     obs = self.runner._run_step(step, state)
                 elapsed = int((time.time() - t0) * 1000)
                 steps.append(StepResult(i, kind, name, "passed", elapsed, obs or {}))
+                live_step(steps[-1])
                 emit("step_end", {"index": i, "status": "passed",
                                   "elapsed_ms": elapsed, "error": None, "tindex": ti})
             except Exception as e:  # noqa: BLE001 — 記錄任何失敗，含 AssertionError
                 elapsed = int((time.time() - t0) * 1000)
                 err = f"{type(e).__name__}: {e}"
                 steps.append(StepResult(i, kind, name, "failed", elapsed, error=err))
-                status, failed_at, stopped = "failed", i, True
+                live_step(steps[-1])
+                stopped = True
                 emit("step_end", {"index": i, "status": "failed",
                                   "elapsed_ms": elapsed, "error": err, "tindex": ti})
-
-        if skipped:
-            status = "skipped"   # 全程未執行，狀態獨立標記（前端顯示「略過」而非「失敗」）
-        result = RunResult(
-            path_id=path_id,
-            description=str(spec.get("description", "")).strip(),
-            started_at=ts,
-            status=status,
-            steps=steps,
-            failed_at=failed_at,
-            run_id=run_id,
-            actors=self._snapshot_actors(state),
-        )
-        if write and self.qa_store is not None:
-            self._persist(result)
-        emit("run_end", {"status": status, "failed_at": failed_at,
-                        "skipped": skipped, "skip_reason": skip_reason,
-                        "passed": sum(1 for s in steps if s.status == "passed"),
-                        "total": len(steps)})
-        return result
 
     @staticmethod
     def _snapshot_actors(state) -> dict[str, dict[str, Any]]:
