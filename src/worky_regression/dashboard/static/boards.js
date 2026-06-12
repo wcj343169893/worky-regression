@@ -3,7 +3,7 @@
 
 import {
   $, api, esc, money, fmtTs, fmtDate8, laborName, shopName, empName,
-  badge, resBadge, contractCat, CAT_COLOR, toast, PAGE, state, OPT,
+  badge, resBadge, contractCat, CAT_COLOR, toast, PAGE, state, OPT, urlPager,
 } from "./util.js";
 
 // 最近執行結果 / 執行次數（Issue #1：把看板綁回測試框架）。沿用用例頁 resBadge 風格。
@@ -69,6 +69,8 @@ export async function renderBoard(key) {
   const cfg = BOARDS[key];
   const s = state[key] || (state[key] = { q: "", page: 0, category: "", selSn: null, filters: {} });
   s.filters = s.filters || {};
+  // URL 帶 ?page=N&limit=M（翻頁時寫入）→ 還原分頁狀態（刷新 / 分享連結停在同一頁）
+  if (location.hash.includes("?")) { const up = urlPager(); s.page = up.page; s.limit = up.limit; }
   $("view").innerHTML = `
     <div class="board">
       <aside class="col-left">
@@ -139,7 +141,8 @@ export async function renderBoard(key) {
 
 async function loadBoardList(key) {
   const cfg = BOARDS[key], s = state[key];
-  const params = new URLSearchParams({ q: s.q, limit: PAGE, offset: s.page * PAGE });
+  const lim = s.limit || PAGE;
+  const params = new URLSearchParams({ q: s.q, limit: lim, offset: s.page * lim });
   if (s.category !== "") params.set(cfg.filterParam, s.category);
   applyFilterParams(params, cfg, s);
   if ($("rows")) $("rows").style.opacity = ".45";

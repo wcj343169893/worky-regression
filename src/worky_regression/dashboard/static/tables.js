@@ -1,7 +1,7 @@
 "use strict";
 // 管理表格引擎（打工夥伴 / 商家 / 店鋪，整頁清單，無詳情抽屜）。
 
-import { $, api, apiPost, esc, fmtTs, stars, flag, toast, PAGE, state, OPT } from "./util.js";
+import { $, api, apiPost, esc, fmtTs, stars, flag, toast, PAGE, state, OPT, urlPager } from "./util.js";
 import { filterBar, bindFilters, applyFilterParams, fillRows, openModal, closeModal } from "./widgets.js";
 
 // 審核操作欄：待審才顯示「通過 / 駁回」按鈕（資料以接口呼叫後台管理員審核）。
@@ -70,6 +70,8 @@ export async function renderTable(key) {
   const cfg = TABLES[key];
   const s = state[key] || (state[key] = { q: "", page: 0, filters: {} });
   s.filters = s.filters || {};
+  // URL 帶 ?page=N&limit=M（翻頁時寫入）→ 還原分頁狀態（刷新 / 分享連結停在同一頁）
+  if (location.hash.includes("?")) { const up = urlPager(); s.page = up.page; s.limit = up.limit; }
   $("view").innerHTML = `
     <div class="view-head">
       <h2>${esc(cfg.title)}</h2>
@@ -134,7 +136,8 @@ function doReview(key, id, approve) {
 
 async function loadTableList(key) {
   const cfg = TABLES[key], s = state[key];
-  const params = new URLSearchParams({ q: s.q, limit: PAGE, offset: s.page * PAGE });
+  const lim = s.limit || PAGE;
+  const params = new URLSearchParams({ q: s.q, limit: lim, offset: s.page * lim });
   applyFilterParams(params, cfg, s);
   if ($("rows")) $("rows").style.opacity = ".45";
   const data = await api(cfg.url + "?" + params).catch((e) => (toast(e.message), null));

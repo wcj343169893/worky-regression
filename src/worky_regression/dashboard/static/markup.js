@@ -2,7 +2,7 @@
 // 頁面標記（mark up）：右上按鈕開標記模式 → 點選頁面元素 → 彈窗填內容 →
 // 連同 CSS 選擇器 / 元素文字 / 路由 / 座標 / 整頁截圖存到後端，交 headless Claude worker 處理。
 
-import { $, api, apiPost, esc, toast, fmtTs } from "./util.js";
+import { $, api, apiPost, esc, toast, fmtTs, urlPager, syncUrlPager } from "./util.js";
 import { openModal, closeModal } from "./widgets.js";
 
 let active = false;          // 是否在標記模式
@@ -25,6 +25,9 @@ function loadHtml2Canvas() {
 }
 
 // ── CSS 選擇器：從目標往上走到帶 id 的祖先或 body，組可定位的路徑 ───────────
+// 帶穩定身份屬性（data-id 等）的節點用屬性選擇器錨定；否則才退回 nth-of-type。
+// nth-of-type 是位置型：清單插入新列後第 K 列就是別人了，標記會「漂」到別條數據上。
+const STABLE_ATTRS = ["data-id", "data-cid", "data-sn", "data-aid", "data-key"];
 function cssPath(el) {
   if (!(el instanceof Element)) return "";
   const parts = [];
@@ -32,15 +35,20 @@ function cssPath(el) {
   while (node && node.nodeType === 1 && node !== document.body) {
     if (node.id) { parts.unshift(`#${CSS.escape(node.id)}`); break; }
     let sel = node.nodeName.toLowerCase();
-    const cls = (node.className && typeof node.className === "string")
-      ? node.className.trim().split(/\s+/).filter((c) => c && !c.startsWith("markup-")).slice(0, 2)
-      : [];
-    if (cls.length) sel += "." + cls.map((c) => CSS.escape(c)).join(".");
-    // 同類兄弟加 nth-of-type 以唯一定位
-    const parent = node.parentNode;
-    if (parent) {
-      const sames = Array.from(parent.children).filter((c) => c.nodeName === node.nodeName);
-      if (sames.length > 1) sel += `:nth-of-type(${sames.indexOf(node) + 1})`;
+    const anchor = STABLE_ATTRS.map((a) => [a, node.getAttribute(a)]).find(([, v]) => v);
+    if (anchor) {
+      sel += `[${anchor[0]}="${anchor[1].replace(/(["\\])/g, "\\$1")}"]`;
+    } else {
+      const cls = (node.className && typeof node.className === "string")
+        ? node.className.trim().split(/\s+/).filter((c) => c && !c.startsWith("markup-")).slice(0, 2)
+        : [];
+      if (cls.length) sel += "." + cls.map((c) => CSS.escape(c)).join(".");
+      // 同類兄弟加 nth-of-type 以唯一定位
+      const parent = node.parentNode;
+      if (parent) {
+        const sames = Array.from(parent.children).filter((c) => c.nodeName === node.nodeName);
+        if (sames.length > 1) sel += `:nth-of-type(${sames.indexOf(node) + 1})`;
+      }
     }
     parts.unshift(sel);
     node = node.parentNode;
@@ -111,7 +119,7 @@ export function toggleMarkupMode() { active ? exitMode() : enterMode(); }
 // ── 點選後：算定位資訊 + 截圖 + 開彈窗 ───────────────────────────────────────
 async function captureAndPopup(el) {
   const r = el.getBoundingClientRect();
-  const route = (location.hash.replace("#", "") || "jobs");
+  const route = curRoute();
   const info = {
     route,
     selector: cssPath(el),
@@ -188,7 +196,7 @@ const fmtMs = (ms) => !ms ? "" : ms >= 60000 ? `${Math.round(ms / 60000)}m${Math
 // 後者仍需所有標記才能在各頁畫框；前者只取當前頁切片，附 status / q 條件。
 const MARKUP_STATUSES = [["", "全部"], ["pending", "待處理"], ["processing", "處理中"], ["done", "已完成"], ["failed", "失敗"]];
 const MARKUP_PAGE_SIZE = 20;
-let mq = { status: "", q: "", page: 0 };   // 管理頁查詢狀態（跨重渲染保留）
+let mq = { status: "", q: "", page: 0, limit: MARKUP_PAGE_SIZE };   // 管理頁查詢狀態（跨重渲染保留）
 let mqTotal = 0;                            // 最近一次查詢的符合總筆數（算頁數用）
 
 function markupCardHtml(m) {
@@ -307,17 +315,22 @@ function fillMarkupList(box, items, { preserveDrafts = false } = {}) {
 async function loadMarkupPage({ preserveDrafts = false } = {}) {
   const box = $("markup-list");
   if (!box) return;
+  const lim = mq.limit || MARKUP_PAGE_SIZE;
   const params = new URLSearchParams({
-    limit: String(MARKUP_PAGE_SIZE), offset: String(mq.page * MARKUP_PAGE_SIZE),
+    limit: String(lim), offset: String(mq.page * lim),
   });
   if (mq.status) params.set("status", mq.status);
   if (mq.q) params.set("q", mq.q);
   try {
     const d = await api(`/api/markups?${params.toString()}`);
     mqTotal = d.total || 0;
-    // 當前頁可能因刪除/篩選而越界（如刪到本頁最後一筆）→ 回退一頁重抓
-    const pages = Math.max(1, Math.ceil(mqTotal / MARKUP_PAGE_SIZE));
-    if (mq.page > pages - 1 && mq.page > 0) { mq.page = pages - 1; return loadMarkupPage({ preserveDrafts }); }
+    // 當前頁可能因刪除/篩選而越界（如刪到本頁最後一筆）→ 回退一頁重抓（URL 同步回退）
+    const pages = Math.max(1, Math.ceil(mqTotal / lim));
+    if (mq.page > pages - 1 && mq.page > 0) {
+      mq.page = pages - 1;
+      if (location.hash.includes("?")) syncUrlPager(mq.page, lim);
+      return loadMarkupPage({ preserveDrafts });
+    }
     fillMarkupList(box, d.items || [], { preserveDrafts });
     updateMarkupPager(pages);
   } catch (e) {
@@ -352,6 +365,8 @@ export async function renderMarkups(tabKey) {
   // 由雜湊（#markups/<status>）定位狀態 tab；缺省 / 不合法 → 全部("")
   const status = MARKUP_STATUS_KEYS.includes(tabKey) ? tabKey : "";
   if (status !== mq.status) { mq.status = status; mq.page = 0; }
+  // URL 帶 ?page=N&limit=M（翻頁時寫入）→ 還原分頁狀態（放在切 tab 歸零之後，同頁刷新時 URL 優先）
+  if (location.hash.includes("?")) { const up = urlPager(MARKUP_PAGE_SIZE); mq.page = up.page; mq.limit = up.limit; }
   const view = $("view");
   const tabs = MARKUP_STATUSES.map(([k, l]) =>
     `<button class="dc-tab${k === mq.status ? " active" : ""}" data-st="${k}">${l}</button>`).join("");
@@ -409,12 +424,13 @@ export async function renderMarkups(tabKey) {
     clearTimeout(t); mq.q = e.target.value;
     t = setTimeout(() => { mq.page = 0; loadMarkupPage(); }, 300);
   };
-  // 翻頁
-  const pagesNow = () => Math.max(1, Math.ceil(mqTotal / MARKUP_PAGE_SIZE));
-  $("mq-first").onclick = () => { if (mq.page > 0) { mq.page = 0; loadMarkupPage(); } };
-  $("mq-prev").onclick = () => { if (mq.page > 0) { mq.page--; loadMarkupPage(); } };
-  $("mq-next").onclick = () => { if (mq.page < pagesNow() - 1) { mq.page++; loadMarkupPage(); } };
-  $("mq-last").onclick = () => { const p = pagesNow() - 1; if (mq.page < p) { mq.page = p; loadMarkupPage(); } };
+  // 翻頁：點擊後把 page/limit 寫回 URL（replaceState，刷新 / 分享連結可還原）
+  const pagesNow = () => Math.max(1, Math.ceil(mqTotal / (mq.limit || MARKUP_PAGE_SIZE)));
+  const goMqPage = (p) => { mq.page = p; syncUrlPager(mq.page, mq.limit || MARKUP_PAGE_SIZE); loadMarkupPage(); };
+  $("mq-first").onclick = () => { if (mq.page > 0) goMqPage(0); };
+  $("mq-prev").onclick = () => { if (mq.page > 0) goMqPage(mq.page - 1); };
+  $("mq-next").onclick = () => { if (mq.page < pagesNow() - 1) goMqPage(mq.page + 1); };
+  $("mq-last").onclick = () => { const p = pagesNow() - 1; if (mq.page < p) goMqPage(p); };
   loadMarkupPage();
 }
 
@@ -435,7 +451,9 @@ let repositionRaf = 0;
 let pollTimer = 0;
 let lastSig = "";
 
-function curRoute() { return location.hash.replace("#", "") || "jobs"; }
+// route 一律去掉 hash 裡的查詢段（#cases?page=2 → cases）：標記入庫與服務端 route 過濾
+// 都要用乾淨值，否則翻頁後的標記會存成髒 route、畫框時也對不上。
+function curRoute() { return (location.hash.replace("#", "").split("?")[0]) || "jobs"; }
 
 function ensureOverlayLayer() {
   if (overlayLayer) return overlayLayer;
@@ -446,8 +464,21 @@ function ensureOverlayLayer() {
   return overlayLayer;
 }
 
+// 一般頁面畫框/輪詢只拉「當前 route 的未解決標記」（服務端過濾，避免全量掃描）；
+// 標記管理頁仍全量——清單要看所有 route 與已解決項（自帶 status/q 分頁查詢）。
+function overlayQuery() {
+  const r = curRoute();
+  return r.split("/")[0] === "markups"
+    ? "/api/markups?limit=200"
+    : `/api/markups?limit=200&route=${encodeURIComponent(r)}&resolved=0`;
+}
+let markupCacheKey = "";
 function loadMarkupsForOverlay(force = false) {
-  if (force || !markupCache) markupCache = api("/api/markups?limit=200").then((d) => d.items || []).catch(() => []);
+  const key = overlayQuery();
+  if (force || !markupCache || key !== markupCacheKey) {   // 換頁（route 變）即重抓
+    markupCacheKey = key;
+    markupCache = api(key).then((d) => d.items || []).catch(() => []);
+  }
   return markupCache;
 }
 function invalidateMarkupCache() { markupCache = null; }
@@ -463,10 +494,12 @@ function hasInFlight(items) {
 async function pollMarkups() {
   pollTimer = 0;
   let items = null;
+  const key = overlayQuery();
   if (!document.hidden) {
-    try { items = (await api("/api/markups?limit=200")).items || []; } catch (_) { items = null; }
+    try { items = (await api(key)).items || []; } catch (_) { items = null; }
   }
   if (items) {
+    markupCacheKey = key;
     markupCache = Promise.resolve(items);          // 餵給 overlay / renderMarkups 共用
     const sig = statusSig(items);
     if (sig !== lastSig) {                          // 狀態有變 → 重畫框 + 就地更新管理頁
@@ -511,6 +544,29 @@ function scheduleReposition() {
   repositionRaf = requestAnimationFrame(() => { repositionRaf = 0; positionOverlays(); });
 }
 
+// 標記 → 目標元素。selector 直查為主；對「位置型選擇器被新增列擠位」的舊標記，
+// 用捕捉時存的 element_text 在同形元素中找回——僅在**唯一匹配**時改判（寧可框錯位置
+// 也不亂跳，避免文字撞車誤吸到別條數據）。新標記的 selector 已帶 data-id 錨點，不需要這層。
+function locateMarkupTarget(m) {
+  let el = null;
+  if (m.selector) { try { el = document.querySelector(m.selector); } catch (_) { el = null; } }
+  const want = (m.element_text || "").trim().slice(0, 80);
+  if (!want) return el;
+  const textOf = (n) => ((n.innerText || n.textContent || "").trim().slice(0, 80));
+  if (el && textOf(el) === want) return el;
+  let pool = [];
+  if (m.selector) {
+    try { pool = Array.from(document.querySelectorAll(m.selector.replace(/:nth-of-type\(\d+\)/g, ""))); }
+    catch (_) { pool = []; }
+  }
+  const exact = pool.filter((n) => textOf(n) === want);
+  if (exact.length === 1) return exact[0];
+  const firstLine = want.split("\n")[0];
+  const part = firstLine ? pool.filter((n) => (n.innerText || "").includes(firstLine)) : [];
+  if (part.length === 1) return part[0];
+  return el;
+}
+
 async function refreshOverlays() {
   const layer = ensureOverlayLayer();
   const route = curRoute();
@@ -522,8 +578,7 @@ async function refreshOverlays() {
   for (const m of items) {
     if (m.route !== route) continue;
     if (m.resolved) continue;                  // 已解決 → 源頁面不畫框（取消解決後又會恢復）
-    let target = null;
-    if (m.selector) { try { target = document.querySelector(m.selector); } catch (_) { target = null; } }
+    const target = locateMarkupTarget(m);
     const fallback = (m.rect && typeof m.rect.x === "number") ? m.rect : null;
     if (!target && !fallback) continue;
     const cls = OVERLAY_CLS[m.status] || "pending";

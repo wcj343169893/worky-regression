@@ -1,7 +1,7 @@
 "use strict";
 // 共用 UI 元件：篩選列、翻頁、清單列渲染、詳情抽屜與小區塊。
 
-import { $, esc, PAGE } from "./util.js";
+import { $, esc, PAGE, syncUrlPager } from "./util.js";
 
 // ── 條件篩選列（看板與管理表共用）──────────────────────────────────────────
 export function filterBar(cfg, s) {
@@ -30,14 +30,20 @@ export function applyFilterParams(params, cfg, s) {
   });
 }
 
-// 翻頁元件共用：依 total 設定 #pginfo 與首/上/下/尾按鈕
+// 翻頁元件共用：依 total 設定 #pginfo 與首/上/下/尾按鈕。
+// 每頁筆數取 s.limit（無則 PAGE）；點擊翻頁時把 page/limit 寫回 URL（replaceState，
+// 不觸發重渲染），刷新 / 分享連結可還原到同一頁。
 export function setupPager(s, total, reload) {
-  const totalPages = Math.max(1, Math.ceil(total / PAGE));
+  const limit = s.limit || PAGE;
+  const totalPages = Math.max(1, Math.ceil(total / limit));
   $("pginfo").innerHTML = `第 <b>${s.page + 1}</b> / ${totalPages.toLocaleString()} 頁`;
   const atFirst = s.page === 0, atLast = s.page + 1 >= totalPages;
   $("first").disabled = atFirst; $("prev").disabled = atFirst;
   $("next").disabled = atLast; $("last").disabled = atLast;
-  const go = (p) => { const np = Math.min(Math.max(0, p), totalPages - 1); if (np !== s.page) { s.page = np; reload(); } };
+  const go = (p) => {
+    const np = Math.min(Math.max(0, p), totalPages - 1);
+    if (np !== s.page) { s.page = np; syncUrlPager(s.page, limit); reload(); }
+  };
   $("first").onclick = () => go(0);
   $("prev").onclick = () => go(s.page - 1);
   $("next").onclick = () => go(s.page + 1);

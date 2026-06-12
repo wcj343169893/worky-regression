@@ -1,7 +1,7 @@
 "use strict";
 // 測試用例（工作 / 任務）：列用例 + 執行 + AI 用例分解。
 
-import { $, api, apiPost, esc, fmtTs, resBadge, toast, PAGE, state, urlPager } from "./util.js";
+import { $, api, apiPost, esc, fmtTs, fmtTsS, resBadge, toast, PAGE, state, urlPager } from "./util.js";
 import { setupPager, openDrawer, openModal, closeModal } from "./widgets.js";
 
 export const CASES = {
@@ -133,6 +133,8 @@ export async function renderCases(key, tabKey, drillPath = []) {
   // 放在 tab / 下鑽歸零之後，確保「同頁刷新」時 URL 的 page 不被歸零蓋掉。
   if (location.hash.includes("?")) { const up = urlPager(); s.page = up.page; s.limit = up.limit; }
   const cur = tabByKey(s.tab);
+  // 是否在子任務層（已下鑽）：子任務列表多一欄勾選 + 「批量執行」按鈕
+  const inSub = !!s.parentId;
   // 內建 + 自訂 tab 依序渲染；自訂 tab 帶可移除的 ✕；末尾再接「＋新增」按鈕
   const tabsHtml = allTabs().map((t) =>
     `<button class="dc-tab${t.key === cur.key ? " active" : ""}" data-tab="${esc(t.key)}">${esc(t.label)}` +
@@ -142,7 +144,7 @@ export async function renderCases(key, tabKey, drillPath = []) {
   $("view").innerHTML = `
     <div class="cases-page">
       <div class="view-head"><h2>${esc(cfg.title)}</h2>
-        <span class="sub2">讀 cases/*.yaml（含 AI 產生的 generated/），依建立時間倒序；對應 results/ 顯示最近一次執行</span></div>
+        <span class="sub2">讀 cases/*.yaml（含 AI 產生的 generated/），依 id 倒序；對應 results/ 顯示最近一次執行</span></div>
       <div class="card ai-panel">
         <div class="panel-head"><h3>AI 用例分解</h3>
           <span class="sub2">自然語言用例 → DeepSeek 分解成任務流（存入 generated/）</span></div>
@@ -156,10 +158,11 @@ export async function renderCases(key, tabKey, drillPath = []) {
       <div class="card cases-list">
         <div class="crumbs" id="crumbs"></div>
         <div class="panel-head"><h3>用例清單</h3>
-          <input type="search" id="q" placeholder="搜尋 名稱 / 描述…" value="${esc(s.q)}" />
-          <button class="btn ghost danger" id="clear-all" title="清空所有測試用例與執行紀錄，重新測試（不影響帳號池 / 設定 / 標記）">🗑 清空全部</button></div>
+          ${inSub ? `<button class="btn primary" id="batch-run" disabled title="勾選下方子任務後串行逐條執行">▶ 批量執行</button>` : ""}
+          <button class="btn ghost danger" id="clear-all" title="清空所有測試用例與執行紀錄，重新測試（不影響帳號池 / 設定 / 標記）">🗑 清空全部</button>
+          <input type="search" id="q" placeholder="搜尋 名稱 / 描述…" value="${esc(s.q)}" /></div>
         <div class="table-wrap"><table>
-          <thead><tr><th>用例 ID / 描述</th><th>來源</th><th>建立時間</th><th class="num">步驟</th><th>任務流</th><th>最近結果</th><th class="act">操作</th></tr></thead>
+          <thead><tr>${inSub ? `<th class="ck-col"><input type="checkbox" id="ck-all" title="全選 / 取消全選" /></th>` : ""}<th>用例 ID / 描述</th><th>來源</th><th>建立時間</th><th class="num">步驟</th><th>任務流</th><th>最近結果</th><th class="act">操作</th></tr></thead>
           <tbody id="rows"></tbody>
         </table></div>
         <div class="pager">
@@ -181,6 +184,14 @@ export async function renderCases(key, tabKey, drillPath = []) {
     }, 300);
   };
   $("uc-go").onclick = () => doDecompose(key);
+  // 子任務層：全選勾選框 + 批量執行（勾選列串行逐條跑，共用帳號池避免並行互擾）
+  const ckAll = $("ck-all");
+  if (ckAll) ckAll.onchange = () => {
+    document.querySelectorAll(".row-ck").forEach((c) => { c.checked = ckAll.checked; });
+    updateBatchState();
+  };
+  const batchBtn = $("batch-run");
+  if (batchBtn) batchBtn.onclick = () => batchRun(key);
   // 清空全部：二次確認後清掉所有用例與執行紀錄（重新測試）；不動帳號池 / 設定 / 標記。
   const clearBtn = $("clear-all");
   if (clearBtn) clearBtn.onclick = () => confirmClearAll(key);
@@ -350,14 +361,71 @@ async function loadCases(key) {
   const data = await api("/api/cases?" + params).catch((e) => (toast(e.message), null));
   if (!data || !$("rows")) return;
   renderCaseRows(key, data.items);
+  applyLiveProgress(key, data.items);
   setupPager(s, data.total, () => loadCases(key));
+}
+
+// ── 執行中用例的進度還原（整頁刷新後 SSE 閉包已不在）────────────────────────
+// 後端對 status='running' 的最近 run 附帶 live（由逐步落庫推算的「正在跑哪一步」）：
+//   transition → 該 chip 點亮閃爍；wait_api/sleep（≥30s）→ 下一顆 chip 疊「等待中 + 倒數」
+//   （截止 = step_started_at + wait_secs）。本頁有活躍 SSE 的用例跳過（SSE 自己會畫）。
+// 只要清單裡有執行中用例，10s 後自動重載列表，讓 chip 着色跟著逐步落庫前進。
+let liveTimers = [];
+let liveReloadTimer = 0;
+const activeStreams = new Set();   // 本頁正在 runCaseStream 的用例 id
+function clearLiveProgress() {
+  liveTimers.forEach(clearInterval); liveTimers = [];
+  if (liveReloadTimer) { clearTimeout(liveReloadTimer); liveReloadTimer = 0; }
+}
+function applyLiveProgress(key, items) {
+  clearLiveProgress();
+  const fmtLeft = (s) => `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
+  let running = 0;
+  for (const c of items) {
+    const lr = c.last_result, lv = lr && lr.live;
+    if (!lr || lr.status !== "running") continue;
+    running++;
+    if (!lv || activeStreams.has(c.id)) continue;
+    const row = document.querySelector(`tr[data-id="${CSS.escape(c.id)}"]`);
+    if (!row) continue;
+    if (lv.kind === "transition") {
+      row.querySelector(`.tchip[data-ti="${lv.cur_tindex}"]`)?.classList.add("tchip-running");
+      continue;
+    }
+    if (!(lv.wait_secs >= 30)) continue;            // 短等待不展示（與 SSE 行為一致）
+    const end = (lv.step_started_at + lv.wait_secs) * 1000;
+    if (end <= Date.now()) continue;                // 估算已到期（條件可能快滿足）→ 等下輪重載
+    const target = lv.next_tindex != null ? row.querySelector(`.tchip[data-ti="${lv.next_tindex}"]`) : null;
+    let el = target, base;
+    if (el) {
+      el.classList.add("tchip-running", "tchip-waiting");
+      el.title = `${lv.name}（倒數至逾時上限，條件滿足即提前結束）`;
+      base = `${el.textContent} 等待中`;
+    } else {
+      const flow = row.querySelector(".tflow");
+      if (!flow) continue;
+      el = document.createElement("span");
+      el.className = "tchip tchip-running tchip-wait";
+      el.title = lv.name || "";
+      flow.appendChild(el);
+      base = "⏳ 等待中";
+    }
+    const tick = () => {
+      el.textContent = `${base} ${fmtLeft(Math.max(0, Math.round((end - Date.now()) / 1000)))}`;
+    };
+    tick();
+    liveTimers.push(setInterval(tick, 1000));
+  }
+  if (running) liveReloadTimer = setTimeout(() => loadCases(key), 10000);
 }
 
 function renderCaseRows(key, items) {
   const tb = $("rows");
   if (!tb) return;
+  // 子任務層多一欄勾選（與表頭的 ck-all / 批量執行按鈕成對出現）
+  const inSub = !!(state[key] && state[key].parentId);
   if (!items.length) {
-    tb.innerHTML = `<tr class="norow"><td colspan="7"><div class="empty">沒有用例</div></td></tr>`;
+    tb.innerHTML = `<tr class="norow"><td colspan="${inSub ? 8 : 7}"><div class="empty">沒有用例</div></td></tr>`;
     tb.style.opacity = "1"; return;
   }
   tb.innerHTML = items.map((c) => {
@@ -370,10 +438,16 @@ function renderCaseRows(key, items) {
       ? `<div class="tflow">${c.transitions.map((x, i) =>
           `<span class="tchip clickable ${tchipCls(tss[i])}" data-cid="${esc(c.id)}" data-ti="${i}" title="點擊看詳情">${esc(x.split("_")[0])}</span>`).join("")}</div>`
       : `<span class="sub2">db / 混合</span>`;
-    // 失敗時把第一個失敗步驟的錯誤掛在 title——滑過徽章即可看到原因，不必下鑽
-    const lrHtml = lr ? `<span${lr.error ? ` title="${esc(lr.error)}"` : ""}>${resBadge(lr.status)}</span>`
-      : `<span class="sub2">—</span>`;
-    return `<tr>
+    // 失敗時把第一個失敗步驟的錯誤掛在 title、略過時把 skip_reason 掛在 title——滑過徽章
+    // 即可看原因，不必下鑽；略過另在徽章下方顯示截斷的原因，讓「為什麼略過」一眼可見。
+    const isSkip = (lr && lr.status === "skipped") || c.skip;
+    const lrTip = (lr && lr.error) || (isSkip ? c.skip_reason : "");
+    const skipWhy = isSkip && c.skip_reason ? `<div class="sub2 skip-why">${esc(c.skip_reason)}</div>` : "";
+    const lrHtml = lr ? `<span${lrTip ? ` title="${esc(lrTip)}"` : ""}>${resBadge(lr.status)}</span>${skipWhy}`
+      : (c.skip ? `<span${lrTip ? ` title="${esc(lrTip)}"` : ""}>${resBadge("skipped")}</span>${skipWhy}`
+                : `<span class="sub2">—</span>`);
+    return `<tr data-id="${esc(c.id)}">
+      ${inSub ? `<td class="ck-col"><input type="checkbox" class="row-ck" data-id="${esc(c.id)}" /></td>` : ""}
       <td><div class="cid">${c.seq != null ? `<span class="seq">#${c.seq}</span>` : ""}<code>${esc(c.id)}</code></div><div class="sub2">${esc((c.description || "").slice(0, 50))}</div></td>
       <td><span class="pill">${c.source === "generated" ? "AI 產生" : "內建"}</span></td>
       <td><span class="sub2">${fmtTs(c.created_at)}</span></td>
@@ -389,6 +463,8 @@ function renderCaseRows(key, items) {
       </td></tr>`;
   }).join("");
   tb.style.opacity = "1";
+  tb.querySelectorAll(".row-ck").forEach((ck) => ck.onchange = updateBatchState);
+  updateBatchState();   // 重載清單後同步「批量執行」按鈕與全選框狀態（勾選隨列表重建歸零）
   tb.querySelectorAll(".view-btn").forEach((b) => b.onclick = () => openCaseDetail(b.dataset.id));
   tb.querySelectorAll(".run-btn").forEach((b) => b.onclick = () => runCase(key, b));
   tb.querySelectorAll(".copy-btn").forEach((b) => b.onclick = () => copyCase(key, b));
@@ -405,56 +481,199 @@ async function openCaseDetail(id) {
   $("drawer-body").innerHTML = d ? caseDetailHtml(d) : `<div class="empty">載入失敗</div>`;
 }
 
-// 執行：改走 SSE（/api/cases/run-stream），邊跑邊即時更新該列 chip——
+// 執行核心：走 SSE（/api/cases/run-stream），邊跑邊即時更新該列 chip——
 //   run_start  → 該列所有 chip 還原待跑底色
-//   step_start → 對應 chip 點亮「進行中」閃爍（橘）
-//   step_end   → 依結果為該 chip 上色（綠/紅/灰），局部刷新，不整頁重載
-//   run_end    → 局部更新該列「最近結果」欄 + 開抽屜顯示完整結果（不整頁重載）
-// 失敗/連線中斷則 toast 並還原按鈕。republish / swap / retry 仍走同步 POST，不受影響。
-function runCase(key, btn) {
+//   step_start → 對應 chip 點亮「進行中」閃爍（橘）；等待類步驟（wait_api/sleep，無對應
+//                chip）在任務流尾端掛暫時的「⏳ 等待中」chip——否則 wait_api 等十幾分鐘
+//                （如下班卡等 start_at 到點）看板毫無動靜，像死機
+//   step_end   → 依結果為該 chip 上色（綠/紅/灰），局部刷新，不整頁重載；等待 chip 移除
+//   run_end    → 局部更新該列「最近結果」欄（drawer 選項開啟時再開抽屜顯示完整結果）
+// 回傳 Promise（run_end / error / 連線中斷時 resolve，不 reject），供「執行」按鈕與
+// 批量執行共用：批量時串行 await、且 drawer:false 避免逐條彈抽屜。
+function runCaseStream(id, row, { drawer = true } = {}) {
+  return new Promise((resolve) => {
+    // 本頁開跑改由 SSE 畫進度：註冊 activeStreams 讓刷新還原跳過此用例，
+    // 並清掉既有的還原計時器（避免兩套計時器互搶 chip 文字）。
+    activeStreams.add(id);
+    clearLiveProgress();
+    const done = (v) => { activeStreams.delete(id); resolve(v); };
+    // 列表隨時可能重渲染（新增用例/翻頁/搜尋），閉包抓住的 row 會變成離線節點、
+    // 後續事件與計時器全更新到看不見的舊列——一律以 data-id 即時解析「現在掛在 DOM 上的那一列」。
+    const liveRow = () => {
+      if (!row || !row.isConnected) row = document.querySelector(`tr[data-id="${CSS.escape(id)}"]`);
+      return row;
+    };
+    // 以列為範圍取 chip（data-ti 為 transition 序號，與後端事件的 tindex 對齊）
+    const chip = (ti) => {
+      const r = liveRow();
+      return (ti == null || !r) ? null : r.querySelector(`.tchip[data-ti="${ti}"]`);
+    };
+    const restoreChip = (c) => {   // 還原被「等待中」裝飾過的 chip 原文字/標題/樣式
+      c.textContent = c.dataset.orig || c.textContent;
+      if (c.dataset.origTitle != null) c.title = c.dataset.origTitle;
+      c.classList.remove("tchip-running", "tchip-waiting");
+      delete c.dataset.orig; delete c.dataset.origTitle;
+    };
+    const setChip = (ti, cls) => {
+      const c = chip(ti);
+      if (!c) return;
+      if (c.classList.contains("tchip-waiting")) restoreChip(c);  // 防禦：殘留的等待裝飾
+      c.classList.remove("tchip-running", "tchip-pass", "tchip-fail", "tchip-skip");
+      if (cls) c.classList.add(cls);
+    };
+    const statusToCls = (st) => st === "passed" ? "tchip-pass" : st === "failed" ? "tchip-fail"
+      : st === "skipped" ? "tchip-skip" : "";
+    // 等待類步驟（tindex=null）的顯示：優先把「等待中 + 倒數」疊在下一顆 transition chip 上
+    // （如「J6 等待中 14:22」），沒有下一顆（等待在最後一個 transition 之後）才退回任務流
+    // 尾端掛暫時 chip；<30s 的短等待不展示。倒計時：sleep 是精確秒數；wait_api 倒向逾時上限
+    // （條件滿足會提前結束）。狀態存 waitState、每秒 applyWait()——除了倒數，也負責在列表
+    // 重渲染後把裝飾重新掛回新節點（自我修復），重渲染最多閃斷 1 秒。
+    const fmtLeft = (s) => `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
+    let waitState = null, waitTimer = 0;
+    const applyWait = () => {
+      if (!waitState) return;
+      const w = waitState;
+      const cd = ` ${fmtLeft(Math.max(0, Math.round((w.end - Date.now()) / 1000)))}`;
+      const r = liveRow();
+      if (!r) return;                       // 整列暫不在 DOM（重渲染瞬間），下一秒再試
+      if (w.nextTi != null) {
+        const c = r.querySelector(`.tchip[data-ti="${w.nextTi}"]`);
+        if (c) {
+          if (!c.classList.contains("tchip-waiting")) {   // 首次或重渲染後的新節點：掛裝飾
+            c.dataset.orig = c.textContent;
+            c.dataset.origTitle = c.title;
+            c.title = w.hint;
+            c.classList.add("tchip-running", "tchip-waiting");
+          }
+          c.textContent = `${c.dataset.orig} 等待中${cd}`;
+          return;
+        }
+        // 列在但沒這顆 chip（等待在最後一個 transition 之後）→ 落到尾部暫掛
+      }
+      const flow = r.querySelector(".tflow");
+      if (!flow) return;
+      let c = flow.querySelector(".tchip-wait");
+      if (!c) {                             // 首次或重渲染後：補回尾部暫時 chip
+        c = document.createElement("span");
+        c.className = "tchip tchip-running tchip-wait";
+        c.title = w.hint;
+        flow.appendChild(c);
+      }
+      c.textContent = `⏳ 等待中${cd}`;
+    };
+    const removeWaitChip = () => {
+      if (waitTimer) { clearInterval(waitTimer); waitTimer = 0; }
+      waitState = null;
+      const r = liveRow();
+      if (!r) return;
+      r.querySelectorAll(".tchip-wait").forEach((x) => x.remove());
+      r.querySelectorAll(".tchip-waiting").forEach(restoreChip);
+    };
+    const showWaitChip = (e) => {
+      removeWaitChip();
+      if (!(e.wait_secs >= 30)) return;   // 短等待（<30s 的 sleep / 快輪詢）不值得展示，免得 chip 閃來閃去
+      waitState = {
+        nextTi: e.next_tindex,
+        end: Date.now() + e.wait_secs * 1000,
+        hint: (e.name || "") + (e.kind === "wait_api" ? "（倒數至逾時上限，條件滿足即提前結束）" : ""),
+      };
+      applyWait();
+      waitTimer = setInterval(applyWait, 1000);
+    };
+
+    const es = new EventSource("/api/cases/run-stream?id=" + encodeURIComponent(id));
+    let startedAt = null;
+    es.onmessage = (ev) => {
+      let e; try { e = JSON.parse(ev.data); } catch { return; }
+      if (e.type === "run_start") {
+        startedAt = e.started_at;
+        // 還原該列所有 chip 為待跑底色（重跑時清掉上一輪殘留的綠/紅與等待 chip）
+        removeWaitChip();
+        const r0 = liveRow();
+        if (r0) r0.querySelectorAll(".tchip").forEach((c) =>
+          c.classList.remove("tchip-running", "tchip-pass", "tchip-fail", "tchip-skip"));
+      } else if (e.type === "step_start") {
+        if (e.tindex == null) {
+          if (e.kind === "wait_api" || e.kind === "sleep") showWaitChip(e);
+        } else setChip(e.tindex, "tchip-running"); // 進行中：閃爍
+      } else if (e.type === "step_end") {
+        if (e.tindex == null) removeWaitChip();
+        else setChip(e.tindex, statusToCls(e.status)); // 完成：上色（局部刷新）
+      } else if (e.type === "run_end") {
+        removeWaitChip();
+        es.close();
+        delete stepCache[id];                     // 清步驟詳情快取 → chip 點擊 modal 取最新結果
+        if (e.skipped) toast(`${id}：略過${e.skip_reason ? "（" + e.skip_reason + "）" : ""}`);
+        else toast(`${id}：${e.status === "passed" ? "通過" : "失敗"}（${e.passed}/${e.total}）`);
+        updateLastResultCell(liveRow(), e, startedAt);  // 局部更新「最近結果」欄，不整頁重載
+        if (drawer) showRunResultDrawer(id, e);   // 開抽屜顯示完整結果
+        done({ ok: true, status: e.status, skipped: !!e.skipped });
+      } else if (e.type === "error") {
+        removeWaitChip();
+        es.close();
+        toast("執行失敗：" + (e.error || "未知錯誤"));
+        done({ ok: false });
+      }
+    };
+    es.onerror = () => {
+      removeWaitChip();
+      es.close(); toast("執行中斷：與看板的連線已斷開"); done({ ok: false });
+    };
+  });
+}
+
+// 「執行」按鈕：單條執行（行為與既往一致——按鈕鎖定 + 完整結果抽屜）
+async function runCase(key, btn) {
   const id = btn.dataset.id, old = btn.textContent;
   const row = btn.closest("tr");
-  // 以列為範圍取 chip（data-ti 為 transition 序號，與後端事件的 tindex 對齊）
-  const chip = (ti) => (ti == null || !row) ? null : row.querySelector(`.tchip[data-ti="${ti}"]`);
-  const setChip = (ti, cls) => {
-    const c = chip(ti);
-    if (!c) return;
-    c.classList.remove("tchip-running", "tchip-pass", "tchip-fail", "tchip-skip");
-    if (cls) c.classList.add(cls);
-  };
-  const finish = () => { btn.disabled = false; btn.textContent = old; };
-  const statusToCls = (st) => st === "passed" ? "tchip-pass" : st === "failed" ? "tchip-fail"
-    : st === "skipped" ? "tchip-skip" : "";
-
   btn.disabled = true; btn.textContent = "執行中…";
   toast(`執行中：${id}（登入 + 呼叫被測 API，請稍候）`);
+  await runCaseStream(id, row);
+  btn.disabled = false; btn.textContent = old;
+}
 
-  const es = new EventSource("/api/cases/run-stream?id=" + encodeURIComponent(id));
-  let startedAt = null, total = 0;
-  es.onmessage = (ev) => {
-    let e; try { e = JSON.parse(ev.data); } catch { return; }
-    if (e.type === "run_start") {
-      startedAt = e.started_at; total = e.total;
-      // 還原該列所有 chip 為待跑底色（重跑時清掉上一輪殘留的綠/紅）
-      if (row) row.querySelectorAll(".tchip").forEach((c) =>
-        c.classList.remove("tchip-running", "tchip-pass", "tchip-fail", "tchip-skip"));
-    } else if (e.type === "step_start") {
-      setChip(e.tindex, "tchip-running");       // 進行中：閃爍
-    } else if (e.type === "step_end") {
-      setChip(e.tindex, statusToCls(e.status)); // 完成：上色（局部刷新）
-    } else if (e.type === "run_end") {
-      es.close(); finish();
-      delete stepCache[id];                     // 清步驟詳情快取 → chip 點擊 modal 取最新結果
-      if (e.skipped) toast(`${id}：略過${e.skip_reason ? "（" + e.skip_reason + "）" : ""}`);
-      else toast(`${id}：${e.status === "passed" ? "通過" : "失敗"}（${e.passed}/${e.total}）`);
-      updateLastResultCell(row, e, startedAt);  // 局部更新「最近結果」欄，不整頁重載
-      showRunResultDrawer(id, e);               // 開抽屜顯示完整結果
-    } else if (e.type === "error") {
-      es.close(); finish();
-      toast("執行失敗：" + (e.error || "未知錯誤"));
-    }
-  };
-  es.onerror = () => { es.close(); finish(); toast("執行中斷：與看板的連線已斷開"); };
+// ── 子任務勾選 + 批量執行 ────────────────────────────────────────────────────
+// 同步「批量執行」按鈕（啟用態 + 已勾數）與表頭全選框（全勾 / 半勾）狀態
+function updateBatchState() {
+  const btn = $("batch-run");
+  if (!btn) return;   // 頂層（無勾選欄）直接略過
+  const all = document.querySelectorAll(".row-ck");
+  const checked = document.querySelectorAll(".row-ck:checked");
+  if (!btn.dataset.running) {
+    btn.disabled = checked.length === 0;
+    btn.textContent = checked.length ? `▶ 批量執行（${checked.length}）` : "▶ 批量執行";
+  }
+  const ca = $("ck-all");
+  if (ca) {
+    ca.checked = all.length > 0 && checked.length === all.length;
+    ca.indeterminate = checked.length > 0 && checked.length < all.length;
+  }
+}
+
+// 批量執行：勾選的子任務**串行**逐條跑（共用帳號池與被測環境，並行易互相干擾），
+// 每條沿用單條執行的 SSE 即時 chip 上色與「最近結果」局部更新；不逐條彈抽屜，
+// 全部跑完 toast 彙總。執行期間鎖定批量按鈕、各列「執行」按鈕與勾選框，避免重入。
+async function batchRun(key) {
+  const btn = $("batch-run");
+  const picked = Array.from(document.querySelectorAll(".row-ck:checked"));
+  if (!picked.length) { toast("請先勾選要執行的子任務"); return; }
+  const lockEls = document.querySelectorAll(".row-ck, #ck-all, .run-btn, .republish-btn");
+  btn.dataset.running = "1"; btn.disabled = true;
+  lockEls.forEach((el) => { el.disabled = true; });
+  toast(`批量執行中：共 ${picked.length} 條子任務（串行逐條，請稍候）`);
+  let pass = 0, fail = 0, skip = 0;
+  for (let i = 0; i < picked.length; i++) {
+    const id = picked[i].dataset.id, row = picked[i].closest("tr");
+    btn.textContent = `批量執行中 ${i + 1}/${picked.length}…`;
+    const r = await runCaseStream(id, row, { drawer: false });
+    if (r.ok && r.skipped) skip++;
+    else if (r.ok && r.status === "passed") pass++;
+    else fail++;
+  }
+  toast(`批量執行完成：通過 ${pass} / 失敗 ${fail}${skip ? ` / 略過 ${skip}` : ""}（共 ${picked.length} 條）`);
+  delete btn.dataset.running;
+  lockEls.forEach((el) => { el.disabled = false; });
+  updateBatchState();
 }
 
 // run_end 後局部更新該列「最近結果」欄（td.act 前一格），免整頁重載即反映本次結果
@@ -476,7 +695,7 @@ async function showRunResultDrawer(id, e) {
   } catch (_) { /* 抽屜僅輔助，失敗不影響已即時更新的 chip */ }
 }
 
-// 以既有用例 spec 為範本快速再建一條新用例（不含執行歷史），刷新後新列因 mtime 最新排到最前
+// 以既有用例 spec 為範本快速再建一條新用例（不含執行歷史），刷新後新列因序號（seq）最大排到最前
 async function copyCase(key, btn) {
   const id = btn.dataset.id, old = btn.textContent;
   btn.disabled = true; btn.textContent = "複製中…";
@@ -491,7 +710,7 @@ async function copyCase(key, btn) {
 // 重新發佈：以該用例 spec 為範本複製成新 id 後「立即執行」，讓時間綁定用例每次發佈都
 // 落成一筆全新獨立記錄（執行歷史掛在新 id 下，完全不動原用例與其歷史）。仿 runCase：
 // disabled + toast 提示 → POST → 成功 toast + 開抽屜顯示這次發佈的執行結果 → 刷新清單
-// （新列 mtime 最新會排到最前）。
+// （新列序號（seq）最大會排到最前）。
 async function republishCase(key, btn) {
   const id = btn.dataset.id, old = btn.textContent;
   btn.disabled = true; btn.textContent = "發佈中…";
@@ -527,7 +746,8 @@ function stepModalHtml(s, idx, total, runId) {
   const obs = r && r.observations && Object.keys(r.observations).length ? jsonBlock(r.observations) : "";
   const resultBody = r
     ? `<div class="sub2" style="margin-bottom:8px">${stepStatusBadge(r.status)}
-         ${r.elapsed_ms != null ? `<span class="sub2">· ${r.elapsed_ms}ms</span>` : ""}</div>
+         ${r.started_at ? `<span class="sub2">· 執行於 ${fmtTsS(r.started_at)}</span>` : ""}
+         ${r.elapsed_ms != null ? `<span class="sub2">· 耗時 ${r.elapsed_ms}ms</span>` : ""}</div>
        ${r.error ? `<div class="err">${esc(r.error)}</div>` : ""}
        ${obs ? `<div class="sub2" style="margin:6px 0 4px">observations</div>${obs}` : ""}`
     : `<div class="sub2">（此用例尚無執行記錄，下面僅顯示規格）</div>`;
@@ -575,7 +795,12 @@ function showStep(key, cid, data, idx) {
   if (aBtn) aBtn.onclick = async () => {
     const fix = $("sm-fix"); fix.innerHTML = `<div class="sub2">AI 分析中…</div>`;
     aBtn.disabled = true;
-    try { fix.innerHTML = analysisHtml(await apiPost("/api/cases/analyze", { id: cid, step_index: idx })); }
+    try {
+      const d = await apiPost("/api/cases/analyze", { id: cid, step_index: idx });
+      fix.innerHTML = analysisHtml(d);
+      const fxBtn = $("sm-ai-fix");
+      if (fxBtn) fxBtn.onclick = () => submitAiFix(fxBtn, cid, data, idx, d);
+    }
     catch (e) { fix.innerHTML = `<div class="err">分析失敗：${esc(e.message)}</div>`; }
     finally { aBtn.disabled = false; }
   };
@@ -629,15 +854,48 @@ function openFeedbackForm(cid, data, idx) {
   };
 }
 
-// AI 診斷結果渲染：根因 + 推理 + 建議 + 建議動作標籤（純顯示，不自動觸發）
+// AI 診斷結果渲染：根因 + 推理 + 建議 + 建議動作標籤 + AI修復按鈕
+// （按鈕綁定在 sm-analyze handler 裡——這裡是純模板，拿不到 cid/step 上下文）
 function analysisHtml(d) {
   const actLabel = { retry: "建議：重試", swap: "建議：換一個號", inspect: "建議：人工檢查", report: "疑似主倉 bug，建議回報" };
   return `<div class="ai-analysis">
     <div class="aa-cause">🔍 <b>${esc(d.cause || "")}</b></div>
     ${d.detail ? `<p class="sub2">${esc(d.detail)}</p>` : ""}
     ${d.suggestion ? `<p class="sub2">💡 ${esc(d.suggestion)}</p>` : ""}
-    <div class="aa-action"><span class="pill">${esc(actLabel[d.recommended_action] || d.recommended_action || "")}</span></div>
+    <div class="aa-action"><span class="pill">${esc(actLabel[d.recommended_action] || d.recommended_action || "")}</span>
+      <button class="btn mini primary" id="sm-ai-fix" title="把分析結果提交為標記，後台 worker 依建議自動修復">🤖 AI修復</button></div>
   </div>`;
+}
+
+// AI修復：把「AI 分析結果 + 用例關鍵信息」組成 content，建一條 kind=feedback 標記
+// （與意見反饋同一條自動修復管線，差別只是內容由分析結果自動生成、免手填）。
+async function submitAiFix(btn, cid, data, idx, d) {
+  const s = data.steps[idx] || {}, r = s.result || {};
+  const content = [
+    "【用例執行失敗 — AI修復】",
+    `用例：${cid}`,
+    `失敗步驟：[${idx + 1}/${data.steps.length}] ${s.name || s.short || ""}`,
+    s.endpoint ? `端點：${s.method || ""} ${s.endpoint}` : "",
+    data.run_id ? `run_id：${data.run_id}` : "",
+    r.error ? `錯誤：${r.error}` : "",
+    "",
+    "── AI 分析 ──",
+    d.cause ? `根因：${d.cause}` : "",
+    d.detail ? `推理：${d.detail}` : "",
+    d.suggestion ? `建議：${d.suggestion}` : "",
+    d.recommended_action ? `建議動作：${d.recommended_action}` : "",
+    "",
+    "請依上述分析自動修復（改用例 YAML / endpoints 規格 / 框架代碼；不要動被測主倉），修復後說明改了什麼。",
+  ].filter((x) => x !== "").join("\n");
+  btn.disabled = true; btn.textContent = "提交中…";
+  try {
+    await apiPost("/api/markups", { kind: "feedback", route: "cases", content });
+    btn.textContent = "✓ 已提交";
+    toast("AI修復標記已送出，後台 worker 將自動處理（「標記」頁可追蹤進度）");
+  } catch (e) {
+    toast("提交失敗：" + e.message);
+    btn.disabled = false; btn.textContent = "🤖 AI修復";
+  }
 }
 
 // 重試 / 換號：真打被測 API + 寫 DB（整支重跑），完成後清快取、刷新清單、重開同一步顯示新結果

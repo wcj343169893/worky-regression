@@ -3,7 +3,7 @@
 // 執行期 runner 從此池按 caps + 最久未用輪換配發；停用(disabled)者不被配發。
 // 版面沿用「測試用例」頁（cases-page / cases-list）：tab 列在上，清單撐滿視窗、表身可捲。
 
-import { $, api, apiPost, esc, fmtTs, toast, OPT } from "./util.js";
+import { $, api, apiPost, esc, fmtTs, toast, OPT, urlPager, syncUrlPager } from "./util.js";
 import { openModal, mini } from "./widgets.js";
 
 // tab 順序：商家在前、打工夥伴在後（與既有列出順序 employer/labor 一致）。
@@ -42,7 +42,8 @@ function selectedRegisterCaps(role) {
 
 let curRole = "employer";   // 當前選中的池（跨重渲染保留）
 let groupsByRole = {};      // 最近一次抓到的各角色分組（切 tab 不重抓）
-const ACC_PAGE_SIZE = 20;   // 每頁筆數（前端切片分頁；/api/accounts 已回各角色完整清單）
+const ACC_PAGE_SIZE = 20;      // 預設每頁筆數（前端切片分頁；/api/accounts 已回各角色完整清單）
+let accLimit = ACC_PAGE_SIZE;  // 實際每頁筆數（可由 URL ?limit= 覆寫）
 let pageByRole = {};        // role -> 當前頁碼（各池獨立、跨重繪保留）
 
 // 列出該商家(employer)的所有店鋪：打 /api/shops?employer_id= 後以彈窗呈現。
@@ -118,11 +119,11 @@ function paintRole() {
   warn.innerHTML = g.available < 2
     ? `<span class="set-status no">⚠ 可用僅 ${g.available} 個，登入失敗時無從換號（補池 worker 會自動補回）</span>` : "";
   // 前端切片分頁：取當前頁那一段；頁碼越界（如資料變少）夾回最後一頁
-  const pages = Math.max(1, Math.ceil(g.items.length / ACC_PAGE_SIZE));
+  const pages = Math.max(1, Math.ceil(g.items.length / accLimit));
   let page = pageByRole[curRole] || 0;
   if (page > pages - 1) page = pages - 1;
   pageByRole[curRole] = page;
-  tbody.innerHTML = g.items.slice(page * ACC_PAGE_SIZE, (page + 1) * ACC_PAGE_SIZE).map(rowHtml).join("");
+  tbody.innerHTML = g.items.slice(page * accLimit, (page + 1) * accLimit).map(rowHtml).join("");
   updateAccPager(pages, page);
 
   tbody.querySelectorAll("tr[data-aid]").forEach((tr) => {
@@ -173,6 +174,11 @@ function selectRole(role) {
 export async function renderAccounts(tabKey) {
   // 由雜湊（#accounts/<role>）定位當前池；缺省 / 不合法 → 預設池
   curRole = (tabKey === "labor" || tabKey === "employer") ? tabKey : DEFAULT_ROLE;
+  // URL 帶 ?page=N&limit=M（翻頁時寫入）→ 還原當前池的分頁狀態（刷新可停在同一頁）
+  if (location.hash.includes("?")) {
+    const up = urlPager(ACC_PAGE_SIZE);
+    pageByRole[curRole] = up.page; accLimit = up.limit;
+  }
   const d = await api("/api/accounts").catch((e) => (toast(e.message), null));
   if (!d) return;
   groupsByRole = {};
@@ -258,9 +264,10 @@ export async function renderAccounts(tabKey) {
     } catch (e) { toast("初始化失敗：" + e.message); btn.disabled = false; btn.textContent = old; }
   };
 
-  // 翻頁：改 pageByRole[curRole] 後重繪當前頁（前端切片，不重抓）
-  const accPages = () => Math.max(1, Math.ceil((groupsByRole[curRole]?.items.length || 0) / ACC_PAGE_SIZE));
-  const gotoAccPage = (p) => { pageByRole[curRole] = p; paintRole(); };
+  // 翻頁：改 pageByRole[curRole] 後重繪當前頁（前端切片，不重抓）；
+  // 點擊後把 page/limit 寫回 URL（replaceState，刷新 / 分享連結可還原）
+  const accPages = () => Math.max(1, Math.ceil((groupsByRole[curRole]?.items.length || 0) / accLimit));
+  const gotoAccPage = (p) => { pageByRole[curRole] = p; syncUrlPager(p, accLimit); paintRole(); };
   $("acc-first").onclick = () => { if ((pageByRole[curRole] || 0) > 0) gotoAccPage(0); };
   $("acc-prev").onclick = () => { const c = pageByRole[curRole] || 0; if (c > 0) gotoAccPage(c - 1); };
   $("acc-next").onclick = () => { const c = pageByRole[curRole] || 0; if (c < accPages() - 1) gotoAccPage(c + 1); };

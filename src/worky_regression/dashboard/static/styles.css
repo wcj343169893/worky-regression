@@ -151,13 +151,22 @@ textarea:focus{outline:none;border-color:var(--accent)}
 .tchip.tchip-pass{background:rgba(61,220,151,.16);border-color:var(--ok);color:var(--ok)}
 .tchip.tchip-fail{background:rgba(255,107,107,.18);border-color:var(--danger);color:var(--danger)}
 .tchip.tchip-skip{opacity:.55}
-/* 進行中：SSE step_start 點亮，背景橘色呼吸閃爍，step_end 後換成 pass/fail 色 */
-.tchip.tchip-running{background:rgba(255,180,84,.20);border-color:#ffb454;color:#ffb454;
+/* 進行中：SSE step_start 點亮，背景與邊框用 --warn 呼吸閃爍（文字不淡出），step_end 後換成 pass/fail 色 */
+.tchip.tchip-running{color:var(--warn);border-color:var(--warn);
+  background:color-mix(in srgb,var(--warn) 25%,transparent);
   animation:tchip-pulse 1s ease-in-out infinite}
-@keyframes tchip-pulse{0%,100%{opacity:1}50%{opacity:.35}}
+@keyframes tchip-pulse{
+  0%,100%{background:color-mix(in srgb,var(--warn) 40%,transparent);border-color:var(--warn)}
+  50%{background:color-mix(in srgb,var(--warn) 6%,transparent);
+      border-color:color-mix(in srgb,var(--warn) 30%,transparent)}}
+/* 等待類步驟（wait_api/sleep）執行中的暫時 chip：虛線框與正式 transition chip 區別 */
+.tchip.tchip-wait{border-style:dashed}
 /* 詳情頁：略過(skip)用例橫幅 */
 .skip-banner{margin:0 0 12px;padding:9px 12px;border-radius:10px;font-size:13px;
   background:rgba(255,180,84,.12);border:1px solid var(--warn);color:var(--warn)}
+/* 用例列表「最近結果」欄：略過原因截斷顯示（完整原因在徽章 title） */
+.skip-why{margin-top:3px;max-width:220px;overflow:hidden;text-overflow:ellipsis;
+  white-space:nowrap;color:var(--warn)}
 /* 詳情頁「參與帳號」表：角色 / 手機 / id / 型別 */
 .actors-table{width:100%;border-collapse:collapse;font-size:12px}
 .actors-table th,.actors-table td{text-align:left;padding:4px 8px;border-bottom:1px solid var(--line)}
@@ -211,7 +220,8 @@ textarea:focus{outline:none;border-color:var(--accent)}
 .ai-analysis{border:1px solid var(--line);border-radius:10px;padding:10px 12px;background:var(--panel2)}
 .ai-analysis .aa-cause{font-size:13px;margin-bottom:6px}
 .ai-analysis p{margin:4px 0}
-.ai-analysis .aa-action{margin-top:8px}
+.ai-analysis .aa-action{margin-top:8px;display:flex;align-items:center;gap:10px}
+.ai-analysis .aa-action .btn{margin-left:auto;margin-right:0}
 .cstep{display:flex;align-items:center;gap:8px;padding:5px 0;flex-wrap:wrap}
 .cstep .ci{width:20px;text-align:right;color:var(--muted);font-size:12px}
 .cstep code{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px;color:var(--muted);word-break:break-all}
@@ -228,6 +238,9 @@ textarea:focus{outline:none;border-color:var(--accent)}
 pre.yaml{background:var(--panel2);border:1px solid var(--line);border-radius:10px;padding:12px;
   overflow:auto;font-size:12px;max-height:340px;color:var(--muted);white-space:pre-wrap;word-break:break-word}
 td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
+/* 子任務批量執行：勾選欄（表頭全選 + 每列勾選） */
+td.ck-col,th.ck-col{width:1%;text-align:center;white-space:nowrap}
+.ck-col input[type=checkbox]{cursor:pointer;accent-color:var(--accent)}
 .mono{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px;color:var(--muted)}
 .strong{font-weight:700}
 .cid{display:flex;align-items:center;gap:7px}
@@ -320,7 +333,11 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
   padding:13px 16px;border-bottom:1px solid var(--line);flex-wrap:wrap}
 .panel-head h3{margin:0;font-size:15px}
 .panel-head .filters input[type=search]{min-width:170px}
-.mq-tools{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+/* 用例清單：標題與按鈕靠左成組，搜索框獨自貼右 */
+.cases-list .panel-head{justify-content:flex-start}
+.cases-list .panel-head #q{margin-left:auto}
+/* 標記清單工具列（搜索 + 新增）：貼到當前行最右側 */
+.mq-tools{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-left:auto;justify-content:flex-end}
 /* 帳號池「註冊入池」控制：靠右，數字框 + 按鈕 */
 .acc-reg{margin-left:auto;display:flex;align-items:center;gap:8px}
 .acc-reg input[type=number]{min-width:64px;width:72px}

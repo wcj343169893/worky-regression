@@ -24,6 +24,8 @@ export const pad = (n) => String(n).padStart(2, "0");
 export const resBadge = (st) => st === "passed" ? `<span class="badge b-done">通過</span>`
   : st === "failed" ? `<span class="badge b-failed">失敗</span>`
   : st === "skipped" ? `<span class="badge b-draft">略過</span>`
+  : st === "running" ? `<span class="badge b-running">執行中</span>`
+  : st === "interrupted" ? `<span class="badge b-canceled" title="執行途中看板進程終止，執行期上下文（帳號 token、擷取變數）已遺失，無法續跑；請點「執行」重新跑整支用例">中斷</span>`
   : `<span class="badge b-draft">${esc(st || "-")}</span>`;
 
 export function fmtTs(v) {
@@ -31,6 +33,13 @@ export function fmtTs(v) {
   const d = new Date(Number(v) * 1000);
   if (isNaN(d)) return "-";
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+// 秒級時間戳格式化（步驟執行時刻用，fmtTs 只到分鐘不夠分辨相鄰步驟）
+export function fmtTsS(v) {
+  if (!v) return "-";
+  const d = new Date(Number(v) * 1000);
+  if (isNaN(d)) return "-";
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
 }
 export function fmtDate8(v) {
   const s = String(v || "");
@@ -50,6 +59,24 @@ export function toast(msg) {
 }
 
 export const PAGE = 20;
+
+// ── 分頁狀態 ↔ URL（hash 查詢段：#view/...?page=N&limit=M）──────────────────
+// 翻頁/載入時用 history.replaceState 把 page/limit 寫回 URL（不觸發 hashchange、
+// 不重渲染、不增加歷史記錄）；渲染時讀回還原——刷新 / 分享連結都停在同一頁。
+// URL 的 page 為 1-based（給人看），內部一律 0-based。
+export function urlPager(defLimit = PAGE) {
+  const q = new URLSearchParams(location.hash.split("?")[1] || "");
+  const page = Math.max(0, (parseInt(q.get("page"), 10) || 1) - 1);
+  const limit = Math.min(200, Math.max(1, parseInt(q.get("limit"), 10) || defLimit));
+  return { page, limit };
+}
+export function syncUrlPager(page, limit) {
+  const path = location.hash.replace(/^#/, "").split("?")[0];
+  const q = new URLSearchParams(location.hash.split("?")[1] || "");
+  q.set("page", String((page || 0) + 1));
+  q.set("limit", String(limit));
+  history.replaceState(null, "", `#${path}?${q.toString()}`);
+}
 
 export const CAT_COLOR = { matching: "#5b8cff", recruited: "#2bd4c0", running: "#ffb454",
   done: "#3ddc97", failed: "#ff6b6b", canceled: "#5d6b8c", draft: "#5d6b8c" };

@@ -26,7 +26,8 @@ function route() {
   //   #view 或 #view/<sub>
   //   cases 用 #cases/<tab>/<父id>/<父id2>…：第一段 sub 為領域 tab，其後各段為下鑽父用例鏈，
   //   讓「查看子任務」的層級寫進 URL（刷新 / 前進後退皆可還原）。
-  let [key, ...rest] = (location.hash.replace("#", "") || "jobs").split("/");
+  // 先剝掉查詢段（?page=N&limit=M 由各模組分頁器讀寫，不參與路由）
+  let [key, ...rest] = ((location.hash.replace("#", "") || "jobs").split("?")[0]).split("/");
   // 相容舊雜湊：兩個用例入口已合併為單一 cases，正規化避免白屏
   if (key === "job-cases" || key === "task-cases") key = "cases";
   NAV.forEach((n) => { const b = document.querySelector(`.nav button[data-k="${n.key}"]`); if (b) b.classList.toggle("active", n.key === key); });
