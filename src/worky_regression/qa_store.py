@@ -191,7 +191,7 @@ class QAStore:
           start 偏移＋工時推算，硬避讓）。
         - publish：{employer_id: {count, last_at}} 今天 J1 發佈成功統計。
         """
-        empty: dict[str, Any] = {"accepted_pairs": set(), "recent_accepts": {}, "publish": {}}
+        empty: dict[str, Any] = {"accepted_pairs": set(), "occupied": {}, "publish": {}}
         with self._engine.begin() as conn:
             runs = conn.execute(text(
                 "SELECT run_id, case_id, started_at, actors FROM qa_runs "
@@ -605,6 +605,16 @@ class QAStore:
         with self._engine.connect() as conn:
             rows = conn.execute(sql, {"ids": case_ids}).all()
         return {str(r[0]): int(r[1]) for r in rows if r[1] is not None}
+
+    def case_id_by_seq(self, seq: int) -> str | None:
+        """以看板顯示序號（#N，即 qa_cases.seq）反查用例 id；無此序號回 None。
+
+        供「分解描述引用既有用例」（如「發佈一條 #2191 一樣的流程」）解析 #N 用。
+        """
+        with self._engine.connect() as conn:
+            v = conn.execute(text(
+                "SELECT id FROM qa_cases WHERE seq=:s"), {"s": seq}).scalar()
+            return str(v) if v is not None else None
 
     def case_id_exists(self, case_id: str) -> bool:
         with self._engine.connect() as conn:

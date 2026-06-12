@@ -26,6 +26,21 @@ class DBAccessDisabled(RuntimeError):
     """
 
 
+class StepAPIError(AssertionError):
+    """正向步驟 API 回 success=false 的結構化失敗。
+
+    比裸 AssertionError 多帶 ``code``（後端業務錯誤碼）與 ``actor_name``（執行本步的
+    具名 actor，bind 解析後，如 labor2），讓上層（RecordingRunner）能按錯誤碼做
+    「自動換號重試」——例如 30229/30213 同企業/商家每日僅限工作一次，換一個夥伴即可繞開。
+    """
+
+    def __init__(self, msg: str, *, code: int | None = None,
+                 actor_name: str | None = None) -> None:
+        super().__init__(msg)
+        self.code = code
+        self.actor_name = actor_name
+
+
 # staging 的 min_publish_interval_seconds / recruit_deadline_offset_seconds 約 600s，
 # 即工作開始時間只需比現在晚約 10 分鐘。這裡 buffer 取 900s（含請求延遲與 Python/PHP 時鐘飄移裕度）：
 # 「今天該時刻」距現在不足這個值就順延隔天，避免被後端 START_AT_IS_LESS_THAN_LIMIT 擋下。
@@ -240,6 +255,8 @@ class PathRunner:
         # 步驟級 role 重綁：bind: {labor: labor2} 讓本步的 request/驗證 SQL/push 目標
         # 一致指向 labor2（多身份用例必要，且完全不用改 endpoints.yaml 模板）。
         bind = step.get("bind")
+        # 本步實際出手的具名 actor（bind 解析後）；StepAPIError 帶上它，上層換號才知道換誰
+        actor_name = str((bind or {}).get(transition.actor_role, transition.actor_role))
         if bind:
             actors = dict(state.actors)
             for role, src in bind.items():
@@ -309,12 +326,13 @@ class PathRunner:
                 "checks": [{"kind": "expect_fail", "code": payload.get("code")}],
             }
 
-        # 正向：success=false 必失敗
+        # 正向：success=false 必失敗（StepAPIError 帶 code/actor_name，供上層按錯誤碼自動換號重試）
         if success is False:
-            raise AssertionError(
+            raise StepAPIError(
                 f"[{transition.name}] API success=false: "
                 f"code={payload.get('code')} message={payload.get('message')!r} "
-                f"data={payload.get('data')}"
+                f"data={payload.get('data')}",
+                code=payload.get("code"), actor_name=actor_name,
             )
 
         data = payload.get("data") if isinstance(payload.get("data"), dict) else payload

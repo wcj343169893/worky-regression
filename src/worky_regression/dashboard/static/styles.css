@@ -143,6 +143,18 @@ textarea:focus{outline:none;border-color:var(--accent)}
 .add-tab-actions{display:flex;justify-content:flex-end;gap:10px;margin-top:14px}
 .ai-form{display:flex;align-items:center;gap:12px;flex-wrap:wrap}
 .ai-form textarea{flex:1;min-width:280px}
+/* 分解輸入框 #N 引用高亮：textarea 文字透明（游標靠 caret-color 保留），
+   文字實際由 .uc-hl 鏡像層顯示——兩者字體/內距/行高/換行規則必須完全一致才能對位 */
+.uc-wrap{position:relative;flex:1;min-width:280px}
+.ai-form .uc-wrap textarea{width:100%;min-width:0;display:block;color:transparent;caret-color:var(--txt)}
+.uc-wrap textarea::placeholder{color:var(--muted)}
+.uc-hl{position:absolute;inset:0;pointer-events:none;overflow:hidden;
+  padding:10px 12px;border:1px solid transparent;border-radius:10px;
+  font-family:inherit;font-size:14px;color:var(--txt);
+  white-space:pre-wrap;overflow-wrap:break-word}
+.uc-wrap textarea,.uc-hl{line-height:1.45}
+.uc-ref{color:var(--accent);text-decoration:underline;cursor:pointer;pointer-events:auto;font-weight:600}
+.uc-ref:hover{filter:brightness(1.25)}
 .ck{display:flex;align-items:center;gap:6px;color:var(--muted);font-size:13px;white-space:nowrap;cursor:pointer}
 .tflow{display:flex;flex-wrap:wrap;gap:4px}
 .tchip{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:11px;padding:1px 7px;

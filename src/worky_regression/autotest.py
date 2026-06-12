@@ -19,7 +19,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -35,17 +37,20 @@ from .recorder import RecordingRunner
 from .verifier import DBVerifier
 
 ROOT = Path(__file__).resolve().parents[2]
-ACCOUNTS = ROOT / "cases" / "_fixtures" / "test_accounts.yaml"
 GENERATED = ROOT / "cases" / "generated"
 
+# job 系統「合格打工夥伴」的池配發能力（_actors_for 與自動換號 job_actor_swapper 共用；
+# 為何不要求 audit_role 見 _actors_for 內註解）
+JOB_LABOR_CAPS = ["verified", "profile_complete", "active", "clean"]
 
-def _build_actor(s: Settings, accounts: dict, role: str, key: str, user_type: int) -> Actor:
-    cfg = accounts[key]
-    client = WorkyClient(s, user_type=user_type)
-    actor = Actor(role=role, user_type=user_type, phone=cfg["phone"],
-                  user_id=cfg["id"], client=client, shop_id=cfg.get("shop_id"))
-    actor.login()
-    return actor
+# 承攬制 publisher / receiver 的池配發能力：兩角色都是 Labor（user_type=2，
+# /contract/* 全繼承 LaborApiController）。publisher 必須 verified——發佈任務後端
+# 檢查實名認證（50024 發案者身份未通過認證，實測無 verified 帳號必撞）；receiver
+# 不要求 verified（長期固定 receiver 276 無 verified 也全綠）。兩者都不要求
+# audit_role（audit 只閘固定碼登入，框架走 dev 發碼，理由同 job）。
+# publisher 配後另做發票 preflight（無發票發佈會 50045）。
+CONTRACT_PUBLISHER_CAPS = ["verified", "profile_complete", "active", "clean"]
+CONTRACT_RECEIVER_CAPS = ["profile_complete", "active", "clean"]
 
 
 def _actor_from_pool(s: Settings, pa: PooledAccount, role: str,
@@ -177,7 +182,8 @@ def _job_history(s: Settings) -> dict:
 
 
 def _pick_job_pair(s: Settings, pool: AccountPool, hist: dict, labor_caps: list[str],
-                   exclude: dict[str, list[str]]) -> tuple[Actor, list[Actor]]:
+                   exclude: dict[str, list[str]],
+                   window: tuple[int, int] | None = None) -> tuple[Actor, list[Actor]]:
     """選一個商家 + 2 個夥伴，避開後端「夥伴×商家×日」類限制。
 
     依配對史避讓（規則 → 對應錯誤碼）：
@@ -206,11 +212,11 @@ def _pick_job_pair(s: Settings, pool: AccountPool, hist: dict, labor_caps: list[
         if now - int(pub.get("last_at") or 0) < 600:
             deferred.append(emp)
             continue
-        la = _labors_for_employer(s, pool, emp, hist, labor_caps, ex_lab)
+        la = _labors_for_employer(s, pool, emp, hist, labor_caps, ex_lab, window)
         if la is not None:
             return emp, la
     for emp in deferred:
-        la = _labors_for_employer(s, pool, emp, hist, labor_caps, ex_lab)
+        la = _labors_for_employer(s, pool, emp, hist, labor_caps, ex_lab, window)
         if la is not None:
             print(f"  [actors] 商家 #{emp.user_id} 距上次發佈 <600s，可能撞發佈間隔（無其他可用商家）")
             return emp, la
@@ -243,15 +249,31 @@ def _labor_slot_conflict(actor: Actor, window: tuple[int, int]) -> bool:
                for it in items)
 
 
-def _acquire_clear_labors(s: Settings, pool: AccountPool, n: int, labor_caps: list[str],
-                          excluded: list[str]) -> list[Actor]:
-    """配 n 個「目標時段乾淨」的夥伴：每配一個就 preflight 時段衝突，髒的排除再補。
+def _slot_window(case_vars: dict | None) -> tuple[int, int]:
+    """用例目標時段的保守包絡（30207 preflight 用）。
 
-    目標時段取保守包絡 [now+11min, now+13min+130min]（新工作 start≈now+13min、
-    工時上限 120min + 緩衝）。excluded 會被就地擴充（呼叫端可繼續沿用）。
+    有 vars.job_start_after_minutes 時以實際偏移＋工時推算（前後加緩衝）——
+    「明天開工」類用例（after=1440）的佔用在明天，寫死 now+13min 包絡會全盲；
+    無 vars 沿用預設包絡 [now+11min, now+13min+130min]（start≈now+13min、工時上限 120min）。
     """
     now = int(time.time())
-    window = (now + 11 * 60, now + (13 + 120 + 10) * 60)
+    v = case_vars or {}
+    after = v.get("job_start_after_minutes")
+    if after is None:
+        return (now + 11 * 60, now + (13 + 120 + 10) * 60)
+    work = int(v.get("job_work_minutes", 120))
+    return (now + (int(after) - 2) * 60, now + (int(after) + work + 10) * 60)
+
+
+def _acquire_clear_labors(s: Settings, pool: AccountPool, n: int, labor_caps: list[str],
+                          excluded: list[str],
+                          window: tuple[int, int] | None = None) -> list[Actor]:
+    """配 n 個「目標時段乾淨」的夥伴：每配一個就 preflight 時段衝突，髒的排除再補。
+
+    window 為用例目標時段包絡（_slot_window；不給時用預設近時段包絡）。
+    excluded 會被就地擴充（呼叫端可繼續沿用）。
+    """
+    window = window or _slot_window(None)
     picked: list[Actor] = []
     while len(picked) < n:
         cands = _login_from_pool(s, pool, "labor", labor_caps, n - len(picked),
@@ -266,7 +288,8 @@ def _acquire_clear_labors(s: Settings, pool: AccountPool, n: int, labor_caps: li
 
 
 def _labors_for_employer(s: Settings, pool: AccountPool, emp: Actor, hist: dict,
-                         labor_caps: list[str], ex_lab: list[str]) -> list[Actor] | None:
+                         labor_caps: list[str], ex_lab: list[str],
+                         window: tuple[int, int] | None = None) -> list[Actor] | None:
     """為指定商家配 2 個夥伴：硬排「今日已錄取配對」與「時段佔用中」，配到後再
     逐一 preflight 時段衝突（API 實查，補史料盲區）；不足回 None。
 
@@ -277,7 +300,7 @@ def _labors_for_employer(s: Settings, pool: AccountPool, emp: Actor, hist: dict,
     burned = [l for (e, l) in hist["accepted_pairs"] if e == str(emp.user_id)]
     busy = [l for (l, ts) in hist["occupied"].items() if ts > now + 600]
     try:
-        return _acquire_clear_labors(s, pool, 2, labor_caps, ex_lab + burned + busy)
+        return _acquire_clear_labors(s, pool, 2, labor_caps, ex_lab + burned + busy, window)
     except PoolShortage:
         return None
 
@@ -305,18 +328,47 @@ def required_actors(spec: dict) -> set[str]:
     return names
 
 
+# 配發互斥鎖：並行 run（看板批量執行）同時配發時，候選迭代（lease=False 不鎖號）
+# 會看到相同的池快照而挑到同一組帳號。配發全程串行化＋配齊後整組上租約
+# （lease_accounts），後續 run 的 acquire 自然跳過已租帳號 → 並行 run 帳號互斥。
+# 配發只佔數秒（登入＋preflight），串行化不影響整體並行收益。
+_ACTOR_ALLOC_LOCK = threading.Lock()
+
+
 def _actors_for(system: str, s: Settings,
                 exclude: dict[str, list[str]] | None = None,
-                required: set[str] | None = None) -> dict[str, Actor]:
+                required: set[str] | None = None,
+                case_vars: dict | None = None,
+                lease_owner: str | None = None) -> dict[str, Actor]:
+    """依系統登入對應角色（_actors_for_unlocked 的加鎖＋租約包裝）。
+
+    lease_owner：給定時（看板每次 run 產生唯一 owner），配齊後把整組池帳號上租約，
+    並行 run 不會再配到同帳號；呼叫端須在 run 結束後 release(owner) 歸還
+    （release 也要用同一個 for_system 作用域的 pool，否則 db_name 對不上放不掉）。
+    None（CLI / 換號預覽）時行為與既往完全相同：不上租約。
+    """
+    with _ACTOR_ALLOC_LOCK:
+        actors = _actors_for_unlocked(system, s, exclude, required, case_vars)
+        if lease_owner:
+            ids = sorted({str(a.user_id) for a in actors.values()
+                          if getattr(a, "user_id", None)})
+            # 池以 db_name 隔離：contract 帳號掛在 contract 庫作用域，租約要寫對作用域
+            AccountPool(s.for_system(system)).lease_accounts(ids, owner=lease_owner)
+        return actors
+
+
+def _actors_for_unlocked(system: str, s: Settings,
+                         exclude: dict[str, list[str]] | None = None,
+                         required: set[str] | None = None,
+                         case_vars: dict | None = None) -> dict[str, Actor]:
     """依系統登入對應角色（承攬制 publisher 會做發票 preflight）。
 
-    exclude：{role: [account_id,...]}，配發時跳過這些帳號（「換一個號」用，
-    只對池配發的 job/activity 角色有效；contract 為固定 audit 帳號不受影響）。
+    exclude：{role: [account_id,...]}，配發時跳過這些帳號（「換一個號」用；
+    三系統的角色現在都從帳號池配發，contract 用 publisher/receiver 為 key）。
     required：用例引用的具名 actor（required_actors(spec)）。選配 actor（labor3 /
     labor_lacking_*）若在其中即升級為硬需求：配不到立刻拋 PoolShortage，在發佈任何
     工作前就失敗（避免跑到中途 KeyError，白燒一次發佈間隔與當日配對）。
     """
-    accounts = yaml.safe_load(ACCOUNTS.read_text(encoding="utf-8"))
     exclude = exclude or {}
     required = required or set()
 
@@ -335,14 +387,15 @@ def _actors_for(system: str, s: Settings,
         # （LoginConfirmForm::isAuditUser），apply/錄取/打卡/評價全不檢查；框架登入統一走
         # dev 發碼（Actor.login 不用固定碼）。要求它會把合格夥伴鎖死在 provision 種子帳號，
         # 打卡類用例時段釘在「現在+N分」，同兩個號短時間重跑必撞 30207（該時段已有確認工作）。
-        labor_caps = ["verified", "profile_complete", "active", "clean"]
+        labor_caps = JOB_LABOR_CAPS
         # 配對感知配發（#717 30229）：單帳號 LRU 看不見「夥伴×商家」配對維度，小池會踩回
         # 當日燒過的組合。從今日 qa_runs 還原配對史，硬避已錄取配對、軟避時段衝突與發佈間隔；
         # 規則對應的後端錯誤碼見 _pick_job_pair docstring。
         # employer 要 shop_approved（店鋪 validation_status=3 已過審）才能發佈工作；
         # verified_shop 只代表「公司型已送審」，未過審發佈會 20022（JobForm::validateCanCreateJob）。
         hist = _job_history(s)
-        emp, la = _pick_job_pair(s, pool, hist, labor_caps, exclude)
+        window = _slot_window(case_vars)   # 用例實際時段（明天類用例 preflight 不可用預設包絡）
+        emp, la = _pick_job_pair(s, pool, hist, labor_caps, exclude, window)
         ensure_employer_invoice(emp)   # 無發票資訊發佈會 20017（非企業支付都檢查）
         actors = {
             "employer": emp,
@@ -350,15 +403,17 @@ def _actors_for(system: str, s: Settings,
             "labor1": la[0],
             "labor2": la[1],
         }
-        # 第三個合格夥伴：排除已用兩位與本商家燒過的配對，再配一個（同樣
-        # preflight 時段衝突——labor3 也會申請，J2 一樣被 30207 擋）。
+        # 第三個合格夥伴：排除已用兩位、本商家燒過的配對與時段佔用中的夥伴，再配一個
+        # （同樣 preflight 時段衝突——labor3 也會申請，J2 一樣被 30207 擋）。
         # 用例有引用（required）時是硬需求，配不到立即失敗；否則選配、池不足略過。
         try:
             used = [str(a.user_id) for a in la]
             burned3 = [l for (e, l) in hist["accepted_pairs"] if e == str(emp.user_id)]
+            now3 = int(time.time())
+            busy3 = [l for (l, ts) in hist["occupied"].items() if ts > now3 + 600]
             actors["labor3"] = _acquire_clear_labors(
                 s, pool, 1, labor_caps,
-                (exclude.get("labor") or []) + used + burned3)[0]
+                (exclude.get("labor") or []) + used + burned3 + busy3, window)[0]
         except PoolShortage as e:
             if "labor3" in required:
                 raise PoolShortage(
@@ -395,12 +450,58 @@ def _actors_for(system: str, s: Settings,
             if "employer" in required:
                 raise
         return _check(actors)
-    publisher = _build_actor(s, accounts, "publisher", "publisher_primary", 2)
+    # 承攬制：publisher / receiver 改從帳號池按能力動態配發（不再寫死 audit 帳號）。
+    # 池以 db_name 隔離作用域，contract 分庫的帳號掛在 for_system("contract") 的庫名下；
+    # API base 兩系統共用，故登入照常。receiver 排除 publisher 已配的號（兩角色互斥），
+    # 登入失敗自動換號（_login_from_pool）。發票 preflight 沿用（API 冪等覆寫，不動綁卡）。
+    sc = s.for_system("contract")
+    cpool = AccountPool(sc)
+    publisher = _login_from_pool(sc, cpool, "labor", CONTRACT_PUBLISHER_CAPS, 1,
+                                 owner="contract-actors",
+                                 exclude=exclude.get("publisher"))[0]
     ensure_publisher_invoice(publisher)
-    return _check({
-        "publisher": publisher,
-        "receiver": _build_actor(s, accounts, "receiver", "receiver_primary", 2),
-    })
+    receiver = _login_from_pool(sc, cpool, "labor", CONTRACT_RECEIVER_CAPS, 1,
+                                owner="contract-actors",
+                                exclude=(exclude.get("receiver") or []) + [str(publisher.user_id)])[0]
+    return _check({"publisher": publisher, "receiver": receiver})
+
+
+_SWAPPABLE_LABOR = re.compile(r"labor\d*$")   # labor / labor1..3；labor_lacking_* 是刻意缺能力，不可換
+
+
+def job_actor_swapper(s: Settings):
+    """回傳 RecordingRunner 的自動換號回呼（job 系統；其他系統用 actor_swapper_for）。
+
+    觸發場景（意見反饋）：J2 labor-apply 撞 30229/30213「同一企業/商家每日僅限工作一次」。
+    配發層的配對史避撞（_pick_job_pair）對框架外的手動操作、actors 已丟失的舊中斷 run
+    是盲的，後端最終裁決才暴露。此時工作已發佈，換 employer 代價高（重發佈＋600s 間隔），
+    換夥伴即可：排除當前所有在用帳號＋該商家今日已錄取配對＋時段佔用中的夥伴，
+    從池中再配一個時段乾淨的合格夥伴重試本步。配不到（PoolShortage）回 None，照常記失敗。
+    """
+    def swap(actor_name: str, old: Actor, state) -> Actor | None:
+        if not _SWAPPABLE_LABOR.fullmatch(actor_name):
+            return None
+        pool = AccountPool(s)
+        hist = _job_history(s)
+        emp = state.actors.get("employer")
+        burned = [l for (e, l) in hist["accepted_pairs"]
+                  if emp is not None and e == str(emp.user_id)]
+        now = int(time.time())
+        busy = [l for (l, ts) in hist["occupied"].items() if ts > now + 600]
+        used = [str(getattr(a, "user_id", "")) for a in state.actors.values()]
+        window = _slot_window(getattr(state, "vars", None))   # 依用例 vars 算實際時段
+        try:
+            return _acquire_clear_labors(s, pool, 1, JOB_LABOR_CAPS,
+                                         used + burned + busy, window)[0]
+        except PoolShortage as e:
+            print(f"  [swap] 池中無可替補夥伴（排除在用 {used}、已燒配對與佔用後）：{e}")
+            return None
+    return swap
+
+
+def actor_swapper_for(system: str, s: Settings):
+    """依系統回對應的自動換號回呼；contract 是固定 audit 帳號（無池可換）回 None。"""
+    return job_actor_swapper(s) if system == "job" else None
 
 
 def _load_plan(path: Path) -> TaskPlan:
@@ -459,10 +560,12 @@ def main(argv: list[str] | None = None) -> int:
 
     # 3) 登入角色 + 執行 + 記錄（contract 與 job 在 dev 分庫，依系統選 DB）
     db = DBVerifier(s.for_system(system))
-    actors = _actors_for(system, s, required=required_actors(spec))
+    actors = _actors_for(system, s, required=required_actors(spec),
+                         case_vars=spec.get("vars"))
     qa = QAStore(s)
     qa.migrate()
-    result = RecordingRunner(db, qa_store=qa, system=system).run(spec, actors=actors)
+    result = RecordingRunner(db, qa_store=qa, system=system,
+                             actor_swapper=actor_swapper_for(system, s)).run(spec, actors=actors)
 
     print(f"\n{'='*60}")
     print(result.summary())

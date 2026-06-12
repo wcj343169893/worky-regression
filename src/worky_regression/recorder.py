@@ -21,7 +21,15 @@ import yaml
 
 from .actor import Actor
 from .qa_store import QAStore, make_run_id
-from .runner import PathRunner
+from .runner import PathRunner, StepAPIError
+
+# 撞到這些業務錯誤碼時，若有 actor_swapper 就自動換號重試本步（不換 employer，工作已發佈）：
+#   30229 LABOR_THAT_DAY_MATCH_JOB_SUCCESS_ONLINE — 同一企業每日僅限工作一次
+#   30213 LABOR_HAS_JOB_ON_THE_SAME_DAY_AT_THE_SHOP — 同一商家每日僅限工作一次
+# 兩者都是「(夥伴×商家×日) 配對燒掉」，換一個夥伴即可繞開；配發層的配對史避撞對
+# 框架外的手動操作/史料遺失的舊 run 是盲的，這裡是後端最終裁決暴露後的兜底。
+SWAP_RETRY_CODES = {30229, 30213}
+MAX_ACTOR_SWAPS_PER_STEP = 2   # 同一步最多自動換號重試次數（防池小/同因失敗時打轉）
 
 
 @dataclass
@@ -61,10 +69,18 @@ class RunResult:
 class RecordingRunner:
     """跑一條 path 並逐步記錄結果，不在失敗時 raise；結果落地到 worky_qa_dashboard。"""
 
-    def __init__(self, db, *, qa_store: QAStore | None = None, system: str = ""):
+    def __init__(self, db, *, qa_store: QAStore | None = None, system: str = "",
+                 actor_swapper: Callable[[str, Actor, Any], Actor | None] | None = None):
+        """actor_swapper（可選）：步驟撞 SWAP_RETRY_CODES 時的自動換號回呼。
+
+        簽名 ``(actor_name, old_actor, state) -> Actor | None``：回新 Actor 就把
+        state.actors 裡所有指向 old_actor 的別名（labor/labor1 同人）換掉並重試本步；
+        回 None / 拋例外則照常記失敗。實作見 autotest.job_actor_swapper。
+        """
         self.runner = PathRunner(db)
         self.qa_store = qa_store
         self.system = system
+        self.actor_swapper = actor_swapper
 
     def run(self, path: str | Path | dict, *,
             publisher: Actor | None = None, receiver: Actor | None = None,
@@ -227,32 +243,72 @@ class RecordingRunner:
                                 "wait_secs": wait_secs,
                                 "next_tindex": (None if ti is not None else tindex + 1)})
             t0 = time.time()
-            try:
-                if is_db:
-                    obs = self.runner._run_db_exec(step, state)
-                elif is_assert:
-                    obs = self.runner._run_assert(step, state)
-                elif is_assert_api:
-                    obs = self.runner._run_assert_api(step, state)
-                elif is_wait_api:
-                    obs = self.runner._run_wait_api(step, state)
-                elif is_sleep:
-                    obs = self.runner._run_sleep(step, state)
-                else:
-                    obs = self.runner._run_step(step, state)
-                elapsed = int((time.time() - t0) * 1000)
-                steps.append(StepResult(i, kind, name, "passed", elapsed, obs or {}))
-                live_step(steps[-1])
-                emit("step_end", {"index": i, "status": "passed",
-                                  "elapsed_ms": elapsed, "error": None, "tindex": ti})
-            except Exception as e:  # noqa: BLE001 — 記錄任何失敗，含 AssertionError
-                elapsed = int((time.time() - t0) * 1000)
-                err = f"{type(e).__name__}: {e}"
-                steps.append(StepResult(i, kind, name, "failed", elapsed, error=err))
-                live_step(steps[-1])
-                stopped = True
-                emit("step_end", {"index": i, "status": "failed",
-                                  "elapsed_ms": elapsed, "error": err, "tindex": ti})
+            swaps = 0   # 本步已自動換號重試的次數（耗時累計入同一步，不另記一筆）
+            while True:
+                try:
+                    if is_db:
+                        obs = self.runner._run_db_exec(step, state)
+                    elif is_assert:
+                        obs = self.runner._run_assert(step, state)
+                    elif is_assert_api:
+                        obs = self.runner._run_assert_api(step, state)
+                    elif is_wait_api:
+                        obs = self.runner._run_wait_api(step, state)
+                    elif is_sleep:
+                        obs = self.runner._run_sleep(step, state)
+                    else:
+                        obs = self.runner._run_step(step, state)
+                    elapsed = int((time.time() - t0) * 1000)
+                    if swaps:
+                        obs = obs or {}
+                        obs["actor_swaps"] = swaps
+                    steps.append(StepResult(i, kind, name, "passed", elapsed, obs or {}))
+                    live_step(steps[-1])
+                    emit("step_end", {"index": i, "status": "passed",
+                                      "elapsed_ms": elapsed, "error": None, "tindex": ti})
+                except Exception as e:  # noqa: BLE001 — 記錄任何失敗，含 AssertionError
+                    if (kind == "transition" and swaps < MAX_ACTOR_SWAPS_PER_STEP
+                            and self._swap_actor(e, state)):
+                        swaps += 1
+                        continue
+                    elapsed = int((time.time() - t0) * 1000)
+                    err = f"{type(e).__name__}: {e}"
+                    if swaps:
+                        err = f"{err}（已自動換號重試 {swaps} 次）"
+                    steps.append(StepResult(i, kind, name, "failed", elapsed, error=err))
+                    live_step(steps[-1])
+                    stopped = True
+                    emit("step_end", {"index": i, "status": "failed",
+                                      "elapsed_ms": elapsed, "error": err, "tindex": ti})
+                break
+
+    def _swap_actor(self, exc: Exception, state) -> bool:
+        """步驟失敗的自動換號：撞 SWAP_RETRY_CODES 且能從池配到替補就換掉重試。
+
+        只認 StepAPIError（帶 code/actor_name 的正向失敗）；負向斷言（expect.success=false）
+        錯誤碼不符等其他失敗是裸 AssertionError，不會誤觸換號。換號把 state.actors 裡
+        所有指向同一人的別名（labor 與 labor1 同人）一起替換，後續步驟與 push 驗證才一致。
+        """
+        if self.actor_swapper is None or not isinstance(exc, StepAPIError):
+            return False
+        if exc.code not in SWAP_RETRY_CODES or not exc.actor_name:
+            return False
+        old = state.actors.get(exc.actor_name)
+        if old is None:
+            return False
+        try:
+            new = self.actor_swapper(exc.actor_name, old, state)
+        except Exception as e:  # noqa: BLE001 — 換號失敗不擋原始失敗的落地
+            print(f"  [swap] 自動換號失敗（{exc.actor_name}, code={exc.code}）：{e}")
+            return False
+        if new is None:
+            return False
+        for k, v in list(state.actors.items()):
+            if v is old:
+                state.actors[k] = new
+        print(f"  [swap] code={exc.code}：{exc.actor_name} "
+              f"#{getattr(old, 'user_id', '?')} → #{getattr(new, 'user_id', '?')}，重試本步")
+        return True
 
     @staticmethod
     def _snapshot_actors(state) -> dict[str, dict[str, Any]]:

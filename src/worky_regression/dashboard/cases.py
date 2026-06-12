@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import copy
+import re
 from pathlib import Path
 
 import yaml
@@ -162,9 +163,14 @@ class CaseStore:
 
     def case_detail(self, case_id: str) -> dict | None:
         found = self._find(case_id)
+        if found is None and case_id.isdigit():
+            # 純數字視為看板序號（#N）回退反查：分解輸入框點擊 #N 引用查看用例走這裡
+            cid = self.qa.case_id_by_seq(int(case_id))
+            found = self._find(cid) if cid else None
         if found is None:
             return None
         path, source, spec = found
+        case_id = _case_id(spec, path)   # seq 回退時換回真正 id（history / 前端後續操作要用）
         steps = []
         for i, st in enumerate(spec.get("path", [])):
             if "db_exec" in st:
@@ -249,7 +255,10 @@ class CaseStore:
     # ── 執行 / 分解（會真的打被測 API）────────────────────────────────────────
     def _run_spec(self, spec: dict, *, source: str = "builtin", file: str = "",
                   actors: dict | None = None, on_event=None) -> dict:
-        from ..autotest import _actors_for, required_actors
+        from uuid import uuid4
+
+        from ..autotest import _actors_for, actor_swapper_for, required_actors
+        from ..qa_accounts import AccountPool
         from ..recorder import RecordingRunner
         from ..verifier import DBVerifier
 
@@ -267,15 +276,26 @@ class CaseStore:
         if spec.get("skip"):
             return RecordingRunner(None, qa_store=self.qa, system=system).run(
                 spec, actors={}, on_event=on_event).to_dict()
-        db = DBVerifier(self.settings.for_system(system))   # contract/job dev 分庫
-        # actors 可由呼叫端覆蓋（換號時帶入「已排除原帳號」的 actors）；否則照常配發。
+        db = DBVerifier(self.settings.for_system(system))   # contract/job 分庫
+        # on_event（可選）：透傳給 RecordingRunner 做逐步事件回呼（看板 SSE 即時刷新用）
+        # actor_swapper：步驟撞 30229/30213（夥伴×商家×日配對燒掉）時自動從池換夥伴重試
+        runner = RecordingRunner(db, qa_store=self.qa, system=system,
+                                 actor_swapper=actor_swapper_for(system, self.settings))
+        # actors 可由呼叫端覆蓋（換號時帶入「已排除原帳號」的 actors）：沿用舊行為，不上租約。
+        if actors is not None:
+            return runner.run(spec, actors=actors, on_event=on_event).to_dict()
+        # 正常配發：每次 run 用唯一 owner 配發＋整組上租約（並行批量執行的帳號互斥；
+        # 池內已租帳號任何 acquire 都不再配出），結束（含拋錯）一律歸還。
         # required：用例引用的具名 actor（labor3 / labor_lacking_*）升級為硬需求，
         # 配不到在執行前就 PoolShortage，不會跑到中途 KeyError 白燒發佈。
-        if actors is None:
-            actors = _actors_for(system, self.settings, required=required_actors(spec))
-        # on_event（可選）：透傳給 RecordingRunner 做逐步事件回呼（看板 SSE 即時刷新用）
-        return RecordingRunner(db, qa_store=self.qa, system=system).run(
-            spec, actors=actors, on_event=on_event).to_dict()
+        lease_owner = f"run-{spec.get('id') or 'case'}-{uuid4().hex[:8]}"
+        actors = _actors_for(system, self.settings, required=required_actors(spec),
+                             case_vars=spec.get("vars"), lease_owner=lease_owner)
+        try:
+            return runner.run(spec, actors=actors, on_event=on_event).to_dict()
+        finally:
+            # release 作用域須與上租約一致（contract 帳號掛 contract 庫的 db_name 下）
+            AccountPool(self.settings.for_system(system)).release(lease_owner)
 
     def run_case(self, case_id: str) -> dict:
         found = self._find(case_id)
@@ -374,13 +394,14 @@ class CaseStore:
                 "contract 的 publisher/receiver 為固定 audit 帳號，請改用『重試』或回報主倉。")
         # 先以正常配發讀出「目前會用到」的帳號（acquire 對 role 的首選），再排除它重配
         req = required_actors(spec)
-        before = _actors_for(system, self.settings, required=req)
+        before = _actors_for(system, self.settings, required=req, case_vars=spec.get("vars"))
         cur = before.get(actor_name) or before.get(role)
         cur_id = getattr(cur, "user_id", None)
         if cur_id is None:
             raise ValueError(f"無法判定 actor「{actor_name}」目前使用的帳號")
         try:
-            swapped = _actors_for(system, self.settings, exclude={role: [str(cur_id)]}, required=req)
+            swapped = _actors_for(system, self.settings, exclude={role: [str(cur_id)]},
+                                  required=req, case_vars=spec.get("vars"))
         except PoolShortage as e:
             # 排除目前帳號後湊不齊本用例所需的合格帳號 —— 通常是合格號已全用於本用例、池無多餘替補。
             # 不把原始候選清單直接丟給使用者，改回可行動的指引。
@@ -512,6 +533,41 @@ class CaseStore:
             children = children[:self._MAX_CHILDREN]
         return {"children": children, "analyzed": analyzed, "truncated": truncated}
 
+    # 分解描述中的「#數字」視為看板序號（qa_cases.seq）引用既有用例，
+    # 例：「發佈一條 #2191 一樣的流程，只是把工作開始時間改為明天下午13點」。
+    _CASE_REF = re.compile(r"#(\d+)")
+
+    def _expand_case_refs(self, use_case: str) -> tuple[str, list[dict]]:
+        """把分解描述中的 #N 引用展開成「引用用例定義」附錄，一併餵給 LLM 當分解基準。
+
+        每個 #N 以 qa_cases.seq 反查用例 id，再讀其 YAML 定義（_find，以檔案為準）
+        附在描述後。找不到對應序號時直接拋錯——靜默忽略會讓 LLM 看不懂 #N 而亂分解。
+        回傳 (展開後文字, refs)；refs 為 [{seq, id}]，附在 preview 回傳供前端顯示。
+        """
+        refs: list[dict] = []
+        blocks: list[str] = []
+        seen: set[int] = set()
+        for m in self._CASE_REF.finditer(use_case):
+            seq = int(m.group(1))
+            if seq in seen:
+                continue
+            seen.add(seq)
+            cid = self.qa.case_id_by_seq(seq)
+            found = self._find(cid) if cid else None
+            if found is None:
+                raise ValueError(f"描述引用了 #{seq}，但找不到對應的用例（看板序號不存在）")
+            _, _, spec = found
+            refs.append({"seq": seq, "id": cid})
+            blocks.append(f"## 引用用例 #{seq}（id: {cid}）的既有定義（YAML）：\n"
+                          + yaml.safe_dump(spec, allow_unicode=True, sort_keys=False))
+        if not blocks:
+            return use_case, refs
+        expanded = (use_case
+                    + "\n\n# 引用用例定義\n描述中的 #N 指的就是下列既有用例。"
+                    "請以其任務流為基準分解，再依描述要求的差異調整。\n\n"
+                    + "\n".join(blocks))
+        return expanded, refs
+
     def decompose_preview(self, use_case: str, system: str | None = None) -> dict:
         """分解第一段：呼叫 LLM 產 plan + 展開 spec，算好防撞 id，但**不落地**。
 
@@ -523,6 +579,8 @@ class CaseStore:
         from ..planner import build_path
         from ..planner import decompose as _decompose
 
+        # 描述中的 #N 先展開成既有用例定義（找不到會直接拋錯，不送 LLM）
+        use_case, refs = self._expand_case_refs(use_case)
         # system 為前端 tab 指定的目標系統（job/contract）；透傳給 planner
         plan = _decompose(use_case, self.settings, system=system)
         spec = build_path(plan)
@@ -539,6 +597,7 @@ class CaseStore:
         } for c in derived["children"]]
         return {"plan": plan.raw, "spec": spec, "spec_yaml": spec_yaml,
                 "proposed_id": spec["id"], "system": plan.system,
+                "refs": refs,
                 "children": children,
                 "children_analyzed": derived["analyzed"],
                 "children_truncated": derived["truncated"]}

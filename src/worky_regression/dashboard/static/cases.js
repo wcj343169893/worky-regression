@@ -133,8 +133,6 @@ export async function renderCases(key, tabKey, drillPath = []) {
   // 放在 tab / 下鑽歸零之後，確保「同頁刷新」時 URL 的 page 不被歸零蓋掉。
   if (location.hash.includes("?")) { const up = urlPager(); s.page = up.page; s.limit = up.limit; }
   const cur = tabByKey(s.tab);
-  // 是否在子任務層（已下鑽）：子任務列表多一欄勾選 + 「批量執行」按鈕
-  const inSub = !!s.parentId;
   // 內建 + 自訂 tab 依序渲染；自訂 tab 帶可移除的 ✕；末尾再接「＋新增」按鈕
   const tabsHtml = allTabs().map((t) =>
     `<button class="dc-tab${t.key === cur.key ? " active" : ""}" data-tab="${esc(t.key)}">${esc(t.label)}` +
@@ -150,7 +148,10 @@ export async function renderCases(key, tabKey, drillPath = []) {
           <span class="sub2">自然語言用例 → DeepSeek 分解成任務流（存入 generated/）</span></div>
         <div class="dc-tabs">${tabsHtml}</div>
         <div class="ai-form">
-          <textarea id="uc" rows="2" placeholder="${esc(cur.ph)}"></textarea>
+          <div class="uc-wrap">
+            <textarea id="uc" rows="2" placeholder="${esc(cur.ph)}"></textarea>
+            <div class="uc-hl" id="uc-hl" aria-hidden="true"></div>
+          </div>
           <label class="ck"><input type="checkbox" id="uc-run" /> 建立後立即執行</label>
           <button class="btn primary" id="uc-go">分解</button>
         </div>
@@ -158,11 +159,11 @@ export async function renderCases(key, tabKey, drillPath = []) {
       <div class="card cases-list">
         <div class="crumbs" id="crumbs"></div>
         <div class="panel-head"><h3>用例清單</h3>
-          ${inSub ? `<button class="btn primary" id="batch-run" disabled title="勾選下方子任務後串行逐條執行">▶ 批量執行</button>` : ""}
+          <button class="btn primary" id="batch-run" disabled title="勾選下方用例後串行逐條執行">▶ 批量執行</button>
           <button class="btn ghost danger" id="clear-all" title="清空所有測試用例與執行紀錄，重新測試（不影響帳號池 / 設定 / 標記）">🗑 清空全部</button>
           <input type="search" id="q" placeholder="搜尋 名稱 / 描述…" value="${esc(s.q)}" /></div>
         <div class="table-wrap"><table>
-          <thead><tr>${inSub ? `<th class="ck-col"><input type="checkbox" id="ck-all" title="全選 / 取消全選" /></th>` : ""}<th>用例 ID / 描述</th><th>來源</th><th>建立時間</th><th class="num">步驟</th><th>任務流</th><th>最近結果</th><th class="act">操作</th></tr></thead>
+          <thead><tr><th class="ck-col"><input type="checkbox" id="ck-all" title="全選 / 取消全選" /></th><th>用例 ID / 描述</th><th>來源</th><th>建立時間</th><th class="num">步驟</th><th>任務流</th><th>最近結果</th><th class="act">操作</th></tr></thead>
           <tbody id="rows"></tbody>
         </table></div>
         <div class="pager">
@@ -184,7 +185,8 @@ export async function renderCases(key, tabKey, drillPath = []) {
     }, 300);
   };
   $("uc-go").onclick = () => doDecompose(key);
-  // 子任務層：全選勾選框 + 批量執行（勾選列串行逐條跑，共用帳號池避免並行互擾）
+  setupUcRefs();
+  // 全選勾選框 + 批量執行（主用例與子任務層皆有；勾選列串行逐條跑，共用帳號池避免並行互擾）
   const ckAll = $("ck-all");
   if (ckAll) ckAll.onchange = () => {
     document.querySelectorAll(".row-ck").forEach((c) => { c.checked = ckAll.checked; });
@@ -422,10 +424,8 @@ function applyLiveProgress(key, items) {
 function renderCaseRows(key, items) {
   const tb = $("rows");
   if (!tb) return;
-  // 子任務層多一欄勾選（與表頭的 ck-all / 批量執行按鈕成對出現）
-  const inSub = !!(state[key] && state[key].parentId);
   if (!items.length) {
-    tb.innerHTML = `<tr class="norow"><td colspan="${inSub ? 8 : 7}"><div class="empty">沒有用例</div></td></tr>`;
+    tb.innerHTML = `<tr class="norow"><td colspan="8"><div class="empty">沒有用例</div></td></tr>`;
     tb.style.opacity = "1"; return;
   }
   tb.innerHTML = items.map((c) => {
@@ -447,7 +447,7 @@ function renderCaseRows(key, items) {
       : (c.skip ? `<span${lrTip ? ` title="${esc(lrTip)}"` : ""}>${resBadge("skipped")}</span>${skipWhy}`
                 : `<span class="sub2">—</span>`);
     return `<tr data-id="${esc(c.id)}">
-      ${inSub ? `<td class="ck-col"><input type="checkbox" class="row-ck" data-id="${esc(c.id)}" /></td>` : ""}
+      <td class="ck-col"><input type="checkbox" class="row-ck" data-id="${esc(c.id)}" /></td>
       <td><div class="cid">${c.seq != null ? `<span class="seq">#${c.seq}</span>` : ""}<code>${esc(c.id)}</code></div><div class="sub2">${esc((c.description || "").slice(0, 50))}</div></td>
       <td><span class="pill">${c.source === "generated" ? "AI 產生" : "內建"}</span></td>
       <td><span class="sub2">${fmtTs(c.created_at)}</span></td>
@@ -473,6 +473,29 @@ function renderCaseRows(key, items) {
   tb.querySelectorAll(".sub-btn").forEach((b) => b.onclick = () => drillInto(key, { id: b.dataset.id }));
   tb.querySelectorAll(".tchip.clickable").forEach((ch) =>
     ch.onclick = () => openStepModal(key, ch.dataset.cid, Number(ch.dataset.ti)));
+}
+
+// 分解輸入框 #N 用例引用高亮：textarea 文字設透明（caret-color 保留游標），
+// 由疊在上面的鏡像層（.uc-hl，同字體/內距/換行）顯示文字並把 #N 上藍色。
+// 鏡像層整層 pointer-events:none、僅 .uc-ref 可點——點 #N 開用例詳情抽屜
+// （後端 /api/cases/<純數字> 以看板序號 seq 回退反查），其餘點擊穿透回 textarea。
+// 代價：點 #N 字面無法把游標放進該 token（用方向鍵可進），換取可點擊。
+function setupUcRefs() {
+  const ta = $("uc"), hl = $("uc-hl");
+  if (!ta || !hl) return;
+  const paint = () => {
+    // 先 esc 再替換（# 與數字不受轉義影響）；尾端補 \n 讓結尾空行也佔高、捲動對齊
+    hl.innerHTML = esc(ta.value).replace(/#(\d+)/g,
+      `<span class="uc-ref" data-seq="$1" title="點擊查看用例 #$1">#$1</span>`) + "\n";
+    hl.scrollTop = ta.scrollTop;
+  };
+  ta.addEventListener("input", paint);
+  ta.addEventListener("scroll", () => { hl.scrollTop = ta.scrollTop; });
+  hl.addEventListener("click", (e) => {
+    const s = e.target.closest(".uc-ref");
+    if (s) openCaseDetail(s.dataset.seq);
+  });
+  paint();
 }
 
 async function openCaseDetail(id) {
@@ -592,6 +615,10 @@ function runCaseStream(id, row, { drawer = true } = {}) {
         const r0 = liveRow();
         if (r0) r0.querySelectorAll(".tchip").forEach((c) =>
           c.classList.remove("tchip-running", "tchip-pass", "tchip-fail", "tchip-skip"));
+        // 「最近結果」欄立即標「執行中」——若等到 run_end 才更新，執行期間此欄一直是
+        // 上一輪的舊結果；同時若清單裡另有早前啟動、仍在長等待的 run（如打卡用例），
+        // 只有那列顯示「執行中」，看起來就像執行中跑錯列
+        updateLastResultCell(r0, { status: "running" });
       } else if (e.type === "step_start") {
         if (e.tindex == null) {
           if (e.kind === "wait_api" || e.kind === "sleep") showWaitChip(e);
@@ -632,11 +659,11 @@ async function runCase(key, btn) {
   btn.disabled = false; btn.textContent = old;
 }
 
-// ── 子任務勾選 + 批量執行 ────────────────────────────────────────────────────
+// ── 勾選 + 批量執行（主用例與子任務層通用）──────────────────────────────────
 // 同步「批量執行」按鈕（啟用態 + 已勾數）與表頭全選框（全勾 / 半勾）狀態
 function updateBatchState() {
   const btn = $("batch-run");
-  if (!btn) return;   // 頂層（無勾選欄）直接略過
+  if (!btn) return;   // 防禦：按鈕不在 DOM（頁面切走）時略過
   const all = document.querySelectorAll(".row-ck");
   const checked = document.querySelectorAll(".row-ck:checked");
   if (!btn.dataset.running) {
@@ -650,26 +677,37 @@ function updateBatchState() {
   }
 }
 
-// 批量執行：勾選的子任務**串行**逐條跑（共用帳號池與被測環境，並行易互相干擾），
+// 批量執行：勾選的用例（主用例或子任務皆可）**並行**跑（上限 BATCH_CONCURRENCY），
+// 每條 run 後端會以唯一租約配發互斥的帳號組（_run_spec 的 lease_owner），不會互搶帳號。
+// 並行上限的考量：① 帳號池容量——每條 job 用例租 1 商家 + 3~5 夥伴，池就 7 商家 11 夥伴；
+// ② 瀏覽器同域 HTTP/1.1 連線數上限（約 6），每條 run 佔一條 SSE。
 // 每條沿用單條執行的 SSE 即時 chip 上色與「最近結果」局部更新；不逐條彈抽屜，
 // 全部跑完 toast 彙總。執行期間鎖定批量按鈕、各列「執行」按鈕與勾選框，避免重入。
+const BATCH_CONCURRENCY = 3;
 async function batchRun(key) {
   const btn = $("batch-run");
   const picked = Array.from(document.querySelectorAll(".row-ck:checked"));
-  if (!picked.length) { toast("請先勾選要執行的子任務"); return; }
+  if (!picked.length) { toast("請先勾選要執行的用例"); return; }
   const lockEls = document.querySelectorAll(".row-ck, #ck-all, .run-btn, .republish-btn");
   btn.dataset.running = "1"; btn.disabled = true;
   lockEls.forEach((el) => { el.disabled = true; });
-  toast(`批量執行中：共 ${picked.length} 條子任務（串行逐條，請稍候）`);
-  let pass = 0, fail = 0, skip = 0;
-  for (let i = 0; i < picked.length; i++) {
-    const id = picked[i].dataset.id, row = picked[i].closest("tr");
-    btn.textContent = `批量執行中 ${i + 1}/${picked.length}…`;
-    const r = await runCaseStream(id, row, { drawer: false });
-    if (r.ok && r.skipped) skip++;
-    else if (r.ok && r.status === "passed") pass++;
-    else fail++;
-  }
+  const conc = Math.min(BATCH_CONCURRENCY, picked.length);
+  toast(`批量執行中：共 ${picked.length} 條用例（${conc} 條並行、各用獨立帳號）`);
+  let pass = 0, fail = 0, skip = 0, done = 0, next = 0;
+  btn.textContent = `批量執行中 0/${picked.length}…`;
+  const worker = async () => {
+    while (next < picked.length) {
+      const i = next++;                 // 單執行緒 JS，無競態
+      const id = picked[i].dataset.id, row = picked[i].closest("tr");
+      const r = await runCaseStream(id, row, { drawer: false });
+      if (r.ok && r.skipped) skip++;
+      else if (r.ok && r.status === "passed") pass++;
+      else fail++;
+      done++;
+      btn.textContent = `批量執行中 ${done}/${picked.length}…`;
+    }
+  };
+  await Promise.all(Array.from({ length: conc }, worker));
   toast(`批量執行完成：通過 ${pass} / 失敗 ${fail}${skip ? ` / 略過 ${skip}` : ""}（共 ${picked.length} 條）`);
   delete btn.dataset.running;
   lockEls.forEach((el) => { el.disabled = false; });

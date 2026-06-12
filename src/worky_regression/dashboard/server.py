@@ -15,6 +15,7 @@ import json
 import mimetypes
 import re
 import secrets
+import threading
 import time
 import traceback
 from functools import lru_cache
@@ -85,7 +86,7 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _sse_start(self):
-        """開一條 Server-Sent Events 串流連線（標頭只送一次，之後逐筆 _sse_send）。"""
+        """開一條 Server-Sent Events 串流連線（標頭只送一次，之後由 _run_stream 逐筆寫事件）。"""
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream; charset=utf-8")
         self.send_header("Cache-Control", "no-store")
@@ -93,12 +94,6 @@ class Handler(BaseHTTPRequestHandler):
         # 關掉 nginx 等反代的緩衝，event 才會即時到前端
         self.send_header("X-Accel-Buffering", "no")
         self.end_headers()
-
-    def _sse_send(self, etype: str, payload):
-        """送一筆 SSE 事件；前端關頁造成的 BrokenPipeError 由呼叫端吞掉以續跑。"""
-        data = json.dumps({"type": etype, **payload}, ensure_ascii=False, default=str)
-        self.wfile.write(f"data: {data}\n\n".encode("utf-8"))
-        self.wfile.flush()
 
     def _send_file(self, path: Path):
         if not path.is_file():
@@ -255,27 +250,47 @@ class Handler(BaseHTTPRequestHandler):
         執行同步跑在這條請求自己的 thread 內（ThreadingHTTPServer），邊跑邊吐 event。
         前端中途關頁 → 寫入觸發 BrokenPipeError，標記斷線後續事件不再嘗試寫，
         但 run_case_streaming 仍會跑完並照常落地 worky_qa_dashboard（關頁不丟 run）。
+
+        心跳保活：長等待步驟（如打卡用例等 start_at 十幾分鐘）期間沒有任何事件可送，
+        邊緣代理會把閒置連線掐掉、前端誤報「執行中斷」。背景 thread 每 20s 送一行
+        SSE 註解（`: ping`，EventSource 規範要求瀏覽器忽略，前端不需配合改動）；
+        事件與心跳共用寫入鎖，避免兩個 thread 的訊框交錯寫壞串流。
         """
         self._sse_start()
         disconnected = {"v": False}
+        wlock = threading.Lock()
 
-        def on_event(etype, payload):
+        def _write(raw: bytes):
             if disconnected["v"]:
                 return
             try:
-                self._sse_send(etype, payload)
-            except (BrokenPipeError, ConnectionResetError):
+                with wlock:
+                    self.wfile.write(raw)
+                    self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError, OSError):
                 disconnected["v"] = True
 
+        def on_event(etype, payload):
+            data = json.dumps({"type": etype, **payload}, ensure_ascii=False, default=str)
+            _write(f"data: {data}\n\n".encode("utf-8"))
+
+        stop = threading.Event()
+
+        def heartbeat():
+            while not stop.wait(20):
+                if disconnected["v"]:
+                    return
+                _write(b": ping\n\n")
+
+        hb = threading.Thread(target=heartbeat, daemon=True, name=f"sse-hb-{case_id}")
+        hb.start()
         try:
             _cases().run_case_streaming(case_id, on_event)
         except Exception as e:  # noqa: BLE001 — 已開 SSE，錯誤改以事件送出
             traceback.print_exc()
-            if not disconnected["v"]:
-                try:
-                    self._sse_send("error", {"error": str(e)})
-                except (BrokenPipeError, ConnectionResetError):
-                    pass
+            on_event("error", {"error": str(e)})
+        finally:
+            stop.set()
 
     def _client_ip(self) -> str:
         """建立者來源 IP：經邊緣代理時取 X-Forwarded-For 第一跳，否則用 socket 對端。"""
@@ -625,6 +640,11 @@ def serve(host: str = "127.0.0.1", port: int = 8765) -> None:
     _dangling = _cases().qa.mark_dangling_runs()
     if _dangling:
         print(f"  ⚠️  上次進程死掉殘留 {_dangling} 筆執行中 run，已標記為「中斷」。")
+    # 同理回收殘留的 run-* 帳號租約（並行執行的帳號互斥鎖），不然要等租約到期才放號
+    from ..qa_accounts import AccountPool
+    _stale = AccountPool(svc.settings).release_run_leases()
+    if _stale:
+        print(f"  ⚠️  回收 {_stale} 個殘留的 run 帳號租約。")
 
     httpd = ThreadingHTTPServer((host, port), Handler)
     url = f"http://{host}:{port}"

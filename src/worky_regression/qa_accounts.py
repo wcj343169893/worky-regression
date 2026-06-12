@@ -243,6 +243,41 @@ class AccountPool:
                 "db": self.db, "a": int(account_id), "r": role,
             })
 
+    def lease_accounts(self, account_ids: list[int | str], *, owner: str,
+                       lease_secs: int = 1800) -> int:
+        """把指定帳號（account_id 清單）統一上租約給 owner，回更新筆數。
+
+        供「整組 actors 配齊後一次上鎖」用：_actors_for 的候選迭代走 lease=False
+        （試錯不鎖號），最終組合確定才呼叫本方法。上了租約的帳號在到期 / release 前
+        任何 acquire（含 lease=False，WHERE 都排除未過期租約）不會再配出 →
+        並行 run 的帳號天然互斥。預設租期 1800s 覆蓋最長用例（打卡類 ≈15min）。
+        """
+        ids = [str(x) for x in account_ids if x]
+        if not ids:
+            return 0
+        stmt = text(
+            "UPDATE qa_accounts SET state='leased', lease_owner=:o, lease_expires_at=:e "
+            "WHERE db_name=:db AND account_id IN :ids"
+        ).bindparams(sqlalchemy.bindparam("ids", expanding=True))
+        with self._qa_engine.begin() as conn:
+            res = conn.execute(stmt, {"o": owner, "e": int(time.time()) + lease_secs,
+                                      "db": self.db, "ids": ids})
+            return res.rowcount
+
+    def release_run_leases(self) -> int:
+        """清掉所有 run-* 租約（看板啟動時用），**跨 db_name 作用域**。
+
+        run 跑在看板進程內的 thread，看板啟動時必無存活 run——殘留的 run-* 租約
+        都是上次進程死掉留下的，不回收會白白鎖住帳號至租約到期（最長 30min）。
+        刻意不過濾 db_name：run 租約可能掛在 job（主庫）或 contract（分庫）兩個
+        作用域下，且 run-* 前綴只有看板 run 會用，全掃不會誤傷其他 owner 的租約。
+        """
+        with self._qa_engine.begin() as conn:
+            res = conn.execute(text(
+                "UPDATE qa_accounts SET state='available', lease_owner=NULL, lease_expires_at=0 "
+                "WHERE state='leased' AND lease_owner LIKE 'run-%'"))
+            return int(res.rowcount or 0)
+
     def release(self, owner: str) -> int:
         """歸還某 owner 借走的所有帳號。"""
         with self._qa_engine.begin() as conn:
