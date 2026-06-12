@@ -447,6 +447,8 @@ body.markup-mode *{cursor:crosshair !important}
 /* 已解決標記：卡片淡化，附綠色 pill 標示「源頁不顯示」 */
 .markup-card.is-resolved{opacity:.62}
 .pill-ok{color:var(--ok);border:1px solid var(--ok);background:transparent}
+/* 本次處理消耗 chip：金黃色調，顯示 token 與預估金額（hover 看細項） */
+.pill-cost{color:#e0b450;border:1px solid #e0b45055;background:#e0b45014;cursor:help}
 /* align-items:flex-start —— 兩欄各取自然高度，避免截圖較高時把右側 body 拉伸到超出、
    再被 overflow 裁掉底部的操作列（已解決/刪除）。故也不要 overflow:hidden。 */
 .markup-card{display:flex;align-items:flex-start;gap:14px;background:var(--panel2);

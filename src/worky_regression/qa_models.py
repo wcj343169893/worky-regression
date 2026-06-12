@@ -13,6 +13,7 @@ from sqlalchemy import (
     BigInteger,
     Index,
     Integer,
+    Numeric,
     String,
     Text,
     create_engine,
@@ -184,6 +185,12 @@ class QAMarkup(Base):
     screenshot_path: Mapped[str | None] = mapped_column(String(255))  # 截圖相對路徑（results/markups/*.png）
     ip: Mapped[str | None] = mapped_column(String(64))            # 建立者來源 IP（X-Forwarded-For 優先）
     elapsed_ms: Mapped[int] = mapped_column(BigInteger, nullable=False, server_default="0")  # worker 處理耗時
+    # ── headless Claude 的成本紀錄（每次 worker 處理該標記後回寫，再次優化會覆蓋為最近一次）──
+    # tokens_in＝prompt 端 token（含 cache_creation/cache_read）、tokens_out＝生成 token；
+    # cost_usd＝claude CLI 回報的 total_cost_usd（權威值，已含各模型計價），看板逐條展示消耗。
+    tokens_in: Mapped[int] = mapped_column(BigInteger, nullable=False, server_default="0")
+    tokens_out: Mapped[int] = mapped_column(BigInteger, nullable=False, server_default="0")
+    cost_usd: Mapped[float] = mapped_column(Numeric(12, 6), nullable=False, server_default="0")
     status: Mapped[str] = mapped_column(String(16), nullable=False, server_default="pending")  # pending|processing|done|failed
     # 使用者「已解決」開關（獨立於 worker 處理狀態 status）：1=已解決 → 源頁面不再畫框；
     # 取消解決（改回 0）源頁面重新顯示。純前端可視化的隱藏/顯示，不影響 worker 處理。

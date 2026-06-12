@@ -349,7 +349,8 @@ class QAStore:
         sql = text(f"""
             SELECT id, kind, route, selector, element_text, rect, content, screenshot_path,
                    status, resolved, result, replies, created_at, updated_at,
-                   ip, elapsed_ms, files_changed, commit_sha, rolled_back
+                   ip, elapsed_ms, files_changed, commit_sha, rolled_back,
+                   tokens_in, tokens_out, cost_usd
             FROM qa_markups {where}
             ORDER BY id DESC LIMIT :lim OFFSET :off
         """)
@@ -362,6 +363,7 @@ class QAStore:
             d["rect"] = _json_or(d.get("rect"), None)
             d["replies"] = _json_or(d.get("replies"), []) or []
             d["files_changed"] = _json_or(d.get("files_changed"), []) or []
+            d["cost_usd"] = float(d.get("cost_usd") or 0)   # Decimal → float（給 JSON 序列化）
             out.append(d)
         return out
 
@@ -386,6 +388,7 @@ class QAStore:
         d["rect"] = _json_or(d.get("rect"), None)
         d["replies"] = _json_or(d.get("replies"), []) or []
         d["files_changed"] = _json_or(d.get("files_changed"), []) or []
+        d["cost_usd"] = float(d.get("cost_usd") or 0)   # Decimal → float（給 JSON 序列化）
         return d
 
     def claim_pending_markup(self) -> dict | None:
@@ -414,14 +417,17 @@ class QAStore:
         return d
 
     def finish_markup(self, markup_id: int, *, status: str, result: str | None,
-                      elapsed_ms: int = 0, files_changed: list | None = None) -> None:
-        """worker 處理完回寫狀態與摘要（status = done | failed）+ 耗時 + 動到的檔案。"""
+                      elapsed_ms: int = 0, files_changed: list | None = None,
+                      tokens_in: int = 0, tokens_out: int = 0, cost_usd: float = 0.0) -> None:
+        """worker 處理完回寫狀態與摘要（status = done | failed）+ 耗時 + 動到的檔案
+        + 本次 headless Claude 的 token 消耗與成本（再次優化會覆蓋為最近一次）。"""
         with self._engine.begin() as conn:
             conn.execute(text(
-                "UPDATE qa_markups SET status=:s, result=:r, elapsed_ms=:ms, files_changed=:fc "
-                "WHERE id=:i"
+                "UPDATE qa_markups SET status=:s, result=:r, elapsed_ms=:ms, files_changed=:fc, "
+                "tokens_in=:ti, tokens_out=:to, cost_usd=:cu WHERE id=:i"
             ), {"s": status, "r": result, "ms": int(elapsed_ms),
-                "fc": json.dumps(files_changed or [], ensure_ascii=False), "i": markup_id})
+                "fc": json.dumps(files_changed or [], ensure_ascii=False),
+                "ti": int(tokens_in), "to": int(tokens_out), "cu": float(cost_usd), "i": markup_id})
 
     def set_markup_commit(self, markup_id: int, sha: str) -> None:
         """記錄「已解決」時提交的 commit sha（回滾時 git revert 用）。"""

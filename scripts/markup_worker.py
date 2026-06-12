@@ -137,23 +137,54 @@ def build_prompt(m: dict) -> str:
     return "\n".join(lines)
 
 
-def run_claude(prompt: str, *, skip_permissions: bool, timeout: int) -> tuple[bool, str]:
-    """呼叫 headless claude，回 (ok, 輸出文字)。"""
-    cmd = [CLAUDE_BIN, "-p", prompt]
+def _parse_claude_json(stdout: str) -> tuple[str, dict]:
+    """解析 `claude -p --output-format json` 的單一 result 物件，回 (結果文字, 成本資訊)。
+
+    成本資訊：{tokens_in, tokens_out, cost_usd}。tokens_in 含 prompt 端全部（input +
+    cache_creation + cache_read），tokens_out 為生成 token，cost_usd 取 CLI 權威的
+    total_cost_usd。非 JSON（舊版 CLI / 髒輸出）時退回原文、成本歸零。
+    """
+    text = (stdout or "").strip()
+    try:
+        obj = json.loads(text)
+    except (ValueError, TypeError):
+        return text, {"tokens_in": 0, "tokens_out": 0, "cost_usd": 0.0}
+    u = obj.get("usage") or {}
+    tokens_in = (int(u.get("input_tokens") or 0) + int(u.get("cache_creation_input_tokens") or 0)
+                 + int(u.get("cache_read_input_tokens") or 0))
+    cost = {
+        "tokens_in": tokens_in,
+        "tokens_out": int(u.get("output_tokens") or 0),
+        "cost_usd": float(obj.get("total_cost_usd") or 0.0),
+    }
+    return (obj.get("result") or "").strip() or text, cost
+
+
+def run_claude(prompt: str, *, skip_permissions: bool, timeout: int) -> tuple[bool, str, dict]:
+    """呼叫 headless claude，回 (ok, 輸出文字, 成本資訊)。
+
+    用 `--output-format json` 取得結構化結果，順帶拿到 token 消耗與 total_cost_usd。
+    成本資訊 = {tokens_in, tokens_out, cost_usd}（失敗或非 JSON 時為 0）。
+    """
+    zero = {"tokens_in": 0, "tokens_out": 0, "cost_usd": 0.0}
+    cmd = [CLAUDE_BIN, "-p", prompt, "--output-format", "json"]
     if skip_permissions:
         cmd.insert(1, "--dangerously-skip-permissions")
     try:
         proc = subprocess.run(
             cmd, cwd=str(PROJECT_ROOT), capture_output=True, text=True, timeout=timeout)
     except FileNotFoundError:
-        return False, f"找不到 `{CLAUDE_BIN}` 執行檔，請確認 Claude Code CLI 已安裝且在 PATH。"
+        return False, f"找不到 `{CLAUDE_BIN}` 執行檔，請確認 Claude Code CLI 已安裝且在 PATH。", zero
     except subprocess.TimeoutExpired:
-        return False, f"claude 處理逾時（>{timeout}s），已中止。"
+        return False, f"claude 處理逾時（>{timeout}s），已中止。", zero
     out = (proc.stdout or "").strip()
     err = (proc.stderr or "").strip()
     if proc.returncode != 0:
-        return False, f"claude 退出碼 {proc.returncode}\n{err or out}"
-    return True, out or "(claude 無輸出)"
+        # 失敗時 stdout 也可能是帶 cost 的 JSON（is_error=true），盡量把成本撈出來
+        _, cost = _parse_claude_json(out)
+        return False, f"claude 退出碼 {proc.returncode}\n{err or out}", cost
+    result, cost = _parse_claude_json(out)
+    return True, result or "(claude 無輸出)", cost
 
 
 def process_one(qa: QAStore, *, skip_permissions: bool, timeout: int) -> bool:
@@ -170,13 +201,16 @@ def process_one(qa: QAStore, *, skip_permissions: bool, timeout: int) -> bool:
           f"{(m.get('content') or '')[:60]}")
     before = gitops.dirty_files()
     t0 = time.monotonic()
-    ok, output = run_claude(build_prompt(m), skip_permissions=skip_permissions, timeout=timeout)
+    ok, output, cost = run_claude(build_prompt(m), skip_permissions=skip_permissions, timeout=timeout)
     elapsed_ms = int((time.monotonic() - t0) * 1000)
     changed = sorted(gitops.dirty_files() - before)
     qa.finish_markup(mid, status="done" if ok else "failed", result=output[:60000],
-                     elapsed_ms=elapsed_ms, files_changed=changed)
+                     elapsed_ms=elapsed_ms, files_changed=changed,
+                     tokens_in=cost["tokens_in"], tokens_out=cost["tokens_out"],
+                     cost_usd=cost["cost_usd"])
     print(f"[markup-worker] #{mid} → {'done' if ok else 'failed'}（{elapsed_ms}ms，"
-          f"改檔 {len(changed)} 個）")
+          f"改檔 {len(changed)} 個，token in/out {cost['tokens_in']}/{cost['tokens_out']}，"
+          f"成本 ${cost['cost_usd']:.4f}）")
     # 改了檔就巡檢一次看板健康（worker 改壞看板代碼要及時發現並修復）。
     # 動到 src/ 下的 .py（看板後端 / 框架）必須重啟看板才生效——靜態 JS 即改即生效，
     # 但 Python 已載入進程，不重啟會出現「前端有按鈕、後端 404 not found」的半套狀態。
