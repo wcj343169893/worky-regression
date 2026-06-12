@@ -1,0 +1,81 @@
+id: job-full-flow-with-clock
+description: 商家發工作(招募1人)→兩位夥伴各自申請→商家錄取其中一位→該夥伴打上下班卡。
+# 打卡配方（見 endpoints.yaml J5/J6 guards）：
+#  · 發「13 分鐘後開始」的近時段工作（dev min_publish_interval_seconds=600）；
+#  · J3 錄取後用商家日程內頁（115-2）labors[] 拿打卡碼存進 state；
+#  · 上班卡開工前即可打；下班卡須等 start_at 過後（working_status=1），否則 40403。
+# 整支約 14 分鐘（等開工占大頭）。
+vars:
+  job_recruit_count: 1
+  job_start_after_minutes: 13
+
+path:
+- transition: J1_employer_publish_job
+  save:
+    job_sn: job_sn_list.0
+  expect:
+    http: 200
+    api:
+      query: Q_employer_job_info
+      equals:
+        recruited_count: 0              # 剛發佈、媒合中、尚無人錄取
+
+- transition: J2_labor_apply
+  bind: {labor: labor1}
+  expect:
+    http: 200
+    push: {}
+    api:
+      query: Q_labor_job_matches
+      find: {in: matching, where: {job_sn: '{{state.job_sn}}'}}
+      equals:
+        status: 4                       # STATUS_LABOR_APPLY
+- transition: J2_labor_apply
+  bind: {labor: labor2}
+  expect:
+    http: 200
+    push: {}
+    api:
+      query: Q_labor_job_matches
+      find: {in: matching, where: {job_sn: '{{state.job_sn}}'}}
+      equals:
+        status: 4
+
+- transition: J3_employer_accept
+  bind: {labor: labor1}
+  expect:
+    http: 200
+    push: {}
+    api:
+      query: Q_labor_job_matches
+      find: {in: matching, where: {job_sn: '{{state.job_sn}}'}}
+      equals:
+        status: 6                       # STATUS_EMPLOYER_ACCEPT（labor1 上工）
+
+# 商家日程內頁拿 labor1 的上下班打卡碼（J3 後立即可查，無時間門檻）
+- assert_api:
+    query: Q_employer_schedule_info
+    save:
+      start_code: labors.0.start_code
+      end_code: labors.0.end_code
+
+# 上班卡：開工前即可打（adjusted_clock_in_at 會貼齊 start_at）
+- transition: J5_labor_clock_in
+  bind: {labor: labor1}
+  expect:
+    http: 200
+    push: {}
+
+# 下班卡須等工作開始（start_at<=now，否則 40403）：輪詢 working_status=1
+- wait_api:
+    query: Q_employer_schedule_info
+    equals:
+      working_status: 1                 # 0:未開始 1:進行中
+    timeout: 900
+    interval: 15
+
+- transition: J6_labor_clock_out
+  bind: {labor: labor1}
+  expect:
+    http: 200
+    push: {}

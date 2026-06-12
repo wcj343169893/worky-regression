@@ -1,0 +1,77 @@
+id: job-early-leave
+description: 打工夥伴早退流程：商家發佈工作(招募1人)→兩位夥伴各自申請→商家錄取其中一位→該夥伴上班打卡→開工後、未到下班時間即打下班卡（早退），驗證各階段狀態與推播。
+# 早退＝工作開始後（working_status=1）、end_at 之前打下班卡：工時 120 分鐘，
+# wait_api 等到剛開工即 clock-out，actual_clock_out_at 遠早於 end_at。
+# 打卡配方同 job-full-flow-with-clock（見 endpoints.yaml J5/J6 guards）。
+vars:
+  job_recruit_count: 1
+  job_start_after_minutes: 13
+
+path:
+- transition: J1_employer_publish_job
+  save:
+    job_sn: job_sn_list.0
+  expect:
+    http: 200
+    api:
+      query: Q_employer_job_info
+      equals:
+        recruited_count: 0
+
+- transition: J2_labor_apply
+  bind: {labor: labor1}
+  expect:
+    http: 200
+    push: {}
+    api:
+      query: Q_labor_job_matches
+      find: {in: matching, where: {job_sn: '{{state.job_sn}}'}}
+      equals:
+        status: 4
+- transition: J2_labor_apply
+  bind: {labor: labor2}
+  expect:
+    http: 200
+    push: {}
+    api:
+      query: Q_labor_job_matches
+      find: {in: matching, where: {job_sn: '{{state.job_sn}}'}}
+      equals:
+        status: 4
+
+- transition: J3_employer_accept
+  bind: {labor: labor1}
+  expect:
+    http: 200
+    push: {}
+    api:
+      query: Q_labor_job_matches
+      find: {in: matching, where: {job_sn: '{{state.job_sn}}'}}
+      equals:
+        status: 6
+
+- assert_api:
+    query: Q_employer_schedule_info
+    save:
+      start_code: labors.0.start_code
+      end_code: labors.0.end_code
+
+- transition: J5_labor_clock_in
+  bind: {labor: labor1}
+  expect:
+    http: 200
+    push: {}
+
+# 等到剛開工就打下班卡 → 早退（距 end_at 還有近 2 小時）
+- wait_api:
+    query: Q_employer_schedule_info
+    equals:
+      working_status: 1
+    timeout: 900
+    interval: 15
+
+- transition: J6_labor_clock_out
+  bind: {labor: labor1}
+  expect:
+    http: 200
+    push: {}

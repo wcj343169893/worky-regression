@@ -1,0 +1,37 @@
+id: job-two-labor-apply
+description: 商家發佈工作(招募1人)→兩位夥伴各自申請，驗證各階段狀態與推播。
+vars:
+  job_recruit_count: 1
+
+path:
+- transition: J1_employer_publish_job
+  save:
+    job_sn: job_sn_list.0
+  expect:
+    http: 200
+    api:
+      query: Q_employer_job_info
+      equals:
+        recruited_count: 0              # 剛發佈、媒合中、尚無人錄取
+
+# 兩位夥伴各自申請（bind 切身份；商家各收一筆 LABOR_JOB_APPLY_V2 推播）
+- transition: J2_labor_apply
+  bind: {labor: labor1}
+  expect:
+    http: 200
+    push: {}
+    api:
+      query: Q_labor_job_matches
+      find: {in: matching, where: {job_sn: '{{state.job_sn}}'}}
+      equals:
+        status: 4                       # STATUS_LABOR_APPLY（labor1 已申請）
+- transition: J2_labor_apply
+  bind: {labor: labor2}
+  expect:
+    http: 200
+    push: {}
+    api:
+      query: Q_labor_job_matches
+      find: {in: matching, where: {job_sn: '{{state.job_sn}}'}}
+      equals:
+        status: 4                       # STATUS_LABOR_APPLY（labor2 已申請）

@@ -73,6 +73,28 @@ python -m worky_regression.dashboard          # 預設 http://127.0.0.1:8765
 python -m worky_regression.dashboard --port 9000 --host 0.0.0.0
 ```
 
+### 開機自啟（systemd user 服務）
+
+看板與標記 worker 已配成**用戶級 systemd 服務**（無免密 sudo，故用 user unit +
+`loginctl enable-linger`，非 `/etc/systemd/system`）。WSL 啟動即自動拉起、
+崩潰 5 秒後自動重啟（`Restart=always`），解決「機器重啟後 8765 沒人聽 → 邊緣代理 502」。
+
+- `~/.config/systemd/user/worky-dashboard.service` — 看板，綁 `0.0.0.0:8765`
+  （邊緣代理用 LAN IP 直連，綁 127.0.0.1 會連不到）。
+- `~/.config/systemd/user/worky-markup-worker.service` — 標記 worker；
+  `Environment=PATH` 帶 nvm 的 node（`claude` CLI 依賴，systemd 預設 PATH 沒有）。
+
+```bash
+systemctl --user status  worky-dashboard worky-markup-worker   # 看狀態
+systemctl --user restart worky-dashboard                       # 重啟看板
+systemctl --user restart worky-markup-worker                   # 重啟 worker
+```
+
+日誌仍寫到 `logs/dashboard.log` / `logs/markup_worker.log`。
+
+> **不要再用 nohup 手動起**：會與 systemd 實例搶埠 / 單例鎖
+> （worker 有單例鎖，舊 nohup 進程不死、新實例起不來）。
+
 開瀏覽器進 `http://127.0.0.1:8765`。功能：
 
 - **頂部統計**：總數 / 進行中 / 已完成 / 取消失敗，加一條進度分布長條。
@@ -364,7 +386,14 @@ YAML 模板可參考 `cases/path-contract-happy-green.yaml`。
 
 ## 把 worker 跑起來
 
-兩支背景 worker 與看板 server 解耦、可獨立起停。共通：先進虛擬環境、背景常駐用 `nohup` + `-u`
+兩支背景 worker 與看板 server 解耦、可獨立起停。
+
+> **markup_worker 平常不用手動起**：已配成 systemd user 服務開機自啟
+> （見「PC 任務看板 → 開機自啟」），`systemctl --user restart worky-markup-worker` 即可。
+> 以下手動方式只用於除錯（`--once`）或臨時換旗標跑；**先停掉 systemd 實例**
+> （`systemctl --user stop worky-markup-worker`），否則單例鎖會擋住新實例。
+
+共通：先進虛擬環境、背景常駐用 `nohup` + `-u`
 （不帶 `-u` 看不到即時 log，見 CLAUDE.md），log 落到 `logs/`。
 
 ```bash

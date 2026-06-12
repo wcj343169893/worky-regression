@@ -1,0 +1,94 @@
+id: job-full-flow-clock-in-out
+description: 商家發佈1個今天職位，2個打工夥伴申請，商家錄取其中一位，該夥伴打上下班卡，再相互5星好評。
+# 互評端點已補進 endpoints.yaml（J8 商家評夥伴 126-1 / J9 夥伴評商家 219-1），已解鎖。
+vars:
+  job_recruit_count: 1
+  job_start_after_minutes: 13
+
+path:
+- transition: J1_employer_publish_job
+  save:
+    job_sn: job_sn_list.0
+  expect:
+    http: 200
+    api:
+      query: Q_employer_job_info
+      equals:
+        recruited_count: 0
+
+- transition: J2_labor_apply
+  bind: {labor: labor1}
+  expect:
+    http: 200
+    push: {}
+    api:
+      query: Q_labor_job_matches
+      find: {in: matching, where: {job_sn: '{{state.job_sn}}'}}
+      equals:
+        status: 4
+- transition: J2_labor_apply
+  bind: {labor: labor2}
+  expect:
+    http: 200
+    push: {}
+    api:
+      query: Q_labor_job_matches
+      find: {in: matching, where: {job_sn: '{{state.job_sn}}'}}
+      equals:
+        status: 4
+
+- transition: J3_employer_accept
+  bind: {labor: labor1}
+  expect:
+    http: 200
+    push: {}
+    api:
+      query: Q_labor_job_matches
+      find: {in: matching, where: {job_sn: '{{state.job_sn}}'}}
+      equals:
+        status: 6
+
+- assert_api:
+    query: Q_employer_schedule_info
+    save:
+      start_code: labors.0.start_code
+      end_code: labors.0.end_code
+
+- transition: J5_labor_clock_in
+  bind: {labor: labor1}
+  expect:
+    http: 200
+    push: {}
+
+- wait_api:
+    query: Q_employer_schedule_info
+    equals:
+      working_status: 1
+    timeout: 900
+    interval: 15
+
+- transition: J6_labor_clock_out
+  bind: {labor: labor1}
+  expect:
+    http: 200
+    push: {}
+
+# 互評：工作完成（J6 下班卡後 job_status=3）即可評。商家對被錄取的 labor1 5 星好評、
+# labor1 回評商家 5 星（三維星等皆給滿分 4，evaluation_labels 帶正面標籤）。
+- transition: J8_employer_evaluate_labor
+  bind: {labor: labor1}
+  expect:
+    http: 200
+    api:
+      query: Q_employer_evaluation_get
+      equals:
+        job_sn: '{{state.job_sn}}'
+
+- transition: J9_labor_evaluate_employer
+  bind: {labor: labor1}
+  expect:
+    http: 200
+    api:
+      query: Q_labor_evaluation_get
+      equals:
+        job_sn: '{{state.job_sn}}'

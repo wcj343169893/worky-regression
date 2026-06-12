@@ -1,0 +1,78 @@
+id: job-accept-two-labor
+description: 商家發佈工作(招募2人)→3位夥伴各自申請→商家錄取其中2位，第3位轉備取，驗證各階段狀態與推播。
+vars:
+  job_recruit_count: 2
+
+path:
+- transition: J1_employer_publish_job
+  save:
+    job_sn: job_sn_list.0
+  expect:
+    http: 200
+    api:
+      query: Q_employer_job_info
+      equals:
+        recruited_count: 0              # 剛發佈、媒合中、尚無人錄取
+
+# 三位夥伴各自申請（bind 切身份）
+- transition: J2_labor_apply
+  bind: {labor: labor1}
+  expect:
+    http: 200
+    push: {}
+    api:
+      query: Q_labor_job_matches
+      find: {in: matching, where: {job_sn: '{{state.job_sn}}'}}
+      equals:
+        status: 4                       # STATUS_LABOR_APPLY
+- transition: J2_labor_apply
+  bind: {labor: labor2}
+  expect:
+    http: 200
+    push: {}
+    api:
+      query: Q_labor_job_matches
+      find: {in: matching, where: {job_sn: '{{state.job_sn}}'}}
+      equals:
+        status: 4
+- transition: J2_labor_apply
+  bind: {labor: labor3}
+  expect:
+    http: 200
+    push: {}
+    api:
+      query: Q_labor_job_matches
+      find: {in: matching, where: {job_sn: '{{state.job_sn}}'}}
+      equals:
+        status: 4
+
+# 商家錄取 labor1、labor2（同商家連續兩次動作，中間 sleep 避開 9002 過快節流）
+- transition: J3_employer_accept
+  bind: {labor: labor1}
+  expect:
+    http: 200
+    push: {}
+    api:
+      query: Q_labor_job_matches
+      find: {in: matching, where: {job_sn: '{{state.job_sn}}'}}
+      equals:
+        status: 6                       # STATUS_EMPLOYER_ACCEPT（labor1 已錄取）
+- sleep: 2
+- transition: J3_employer_accept
+  bind: {labor: labor2}
+  expect:
+    http: 200
+    push: {}
+    api:
+      query: Q_labor_job_matches
+      find: {in: matching, where: {job_sn: '{{state.job_sn}}'}}
+      equals:
+        status: 6                       # STATUS_EMPLOYER_ACCEPT（labor2 已錄取）
+
+# 招募 2 人額滿 → 第 3 位轉備取（打 labor3 自己的媒合清單驗 status=16）
+- assert_api:
+    query: Q_labor_job_matches
+    actor: labor3
+    find: {in: matching, where: {job_sn: '{{state.job_sn}}'}}
+    equals:
+      status: 16                        # STATUS_BACKUP（申請成功但未獲錄取）
