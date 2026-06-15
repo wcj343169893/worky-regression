@@ -520,9 +520,16 @@ async function pollMarkups() {
       if (curRoute().split("/")[0] === "markups") loadMarkupPage({ preserveDrafts: true });
     }
   }
-  // 有待處理/處理中 → 3s 緊盯；否則 15s 慢輪詢（仍能接住外部新增/回覆）；隱藏分頁拉長到 30s。
-  const next = document.hidden ? 30000 : (items && hasInFlight(items) ? 3000 : 15000);
-  pollTimer = setTimeout(pollMarkups, next);
+  // 只在「有標記正在後台處理（pending/processing）」時才持續輪詢盯狀態（3s 緊盯，
+  // 等 worker 把它跑完）。全部落地（done/failed）或當前 route 無標記 → 停止輪詢，
+  // 閒置時對 /api/markups 零請求，不再每幾秒打接口干擾操作。
+  // 重新啟動輪詢的時機（皆走 pollSoon，只打一次來判斷是否需續輪詢）：
+  //   · 使用者新增 / 回覆 / 刪除 / 打回標記（各操作後已呼叫 pollSoon）
+  //   · 切換 route（hashchange → pollSoon，接住別頁正在處理的標記）
+  //   · 分頁從背景切回前景（visibilitychange → pollSoon）
+  if (items && hasInFlight(items) && !document.hidden) {
+    pollTimer = setTimeout(pollMarkups, 3000);
+  }
 }
 
 // 立即排一次輪詢（送出回覆/刪除等本地操作後，讓狀態馬上對齊）。
@@ -659,7 +666,8 @@ export function initMarkupOverlays() {
     new MutationObserver(scheduleOverlayRefresh).observe(view, { childList: true, subtree: true });
     view.addEventListener("scroll", scheduleReposition, { passive: true });
   }
-  window.addEventListener("hashchange", scheduleOverlayRefresh);
+  // 換 route：重畫框 + 打一次 pollMarkups（接住新頁正在處理的標記並決定是否續輪詢）
+  window.addEventListener("hashchange", () => { scheduleOverlayRefresh(); pollSoon(); });
   window.addEventListener("resize", scheduleReposition);
   // 分頁從背景切回前景 → 立刻對齊一次狀態
   document.addEventListener("visibilitychange", () => { if (!document.hidden) pollSoon(); });
