@@ -27,7 +27,6 @@ export async function renderSettings() {
   const b = d.backend || {};
   const pwPh = b.password_set ? "已設定（留空＝不修改）" : "未設定";
   $("view").innerHTML = `
-    <div class="view-head"><h2>系統設置</h2></div>
     <div class="set-grid">
       <div class="set-card"><h3>目標 API（驗證以此為準）</h3>
         ${kv("API Base", esc(d.api_base))}${kv("Activity API", esc(d.activity_api_base || "—"))}${kv("Platform", esc(d.platform))}</div>

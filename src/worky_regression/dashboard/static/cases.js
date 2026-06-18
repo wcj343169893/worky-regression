@@ -22,6 +22,10 @@ const DECOMPOSE_TABS = [
     ph: "工作流程，例：商家發工作，夥伴申請後商家錄取再打卡" },
   { key: "contract", label: "任務", system: "contract",
     ph: "承攬任務流程，例：發案方發布任務，夥伴接案後完成驗收" },
+  // 真機軌（B）：清單篩到 system=app 的 Maestro 用例，「執行」直接驅動真機（DeviceRunner）。
+  // planned=true 暫時關閉 AI 分解（真機 flow 由 Maestro MCP 互動式編寫，AI 自動產出待後續）。
+  { key: "app", label: "📱 真機", system: "app", planned: true,
+    ph: "真機 App 流程（Maestro）；AI 自動產生真機 flow 規劃中，請先手寫用例" },
   { key: "labor", label: "打工夥伴", system: "labor", planned: true,
     ph: "打工夥伴帳號生命週期（註冊 / 審核…）— 規劃中，暫不支援分解" },
 ];
@@ -112,7 +116,6 @@ function actorsSecHtml(last) {
 }
 
 export async function renderCases(key, tabKey, drillPath = []) {
-  const cfg = CASES[key];
   // system 為頁內狀態（"" = 全部），由 AI 分解 tab 控制；tab 記住當前選中的領域 key
   // stack/parentId：主任務→子任務下鑽用的麵包屑堆疊與當前層父 id（頂層為 null）
   const s = state[key] || (state[key] = { q: "", page: 0, system: "", tab: "all", stack: [], parentId: null });
@@ -141,29 +144,16 @@ export async function renderCases(key, tabKey, drillPath = []) {
     `<button class="dc-tab dc-add" id="dc-add" title="用一句話描述，AI 自動建立領域 tab">＋ 新增</button>`;
   $("view").innerHTML = `
     <div class="cases-page">
-      <div class="view-head"><h2>${esc(cfg.title)}</h2>
-        <span class="sub2">讀 cases/*.yaml（含 AI 產生的 generated/），依 id 倒序；對應 results/ 顯示最近一次執行</span></div>
-      <div class="card ai-panel">
-        <div class="panel-head"><h3>AI 用例分解</h3>
-          <span class="sub2">自然語言用例 → DeepSeek 分解成任務流（存入 generated/）</span></div>
-        <div class="dc-tabs">${tabsHtml}</div>
-        <div class="ai-form">
-          <div class="uc-wrap">
-            <textarea id="uc" rows="2" placeholder="${esc(cur.ph)}"></textarea>
-            <div class="uc-hl" id="uc-hl" aria-hidden="true"></div>
-          </div>
-          <label class="ck"><input type="checkbox" id="uc-run" /> 建立後立即執行</label>
-          <button class="btn primary" id="uc-go">分解</button>
-        </div>
-      </div>
+      <div class="dc-tabs">${tabsHtml}</div>
       <div class="card cases-list">
         <div class="crumbs" id="crumbs"></div>
         <div class="panel-head"><h3>用例清單</h3>
+          <button class="btn primary" id="uc-open" title="自然語言用例 → DeepSeek 分解成任務流（存入 generated/）">✨ AI 分解用例</button>
           <button class="btn primary" id="batch-run" disabled title="勾選下方用例後串行逐條執行">▶ 批量執行</button>
           <button class="btn ghost danger" id="clear-all" title="清空所有測試用例與執行紀錄，重新測試（不影響帳號池 / 設定 / 標記）">🗑 清空全部</button>
           <input type="search" id="q" placeholder="搜尋 名稱 / 描述…" value="${esc(s.q)}" /></div>
         <div class="table-wrap"><table>
-          <thead><tr><th class="ck-col"><input type="checkbox" id="ck-all" title="全選 / 取消全選" /></th><th>用例 ID / 描述</th><th>來源</th><th>建立時間</th><th class="num">步驟</th><th>任務流</th><th>最近結果</th><th class="act">操作</th></tr></thead>
+          <thead><tr><th class="ck-col"><input type="checkbox" id="ck-all" title="全選 / 取消全選" /></th><th class="desc-col">用例 ID / 描述</th><th class="src-col">來源</th><th class="date-col">建立時間</th><th class="num">步驟</th><th class="flow-col">任務流</th><th class="lr-col">最近結果</th><th class="act">操作</th></tr></thead>
           <tbody id="rows"></tbody>
         </table></div>
         <div class="pager">
@@ -184,8 +174,9 @@ export async function renderCases(key, tabKey, drillPath = []) {
       else loadCases(key);
     }, 300);
   };
-  $("uc-go").onclick = () => doDecompose(key);
-  setupUcRefs();
+  // AI 用例分解改為彈窗（讓清單佔滿頁面高度）：點按鈕才開分解輸入框
+  const ucOpen = $("uc-open");
+  if (ucOpen) ucOpen.onclick = () => openDecomposeModal(key);
   // 全選勾選框 + 批量執行（主用例與子任務層皆有；勾選列串行逐條跑，共用帳號池避免並行互擾）
   const ckAll = $("ck-all");
   if (ckAll) ckAll.onchange = () => {
@@ -371,27 +362,26 @@ async function loadCases(key) {
 // 後端對 status='running' 的最近 run 附帶 live（由逐步落庫推算的「正在跑哪一步」）：
 //   transition → 該 chip 點亮閃爍；wait_api/sleep（≥30s）→ 下一顆 chip 疊「等待中 + 倒數」
 //   （截止 = step_started_at + wait_secs）。本頁有活躍 SSE 的用例跳過（SSE 自己會畫）。
-// 只要清單裡有執行中用例，10s 後自動重載列表，讓 chip 着色跟著逐步落庫前進。
+// 進度只在「進頁 / 手動刷新 / 自己觸發的 SSE」時更新——不再背景輪詢 /api/cases。
+// （過去每 10s 重打清單會打斷正在挑用例 / 滾動 / 勾選的操作人員，已依回饋移除。）
+// 倒數 chip 純前端每秒走字，不打後端、不重建表、不清勾選。
 let liveTimers = [];
-let liveReloadTimer = 0;
 const activeStreams = new Set();   // 本頁正在 runCaseStream 的用例 id
 function clearLiveProgress() {
   liveTimers.forEach(clearInterval); liveTimers = [];
-  if (liveReloadTimer) { clearTimeout(liveReloadTimer); liveReloadTimer = 0; }
 }
 function applyLiveProgress(key, items) {
   clearLiveProgress();
   const fmtLeft = (s) => `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
-  let running = 0;
   for (const c of items) {
     const lr = c.last_result, lv = lr && lr.live;
     if (!lr || lr.status !== "running") continue;
-    running++;
     if (!lv || activeStreams.has(c.id)) continue;
     const row = document.querySelector(`tr[data-id="${CSS.escape(c.id)}"]`);
     if (!row) continue;
     if (lv.kind === "transition") {
-      row.querySelector(`.tchip[data-ti="${lv.cur_tindex}"]`)?.classList.add("tchip-running");
+      const c = row.querySelector(`.tchip[data-ti="${lv.cur_tindex}"]`);
+      if (c) { c.classList.add("tchip-running"); centerChip(c); }
       continue;
     }
     if (!(lv.wait_secs >= 30)) continue;            // 短等待不展示（與 SSE 行為一致）
@@ -403,6 +393,7 @@ function applyLiveProgress(key, items) {
       el.classList.add("tchip-running", "tchip-waiting");
       el.title = `${lv.name}（倒數至逾時上限，條件滿足即提前結束）`;
       base = `${el.textContent} 等待中`;
+      centerChip(el);                               // 等待中的下一顆步驟也滾到中央
     } else {
       const flow = row.querySelector(".tflow");
       if (!flow) continue;
@@ -418,9 +409,40 @@ function applyLiveProgress(key, items) {
     tick();
     liveTimers.push(setInterval(tick, 1000));
   }
-  if (running) liveReloadTimer = setTimeout(() => loadCases(key), 10000);
 }
 
+// 任務流橫向滑動：把正在執行的 chip 滾到 .tflow 可視區中央（不影響整頁捲動）。
+// .tflow 已設 position:relative，故 chip.offsetLeft 相對 .tflow 內容左緣。
+function centerChip(c) {
+  const flow = c && c.closest(".tflow");
+  if (!flow) return;
+  const target = c.offsetLeft - (flow.clientWidth - c.offsetWidth) / 2;
+  flow.scrollTo({ left: Math.max(0, target), behavior: "smooth" });
+}
+// transition chip 著色 / 最近結果徽章——全量重建（renderCaseRows）與 SSE 逐步更新共用。
+function tchipCls(st) {
+  return st === "passed" ? "tchip-pass" : st === "failed" ? "tchip-fail"
+    : st === "skipped" ? "tchip-skip" : "";
+}
+// 每個 transition chip 依最近一次執行中對應步驟的結果著色（綠=通過 / 紅=失敗）
+function tflowHtml(c) {
+  const tss = (c.last_result && c.last_result.transition_status) || [];
+  return c.transitions.length
+    ? `<div class="tflow">${c.transitions.map((x, i) =>
+        `<span class="tchip clickable ${tchipCls(tss[i])}" data-cid="${esc(c.id)}" data-ti="${i}" title="點擊看詳情">${esc(x.split("_")[0])}</span>`).join("")}</div>`
+    : `<span class="sub2">db / 混合</span>`;
+}
+// 失敗時把第一個失敗步驟的錯誤掛在 title、略過時把 skip_reason 掛在 title——滑過徽章
+// 即可看原因，不必下鑽；略過另在徽章下方顯示截斷的原因，讓「為什麼略過」一眼可見。
+function lrCellHtml(c) {
+  const lr = c.last_result;
+  const isSkip = (lr && lr.status === "skipped") || c.skip;
+  const lrTip = (lr && lr.error) || (isSkip ? c.skip_reason : "");
+  const skipWhy = isSkip && c.skip_reason ? `<div class="sub2 skip-why">${esc(c.skip_reason)}</div>` : "";
+  return lr ? `<span${lrTip ? ` title="${esc(lrTip)}"` : ""}>${resBadge(lr.status)}</span>${skipWhy}`
+    : (c.skip ? `<span${lrTip ? ` title="${esc(lrTip)}"` : ""}>${resBadge("skipped")}</span>${skipWhy}`
+              : `<span class="sub2">—</span>`);
+}
 function renderCaseRows(key, items) {
   const tb = $("rows");
   if (!tb) return;
@@ -429,31 +451,16 @@ function renderCaseRows(key, items) {
     tb.style.opacity = "1"; return;
   }
   tb.innerHTML = items.map((c) => {
-    const lr = c.last_result;
-    // 每個 transition chip 依最近一次執行中對應步驟的結果著色（綠=通過 / 紅=失敗）
-    const tss = (lr && lr.transition_status) || [];
-    const tchipCls = (st) => st === "passed" ? "tchip-pass" : st === "failed" ? "tchip-fail"
-      : st === "skipped" ? "tchip-skip" : "";
-    const tflow = c.transitions.length
-      ? `<div class="tflow">${c.transitions.map((x, i) =>
-          `<span class="tchip clickable ${tchipCls(tss[i])}" data-cid="${esc(c.id)}" data-ti="${i}" title="點擊看詳情">${esc(x.split("_")[0])}</span>`).join("")}</div>`
-      : `<span class="sub2">db / 混合</span>`;
-    // 失敗時把第一個失敗步驟的錯誤掛在 title、略過時把 skip_reason 掛在 title——滑過徽章
-    // 即可看原因，不必下鑽；略過另在徽章下方顯示截斷的原因，讓「為什麼略過」一眼可見。
-    const isSkip = (lr && lr.status === "skipped") || c.skip;
-    const lrTip = (lr && lr.error) || (isSkip ? c.skip_reason : "");
-    const skipWhy = isSkip && c.skip_reason ? `<div class="sub2 skip-why">${esc(c.skip_reason)}</div>` : "";
-    const lrHtml = lr ? `<span${lrTip ? ` title="${esc(lrTip)}"` : ""}>${resBadge(lr.status)}</span>${skipWhy}`
-      : (c.skip ? `<span${lrTip ? ` title="${esc(lrTip)}"` : ""}>${resBadge("skipped")}</span>${skipWhy}`
-                : `<span class="sub2">—</span>`);
+    const tflow = tflowHtml(c);
+    const lrHtml = lrCellHtml(c);
     return `<tr data-id="${esc(c.id)}">
       <td class="ck-col"><input type="checkbox" class="row-ck" data-id="${esc(c.id)}" /></td>
-      <td><div class="cid">${c.seq != null ? `<span class="seq">#${c.seq}</span>` : ""}<code>${esc(c.id)}</code></div><div class="sub2">${esc((c.description || "").slice(0, 50))}</div></td>
-      <td><span class="pill">${c.source === "generated" ? "AI 產生" : "內建"}</span></td>
-      <td><span class="sub2">${fmtTs(c.created_at)}</span></td>
+      <td class="desc-col"><div class="cid">${c.seq != null ? `<span class="seq">#${c.seq}</span>` : ""}<code>${esc(c.id)}</code></div><div class="sub2">${esc((c.description || "").slice(0, 90))}</div></td>
+      <td class="src-col"><span class="pill">${c.source === "generated" ? "AI 產生" : "內建"}</span></td>
+      <td class="date-col"><span class="sub2">${fmtTs(c.created_at)}</span></td>
       <td class="num">${c.step_count}</td>
-      <td>${tflow}</td>
-      <td>${lrHtml}</td>
+      <td class="flow-col">${tflow}</td>
+      <td class="lr-col">${lrHtml}</td>
       <td class="act">
         <button class="btn view-btn" data-id="${esc(c.id)}">查看</button>
         <button class="btn run-btn" data-id="${esc(c.id)}">執行</button>
@@ -543,6 +550,7 @@ function runCaseStream(id, row, { drawer = true } = {}) {
       if (c.classList.contains("tchip-waiting")) restoreChip(c);  // 防禦：殘留的等待裝飾
       c.classList.remove("tchip-running", "tchip-pass", "tchip-fail", "tchip-skip");
       if (cls) c.classList.add(cls);
+      if (cls === "tchip-running") centerChip(c);  // 正在執行的步驟滾到任務流中央
     };
     const statusToCls = (st) => st === "passed" ? "tchip-pass" : st === "failed" ? "tchip-fail"
       : st === "skipped" ? "tchip-skip" : "";
@@ -567,6 +575,7 @@ function runCaseStream(id, row, { drawer = true } = {}) {
             c.dataset.origTitle = c.title;
             c.title = w.hint;
             c.classList.add("tchip-running", "tchip-waiting");
+            centerChip(c);                               // 等待中的下一顆步驟滾到中央
           }
           c.textContent = `${c.dataset.orig} 等待中${cd}`;
           return;
@@ -1083,6 +1092,31 @@ function openConfirmModal(key, pv, run) {
       ok.disabled = false; ok.textContent = oldTxt;
     }
   };
+}
+
+// AI 用例分解彈窗：把原本常駐頁首的分解面板搬進 modal（騰出清單高度）。
+// 沿用當前 tab 的 placeholder/system；開啟後掛 #N 引用高亮（setupUcRefs 需 DOM 已就位）。
+function openDecomposeModal(key) {
+  const s = state[key] || {}, cur = tabByKey(s.tab);
+  openModal(`<div class="uc-modal">
+    <h3 class="modal-title">✨ AI 用例分解 <span class="sub2">（${esc(cur.label)}）</span></h3>
+    <p class="sub2">自然語言用例 → DeepSeek 分解成任務流（preview 確認後才存入 generated/）。可用 #N 引用既有用例。</p>
+    <div class="ai-form">
+      <div class="uc-wrap">
+        <textarea id="uc" rows="4" placeholder="${esc(cur.ph)}"></textarea>
+        <div class="uc-hl" id="uc-hl" aria-hidden="true"></div>
+      </div>
+      <div class="uc-modal-actions">
+        <label class="ck"><input type="checkbox" id="uc-run" /> 建立後立即執行</label>
+        <button class="btn ghost" id="uc-cancel">取消</button>
+        <button class="btn primary" id="uc-go">分解</button>
+      </div>
+    </div>
+  </div>`);
+  $("uc-cancel").onclick = closeModal;
+  $("uc-go").onclick = () => doDecompose(key);
+  setupUcRefs();
+  const ta = $("uc"); if (ta) ta.focus();
 }
 
 async function doDecompose(key) {

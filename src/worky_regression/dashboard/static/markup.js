@@ -382,11 +382,10 @@ export async function renderMarkups(tabKey) {
   const tabs = MARKUP_STATUSES.map(([k, l]) =>
     `<button class="dc-tab${k === mq.status ? " active" : ""}" data-st="${k}">${l}</button>`).join("");
   view.innerHTML = `<section class="cases-page">
-    <div class="view-head"><h2>頁面標記</h2>
-      <span class="sub2">點右上「✎ 標記」在任一頁標註元素；headless Claude worker 會輪詢處理（狀態即時更新）。</span></div>
     <div class="dc-tabs">${tabs}</div>
     <div class="card cases-list">
       <div class="panel-head"><h3>標記清單</h3>
+        <span class="sub2 panel-sub">點右上「✎ 標記」在任一頁標註元素；headless Claude worker 會輪詢處理（狀態即時更新）。</span>
         <div class="mq-tools">
           <input type="search" id="mq-q" placeholder="搜尋 內容 / 路由 / 選擇器…" value="${esc(mq.q)}" />
           <button class="btn primary" id="mq-new" title="不綁定頁面元素，給系統全局添加修改指令">＋ 新增</button>

@@ -198,11 +198,10 @@ export async function renderAccounts(tabKey) {
 
   $("view").innerHTML = `
     <div class="cases-page">
-      <div class="view-head"><h2>帳號池</h2>
-        <span class="sub2">執行期按能力(caps) + 最久未用輪換配發；停用者不配發。測試登入會實際打被測登入 API。</span></div>
       <div class="dc-tabs">${tabsHtml}</div>
       <div class="card cases-list">
         <div class="panel-head"><h3 id="acc-title"></h3><span id="acc-warn"></span>
+          <span class="sub2 panel-sub">執行期按能力(caps) + 最久未用輪換配發；停用者不配發。測試登入會實際打被測登入 API。</span>
           <span class="acc-reg">
             <button class="btn ghost" id="acc-init-btn" title="全清當前庫池列，按能力分群各建 3 個（含 provision 種子補 audit_role）。耗時較長">⟳ 初始化</button>
             <span class="acc-reg-caps" title="選擇要賦予的能力（未勾＝僅基本 active/clean）；verified/shop_approved 需後台帳密核准">${capsCheckboxesHtml(curRole)}</span>

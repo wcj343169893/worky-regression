@@ -74,7 +74,7 @@ input[type=number].flt{min-width:96px;width:110px}
 .table-wrap{overflow:auto;max-height:calc(100vh - 320px)}
 table{width:100%;border-collapse:collapse;font-size:13px}
 thead th{text-align:left;padding:11px 14px;color:var(--muted);font-weight:600;
-  border-bottom:1px solid var(--line);position:sticky;top:0;background:var(--panel2);white-space:nowrap}
+  border-bottom:1px solid var(--line);position:sticky;top:0;z-index:2;background:var(--panel2);white-space:nowrap}
 tbody td{padding:11px 14px;border-bottom:1px solid rgba(38,48,77,.5);vertical-align:middle}
 tbody tr{cursor:default;transition:.1s}
 tbody tr:hover{background:var(--panel2)}
@@ -106,6 +106,19 @@ textarea:focus{outline:none;border-color:var(--accent)}
 .cases-page .ai-panel{flex:none;margin-bottom:0}
 .cases-list{flex:1;min-height:0;display:flex;flex-direction:column}
 .cases-list .table-wrap{max-height:none;flex:1}
+/* 用例清單欄寬：寬螢幕下避免來源 / 建立時間 / 操作被擠到換行；描述占滿剩餘寬度單行省略 */
+.cases-list td.src-col,.cases-list th.src-col,
+.cases-list td.date-col,.cases-list th.date-col,
+.cases-list td.num,.cases-list th.num,
+.cases-list td.flow-col,.cases-list th.flow-col,
+.cases-list td.lr-col,.cases-list th.lr-col,
+.cases-list td.act,.cases-list th.act{white-space:nowrap;width:1%}
+.cases-list td.act{min-width:340px}
+/* 用例 ID / 描述：唯一彈性欄——吸收/釋放剩餘寬度隨螢幕動態縮放（窄螢幕縮到 min 並省略，
+   寬螢幕長到 max 後多餘寬度才落到任務流 / 最近結果欄），其餘欄位皆 width:1% 緊貼內容 */
+.cases-list td.desc-col,.cases-list th.desc-col{width:auto;min-width:220px;max-width:640px}
+.cases-list td.desc-col .cid code{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.cases-list td.desc-col .sub2{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:100%}
 /* 主任務/子任務下鑽：麵包屑（頂層不渲染）。可點層為 button，當前層為弱化文字 */
 .crumbs{display:flex;align-items:center;flex-wrap:wrap;gap:6px;
   padding:10px 14px 0;font-size:13px}
@@ -143,6 +156,16 @@ textarea:focus{outline:none;border-color:var(--accent)}
 .add-tab-actions{display:flex;justify-content:flex-end;gap:10px;margin-top:14px}
 .ai-form{display:flex;align-items:center;gap:12px;flex-wrap:wrap}
 .ai-form textarea{flex:1;min-width:280px}
+/* AI 用例分解彈窗：表單改直向堆疊（輸入框佔滿、動作列在下），騰出清單頁高度 */
+.uc-modal{min-width:min(640px,86vw)}
+.uc-modal .modal-title{margin:0 0 6px}
+.uc-modal .ai-form{flex-direction:column;align-items:stretch;gap:14px}
+.uc-modal .uc-wrap{width:100%;min-width:0}
+.uc-modal textarea{min-height:108px;resize:vertical}
+.uc-modal-actions{display:flex;align-items:center;gap:12px;justify-content:flex-end}
+.uc-modal-actions .ck{margin-right:auto}
+/* 分解面板移入彈窗後，領域 tab 列獨立成頁首篩選條（間距交給 cases-page 的 gap） */
+.cases-page>.dc-tabs{flex:none;margin-bottom:0}
 /* 分解輸入框 #N 引用高亮：textarea 文字透明（游標靠 caret-color 保留），
    文字實際由 .uc-hl 鏡像層顯示——兩者字體/內距/行高/換行規則必須完全一致才能對位 */
 .uc-wrap{position:relative;flex:1;min-width:280px}
@@ -156,9 +179,12 @@ textarea:focus{outline:none;border-color:var(--accent)}
 .uc-ref{color:var(--accent);text-decoration:underline;cursor:pointer;pointer-events:auto;font-weight:600}
 .uc-ref:hover{filter:brightness(1.25)}
 .ck{display:flex;align-items:center;gap:6px;color:var(--muted);font-size:13px;white-space:nowrap;cursor:pointer}
-.tflow{display:flex;flex-wrap:wrap;gap:4px}
-.tchip{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:11px;padding:1px 7px;
-  border-radius:6px;background:var(--panel2);border:1px solid var(--line);color:var(--muted)}
+/* 任務流：chip 不換行，限制最大寬度，超出可橫向滑動（正在執行的步驟由 JS 滾到置中） */
+.tflow{position:relative;display:flex;flex-wrap:nowrap;gap:4px;max-width:360px;
+  overflow-x:auto;overflow-y:hidden;padding-bottom:3px;scrollbar-width:thin}
+.tflow::-webkit-scrollbar{height:6px}
+.tchip{flex:none;white-space:nowrap;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:11px;
+  padding:1px 7px;border-radius:6px;background:var(--panel2);border:1px solid var(--line);color:var(--muted)}
 /* 任務流 chip 依該步驟最近一次執行結果著色（綠=通過 / 紅=失敗 / 灰=略過） */
 .tchip.tchip-pass{background:rgba(61,220,151,.16);border-color:var(--ok);color:var(--ok)}
 .tchip.tchip-fail{background:rgba(255,107,107,.18);border-color:var(--danger);color:var(--danger)}
@@ -264,7 +290,7 @@ td.ck-col,th.ck-col{width:1%;text-align:center;white-space:nowrap}
 
 /* 進度徽章 */
 .badge{display:inline-flex;align-items:center;gap:6px;padding:3px 10px;border-radius:999px;
-  font-size:12px;font-weight:700;border:1px solid}
+  font-size:12px;font-weight:700;border:1px solid;white-space:nowrap}
 .badge::before{content:"";width:7px;height:7px;border-radius:50%;background:currentColor}
 .b-matching{color:var(--accent);border-color:rgba(91,140,255,.4);background:rgba(91,140,255,.1)}
 .b-recruited{color:var(--cyan);border-color:rgba(43,212,192,.4);background:rgba(43,212,192,.1)}
@@ -348,6 +374,8 @@ td.ck-col,th.ck-col{width:1%;text-align:center;white-space:nowrap}
 /* 用例清單：標題與按鈕靠左成組，搜索框獨自貼右 */
 .cases-list .panel-head{justify-content:flex-start}
 .cases-list .panel-head #q{margin-left:auto}
+/* 移除一級標題後，原標題右側的頁面說明改掛在清單面板標題旁（弱化、可換行、不擠壓右側控制） */
+.panel-sub{font-weight:400;line-height:1.4;max-width:620px}
 /* 標記清單工具列（搜索 + 新增）：貼到當前行最右側 */
 .mq-tools{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-left:auto;justify-content:flex-end}
 /* 帳號池「註冊入池」控制：靠右，數字框 + 按鈕 */
