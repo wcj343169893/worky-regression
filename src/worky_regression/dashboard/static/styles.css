@@ -299,6 +299,17 @@ td.ck-col,th.ck-col{width:1%;text-align:center;white-space:nowrap}
 .b-failed{color:var(--danger);border-color:rgba(255,107,107,.4);background:rgba(255,107,107,.1)}
 .b-canceled{color:var(--muted);border-color:var(--line);background:var(--panel2)}
 .b-draft{color:var(--muted);border-color:var(--line);background:var(--panel2)}
+/* 長延時掛起：藍色脈動徽章 + 倒數 + 點開說明 */
+.b-waiting{color:#5aa9ff;border-color:rgba(90,169,255,.4);background:rgba(90,169,255,.12)}
+.b-waiting::before{animation:wait-pulse 1.6s ease-in-out infinite}
+@keyframes wait-pulse{0%,100%{opacity:1}50%{opacity:.25}}
+.wait-countdown{margin-top:3px;color:#5aa9ff;font-variant-numeric:tabular-nums}
+.wait-countdown .wc-val{font-weight:600}
+.wait-explain{border:1px solid rgba(90,169,255,.35);background:rgba(90,169,255,.06);
+  border-radius:10px;padding:12px 14px;margin-bottom:12px}
+.wait-explain h4{margin:0 0 6px;color:#5aa9ff}
+.wait-facts{margin:8px 0 6px;padding-left:18px;line-height:1.9}
+.wait-facts .wc-val{color:#5aa9ff;font-weight:600;font-variant-numeric:tabular-nums}
 
 /* 分頁條：統一風格——卡片底部頁尾，靠右，頂部分隔線 */
 .pager{display:flex;align-items:center;justify-content:flex-end;gap:8px;

@@ -640,6 +640,11 @@ def serve(host: str = "127.0.0.1", port: int = 8765) -> None:
     _dangling = _cases().qa.mark_dangling_runs()
     if _dangling:
         print(f"  ⚠️  上次進程死掉殘留 {_dangling} 筆執行中 run，已標記為「中斷」。")
+    # 長延時掛起（status='waiting'）的 run 不受影響（不是 running）；但卡在 'resuming'
+    # （resume_worker 領取後沒跑完就掛了）的退回 'waiting'，待 worker 下輪重新喚醒。
+    _resuming = _cases().qa.reset_resuming_runs()
+    if _resuming:
+        print(f"  ⚠️  {_resuming} 筆卡在 resuming 的 run 退回 waiting，待 resume_worker 重試。")
     # 同理回收殘留的 run-* 帳號租約（並行執行的帳號互斥鎖），不然要等租約到期才放號
     from ..qa_accounts import AccountPool
     _stale = AccountPool(svc.settings).release_run_leases()

@@ -41,6 +41,23 @@ class StepAPIError(AssertionError):
         self.actor_name = actor_name
 
 
+class SuspendRun(Exception):  # noqa: N818 — 控制流訊號，非錯誤
+    """長延時等待的「掛起」訊號：wait_until 發現距目標時間還很久（> inline_max）時拋出。
+
+    不是失敗——上層（RecordingRunner）捕捉後把這次執行冷凍成 status='waiting'、落
+    checkpoint，由常駐 resume_worker 在 ``resume_at`` 到點時重建狀態續跑（見 README
+    「長延時掛起/喚醒」）。``step_index`` 是要續跑的步序（即這個 wait_until 步本身——
+    重跑時剩餘時間已歸零，inline 等一下即過）。
+    """
+
+    def __init__(self, resume_at: int, *, step_index: int | None = None,
+                 reason: str = "") -> None:
+        super().__init__(reason or f"suspend until {resume_at}")
+        self.resume_at = int(resume_at)
+        self.step_index = step_index
+        self.reason = reason
+
+
 # staging 的 min_publish_interval_seconds / recruit_deadline_offset_seconds 約 600s，
 # 即工作開始時間只需比現在晚約 10 分鐘。這裡 buffer 取 900s（含請求延遲與 Python/PHP 時鐘飄移裕度）：
 # 「今天該時刻」距現在不足這個值就順延隔天，避免被後端 START_AT_IS_LESS_THAN_LIMIT 擋下。
@@ -82,6 +99,33 @@ def _relative_slot(now: int, after_minutes: int, work_minutes: int) -> dict[str,
         "job_end_period": time.strftime("%H:%M", time.localtime(end)),
         "job_work_minutes": work_minutes,
     }
+
+
+def _slot_to_unix(date_int: int, hhmm: str) -> int:
+    """把 job_start_date(YYYYMMDD int) + 時刻字串(HH:MM) 換成當地時區的 unix 秒。
+
+    供 wait_until 把工作的表定開工/結束時間定錨成絕對時間（決定 inline 等還是掛起）。
+    與後端推算的 start_at 可能差幾秒（分鐘精度+時鐘飄移），故喚醒後仍以 verify 端點兜底。
+    """
+    y, m, d = date_int // 10000, (date_int // 100) % 100, date_int % 100
+    h, mi = (int(x) for x in str(hhmm).split(":"))
+    return int(time.mktime((y, m, d, h, mi, 0, 0, 0, -1)))
+
+
+def _job_clock_anchors(vars_: dict[str, Any]) -> dict[str, Any]:
+    """由已定案的時段變數推「表定開工/結束」的 unix 秒，供 wait_until 定錨。
+
+    end 一律取 start + 工時（不靠 job_end_period，跨午夜也正確）。算不出（缺 date/period）
+    就不寫，wait_until 用到時會明確報錯。
+    """
+    out: dict[str, Any] = {}
+    date_int = vars_.get("job_start_date")
+    period = vars_.get("job_start_period")
+    if date_int and period:
+        start = _slot_to_unix(int(date_int), str(period))
+        out["job_start_at"] = start
+        out["job_end_at"] = start + int(vars_.get("job_work_minutes", 120)) * 60
+    return out
 
 
 def _job_slot_vars(now: int) -> dict[str, Any]:
@@ -166,6 +210,8 @@ class PathRunner:
                 self._run_assert_api(step, state)
             elif "wait_api" in step:
                 self._run_wait_api(step, state)
+            elif "wait_until" in step:
+                self._run_wait_until(step, state)
             elif "sleep" in step:
                 self._run_sleep(step, state)
             else:
@@ -223,6 +269,10 @@ class PathRunner:
             state.vars.update(_relative_slot(now, int(after), wm))
         elif tod:
             state.vars.update(_anchor_today_slot(now, str(tod), wm))
+        # 時段定案後推「表定開工/結束」的 unix 秒（job_start_at / job_end_at），供 wait_until
+        # 定錨等待。注意：未在這裡覆寫已存在的同名 vars——resume 重建 state 時會直接帶入
+        # 冷凍當下的時段，不該被重算（_job_clock_anchors 依當前 vars 推出的值與冷凍值一致）。
+        state.vars.update(_job_clock_anchors(state.vars))
         return state
 
     def _run_db_exec(self, step: dict, state: PathExecutionState) -> dict[str, Any]:
@@ -539,6 +589,51 @@ class PathRunner:
                     raise AssertionError(
                         f"[wait_api {spec.get('query')}] 逾時 {timeout}s（試 {attempts} 次）仍未滿足條件：{e}")
                 time.sleep(interval)
+
+    # 距目標時間還剩多少才「inline 死等」而非掛起：≤ 此值就阻塞睡到點，超過就 SuspendRun
+    # 讓 resume_worker 接手。20 分鐘是「值得讓進程繼續抱著」與「該冷凍省資源」的折衷，
+    # 也讓近時段（13 分鐘後開工類）打卡用例維持原本的單進程跑完行為，不繞 worker。
+    WAIT_UNTIL_INLINE_MAX = 1200
+
+    def _run_wait_until(self, step: dict, state: PathExecutionState) -> dict[str, Any]:
+        """等到「某個表定絕對時間」再往下——長延時工作的核心。
+
+        step: {wait_until: {anchor?(state 變數名,如 job_start_at) | at?(絕對 unix/可解析),
+                            offset?(秒,預設0), inline_max?(秒,預設1200),
+                            verify?({query,equals,find?,http?,timeout?,interval?})}}
+
+        target = 錨點 + offset。剩餘時間 remaining：
+          remaining <= 0          → 已到點，直接過（若有 verify 仍跑一次確認）。
+          0 < remaining <= inline_max → inline 睡到點（沿用近時段打卡用例的單進程行為）。
+          remaining > inline_max  → 拋 SuspendRun(target)：冷凍這次執行交給 resume_worker。
+        到點後若帶 verify，再用 wait_api 式輪詢兜底（吸收後端分鐘精度/時鐘飄移的幾秒落差）。
+        """
+        spec = step["wait_until"]
+        offset = int(spec.get("offset", 0))
+        inline_max = int(spec.get("inline_max", self.WAIT_UNTIL_INLINE_MAX))
+        if "at" in spec:
+            anchor = int(state.resolve(spec["at"]))
+        elif "anchor" in spec:
+            name = str(spec["anchor"])
+            if name not in state.vars:
+                raise AssertionError(
+                    f"[wait_until] 錨點變數 {name!r} 不在 state（可用：{sorted(state.vars)}）")
+            anchor = int(state.vars[name])
+        else:
+            raise AssertionError("[wait_until] 需指定 anchor（state 變數名）或 at（絕對時間）")
+        target = anchor + offset
+        remaining = target - int(time.time())
+        if remaining > inline_max:
+            raise SuspendRun(
+                target, reason=f"距目標時間還有 {remaining}s（>{inline_max}s inline 上限），掛起待喚醒")
+        if remaining > 0:
+            print(f"  [wait_until] inline 睡 {remaining}s 至目標時間 {target}")
+            time.sleep(remaining)
+        verify = spec.get("verify")
+        if not verify:
+            return {"kind": "wait_until", "target": target, "waited_inline": max(0, remaining)}
+        # 到點後兜底確認（如 working_status 翻 1）：複用 wait_api 的輪詢
+        return self._run_wait_api({"wait_api": verify}, state)
 
     @staticmethod
     def _dig(data: dict, dotted: str) -> Any:

@@ -21,7 +21,7 @@ import yaml
 
 from .actor import Actor
 from .qa_store import QAStore, make_run_id
-from .runner import PathRunner, StepAPIError
+from .runner import PathRunner, StepAPIError, SuspendRun
 
 # 撞到這些業務錯誤碼時，若有 actor_swapper 就自動換號重試本步（不換 employer，工作已發佈）：
 #   30229 LABOR_THAT_DAY_MATCH_JOB_SUCCESS_ONLINE — 同一企業每日僅限工作一次
@@ -87,6 +87,7 @@ class RecordingRunner:
             employer: Actor | None = None, labor: Actor | None = None,
             actors: dict[str, Actor] | None = None,
             write: bool = True, started_at: int | None = None,
+            resume: dict | None = None,
             on_event: Callable[[str, dict], None] | None = None) -> RunResult:
         """逐步執行並落地。
 
@@ -106,13 +107,24 @@ class RecordingRunner:
         path_id = spec.get("id")
         if not path_id:
             raise ValueError("用例缺少 id：每筆用例都必須有唯一 id 才能落庫追溯（請在 YAML 補 id:）")
-        ts = started_at if started_at is not None else int(time.time())
-        run_id = make_run_id(path_id, ts)
+        # resume（resume_worker 喚醒掛起的 run）：沿用原 run_id / started_at，從 checkpoint
+        # 完整還原 state.vars（job_sn / 打卡碼 / job_start_at 等冷凍當下的值，不重算時段），
+        # actors 由呼叫端依快照重新登入後帶入。start_index = 要續跑的步序（掛起的 wait_until）。
+        resuming = resume is not None
+        if resuming:
+            run_id = resume["run_id"]
+            ts = int(resume.get("started_at") or 0)
+        else:
+            ts = started_at if started_at is not None else int(time.time())
+            run_id = make_run_id(path_id, ts)
 
         state = self.runner.init_state(
             actors=actors, publisher=publisher, receiver=receiver,
             employer=employer, labor=labor, extra_vars=spec.get("vars"),
         )
+        if resuming:
+            # 全量覆蓋為冷凍當下的 vars（含已 save 的 job_sn/start_code 等），確定性還原
+            state.vars = dict(resume.get("vars") or {})
 
         def emit(etype: str, payload: dict) -> None:
             if on_event is None:
@@ -127,11 +139,17 @@ class RecordingRunner:
         skipped = bool(spec.get("skip"))
         skip_reason = str(spec.get("skip_reason", "")).strip()
 
+        # resume 時把先前已跑的步驟（0..start_index-1）seed 回 steps，讓收尾 _persist
+        # （冪等刪後重插）寫出「完整」step 集合，而非只剩這次續跑的尾段。
+        start_index = int(resume.get("resume_step_index") or 0) if resuming else 0
         steps: list[StepResult] = []
+        if resuming and self.qa_store is not None:
+            steps = [StepResult(**s) for s in self.qa_store.load_run_steps(run_id)]
         stopped = skipped
 
         emit("run_start", {"run_id": run_id, "started_at": ts, "total": len(spec["path"]),
-                           "skipped": skipped, "skip_reason": skip_reason,
+                           "skipped": skipped, "skip_reason": skip_reason, "resuming": resuming,
+                           "start_index": start_index,
                            "transitions": [s.get("transition") for s in spec["path"]
                                            if s.get("transition")]})
 
@@ -141,7 +159,14 @@ class RecordingRunner:
         # interrupted。任何落庫失敗降級為「跑完一次性落地」，不可中斷執行；
         # 正常結束仍由 _persist（冪等刪後重插）收尾，順帶修復漏寫。
         live = write and self.qa_store is not None
-        if live:
+        # resume 不重開 run 列（begin_run 會 DELETE 既有 steps）：續跑直接 append 尾段，
+        # 並把 status 從 'resuming' 翻回 'running'（同批帳號已重租、開始實跑）。
+        if live and resuming:
+            try:
+                self.qa_store.mark_run_running(run_id)
+            except Exception as e:  # noqa: BLE001
+                print(f"[recorder] resume 標 running 失敗（不致命）：{e}")
+        elif live:
             try:
                 self.qa_store.begin_run(
                     run_id=run_id, case_id=path_id, system=self.system,
@@ -162,7 +187,30 @@ class RecordingRunner:
                 print(f"[recorder] 逐步落庫失敗，降級為跑完一次性落地：{e}")
 
         try:
-            self._run_steps(spec, state, steps, emit, live_step, stopped)
+            self._run_steps(spec, state, steps, emit, live_step, stopped, start_index=start_index)
+        except SuspendRun as e:
+            # 長延時掛起：不是失敗——冷凍這次執行交給 resume_worker。已跑步驟(0..N-1)已逐步
+            # 落庫；這裡只把 run 標 waiting + 落 checkpoint（resume_at / resume_step_index / 全量
+            # state.vars + actor 快照）。同一支用例可多次掛起/喚醒（先等開工、再等近結束）。
+            resume_idx = e.step_index if e.step_index is not None else len(steps)
+            checkpoint = {
+                "vars": state.vars,
+                "actors": self._snapshot_actors(state),
+                "system": self.system,
+                "case_id": path_id,
+                "description": desc,
+                "started_at": ts,
+            }
+            if write and self.qa_store is not None:
+                self.qa_store.suspend_run(
+                    run_id=run_id, resume_at=e.resume_at,
+                    resume_step_index=resume_idx, checkpoint=checkpoint)
+            emit("run_suspend", {"resume_at": e.resume_at, "resume_step_index": resume_idx,
+                                 "reason": e.reason})
+            return RunResult(
+                path_id=path_id, description=desc, started_at=ts, status="waiting",
+                steps=steps, failed_at=None, run_id=run_id,
+                actors=self._snapshot_actors(state))
         except BaseException:
             # 進程級中斷（Ctrl-C / SystemExit）：把已跑的部分收尾成 interrupted 再拋出。
             # kill -9 連這裡都到不了——靠 begin_run 留下的 running 列 + 看板啟動收斂。
@@ -201,8 +249,13 @@ class RecordingRunner:
 
     def _run_steps(self, spec: dict, state, steps: list[StepResult],
                    emit: Callable[[str, dict], None],
-                   live_step: Callable[[StepResult], None], stopped: bool) -> None:
-        """逐步執行主迴圈：結果 append 進 steps 並即時落庫（live_step）。"""
+                   live_step: Callable[[StepResult], None], stopped: bool,
+                   start_index: int = 0) -> None:
+        """逐步執行主迴圈：結果 append 進 steps 並即時落庫（live_step）。
+
+        start_index>0（resume 續跑）：i < start_index 的步驟先前已跑過、已 seed 進 steps，
+        這裡只快轉（仍推進 tindex 讓 chip 序號對齊），不重跑、不重記。
+        """
         tindex = -1  # transition 序號（與 chip 對應）；每遇 transition 步驟 +1
         for i, step in enumerate(spec["path"]):
             is_db = "db_exec" in step
@@ -210,6 +263,7 @@ class RecordingRunner:
             is_assert = "assert_state" in step
             is_assert_api = "assert_api" in step
             is_wait_api = "wait_api" in step
+            is_wait_until = "wait_until" in step
             if is_db:
                 kind = name = "db_exec"
             elif is_assert:
@@ -218,11 +272,15 @@ class RecordingRunner:
                 kind, name = "assert_api", "assert_api"
             elif is_wait_api:
                 kind, name = "wait_api", f"wait_api {step['wait_api'].get('query', '')}"
+            elif is_wait_until:
+                kind, name = "wait_until", f"wait_until {step['wait_until'].get('anchor', step['wait_until'].get('at',''))}"
             elif is_sleep:
                 kind, name = "sleep", f"sleep {step['sleep']}s"
             else:
                 kind, name = "transition", step.get("transition", "?")
             ti = (tindex := tindex + 1) if kind == "transition" else None
+            if i < start_index:
+                continue   # resume：先前已跑過的步驟，只推進 tindex（上一行已做）
             if stopped:
                 steps.append(StepResult(i, kind, name, "skipped", 0))
                 live_step(steps[-1])
@@ -237,6 +295,8 @@ class RecordingRunner:
             wait_secs = None
             if is_wait_api:
                 wait_secs = float(step["wait_api"].get("timeout", 30))
+            elif is_wait_until:
+                wait_secs = None   # 倒數由 anchor 推算，前端不預知（可能 inline 也可能掛起）
             elif is_sleep:
                 wait_secs = float(step["sleep"])
             emit("step_start", {"index": i, "kind": kind, "name": name, "tindex": ti,
@@ -254,6 +314,8 @@ class RecordingRunner:
                         obs = self.runner._run_assert_api(step, state)
                     elif is_wait_api:
                         obs = self.runner._run_wait_api(step, state)
+                    elif is_wait_until:
+                        obs = self.runner._run_wait_until(step, state)
                     elif is_sleep:
                         obs = self.runner._run_sleep(step, state)
                     else:
@@ -266,6 +328,10 @@ class RecordingRunner:
                     live_step(steps[-1])
                     emit("step_end", {"index": i, "status": "passed",
                                       "elapsed_ms": elapsed, "error": None, "tindex": ti})
+                except SuspendRun as e:
+                    # 長延時掛起：不換號、不記失敗，帶上「續跑步序」往外傳給 run() 冷凍。
+                    e.step_index = i
+                    raise
                 except Exception as e:  # noqa: BLE001 — 記錄任何失敗，含 AssertionError
                     if (kind == "transition" and swaps < MAX_ACTOR_SWAPS_PER_STEP
                             and self._swap_actor(e, state)):

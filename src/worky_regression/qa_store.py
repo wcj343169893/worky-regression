@@ -81,6 +81,13 @@ class QAStore:
         with self._engine.begin() as conn:
             conn.execute(sql, rows)
 
+    def get_case_yaml(self, case_id: str) -> str | None:
+        """讀回單一用例的 YAML（resume_worker 喚醒時重建 spec 用，免再掃檔）。"""
+        with self._engine.connect() as conn:
+            row = conn.execute(text("SELECT yaml FROM qa_cases WHERE id=:i"),
+                               {"i": case_id}).first()
+        return row.yaml if row else None
+
     def insert_run(self, *, run_id: str, case_id: str, system: str, status: str,
                    description: str, started_at: int, failed_at: int | None,
                    steps: list[dict[str, Any]], source: str = "run",
@@ -175,6 +182,84 @@ class QAStore:
             res = conn.execute(text(
                 "UPDATE qa_runs SET status='interrupted' WHERE status='running'"))
             return int(res.rowcount or 0)
+
+    # ── 長延時掛起/喚醒（Tier 2）──────────────────────────────────────────────
+    # wait_until 發現距目標時間還很久時，recorder 把這次執行冷凍成 status='waiting'（落
+    # checkpoint），由常駐 resume_worker 在 resume_at 到點時重建狀態續跑。
+
+    def suspend_run(self, *, run_id: str, resume_at: int, resume_step_index: int,
+                    checkpoint: dict[str, Any]) -> None:
+        """把 run 冷凍成 waiting：記下何時醒（resume_at）、續跑哪一步、重建用的 checkpoint。
+
+        不動 qa_run_steps——已跑步驟由 append_step 逐步落好；這裡只翻 status 與補欄位。
+        """
+        with self._engine.begin() as conn:
+            conn.execute(text("""
+                UPDATE qa_runs SET status='waiting', resume_at=:ra,
+                  resume_step_index=:si, checkpoint=:cp WHERE run_id=:r
+            """), {"ra": int(resume_at), "si": int(resume_step_index),
+                   "cp": json.dumps(checkpoint, ensure_ascii=False), "r": run_id})
+
+    def mark_run_running(self, run_id: str) -> None:
+        """resume 開始實跑：把 resuming/waiting 翻回 running（續跑尾段，不重開 run 列）。"""
+        with self._engine.begin() as conn:
+            conn.execute(text("UPDATE qa_runs SET status='running' WHERE run_id=:r"),
+                         {"r": run_id})
+
+    def set_run_status(self, run_id: str, status: str) -> None:
+        """直接設 run 狀態（resume_worker 遇不可恢復情形，如用例已刪，標 failed 收場）。"""
+        with self._engine.begin() as conn:
+            conn.execute(text("UPDATE qa_runs SET status=:s WHERE run_id=:r"),
+                         {"s": status, "r": run_id})
+
+    def load_run_steps(self, run_id: str) -> list[dict[str, Any]]:
+        """讀回某 run 已落地的步驟（供 resume seed steps）；鍵對齊 StepResult 欄位。"""
+        with self._engine.connect() as conn:
+            rows = conn.execute(text(
+                "SELECT step_index, kind, name, status, elapsed_ms, error, observations "
+                "FROM qa_run_steps WHERE run_id=:r ORDER BY step_index"), {"r": run_id}).all()
+        out: list[dict[str, Any]] = []
+        for r in rows:
+            obs = r.observations
+            obs = json.loads(obs) if isinstance(obs, str) else (obs or {})
+            out.append({"index": int(r.step_index), "kind": r.kind, "name": r.name,
+                        "status": r.status, "elapsed_ms": int(r.elapsed_ms),
+                        "observations": obs, "error": r.error})
+        return out
+
+    def reset_resuming_runs(self) -> int:
+        """啟動收斂：把卡在 'resuming'（worker 領取後、實跑前就掛了）的 run 退回 'waiting' 重試。"""
+        with self._engine.begin() as conn:
+            res = conn.execute(text(
+                "UPDATE qa_runs SET status='waiting' WHERE status='resuming'"))
+            return int(res.rowcount or 0)
+
+    def claim_due_waiting_run(self, *, now: int | None = None) -> dict[str, Any] | None:
+        """原子搶占一筆「到點該醒」的 waiting run（resume_at<=now），翻成 'resuming' 後回傳。
+
+        以 UPDATE ... WHERE status='waiting' AND run_id=:r AND status 未變 搶占，多 worker
+        併跑不會重領同筆。回傳含 checkpoint（已 parse）供重建；無到點者回 None。
+        """
+        now = int(now if now is not None else time.time())
+        with self._engine.begin() as conn:
+            row = conn.execute(text(
+                "SELECT run_id FROM qa_runs WHERE status='waiting' AND resume_at IS NOT NULL "
+                "AND resume_at<=:now ORDER BY resume_at LIMIT 1"), {"now": now}).first()
+            if not row:
+                return None
+            res = conn.execute(text(
+                "UPDATE qa_runs SET status='resuming' WHERE run_id=:r AND status='waiting'"),
+                {"r": row.run_id})
+            if not res.rowcount:
+                return None   # 被別的 worker 搶先
+            full = conn.execute(text(
+                "SELECT run_id, case_id, `system`, resume_at, resume_step_index, checkpoint "
+                "FROM qa_runs WHERE run_id=:r"), {"r": row.run_id}).first()
+        cp = full.checkpoint
+        cp = json.loads(cp) if isinstance(cp, str) else (cp or {})
+        return {"run_id": full.run_id, "case_id": full.case_id, "system": full.system,
+                "resume_at": int(full.resume_at or 0),
+                "resume_step_index": int(full.resume_step_index or 0), "checkpoint": cp}
 
     def job_allocation_history(self, system: str, since: int) -> dict[str, Any]:
         """執行史 → 配號避撞（只讀看板庫，執行期不碰工作庫）。
@@ -622,6 +707,8 @@ class QAStore:
                 }
                 if run["status"] == "running":
                     o["live"] = self._live_progress(conn, run, run["case_id"])
+                elif run["status"] == "waiting":
+                    o["wait"] = self._wait_info(conn, run)
                 out[run["case_id"]] = o
         return out
 
@@ -663,11 +750,53 @@ class QAStore:
                     actors = json.loads(actors)
                 except Exception:  # noqa: BLE001
                     actors = {}
-            return {
+            out = {
                 "run_id": run["run_id"], "status": run["status"],
                 "started_at": run["started_at"], "failed_at": run["failed_at"],
                 "steps": steps, "actors": actors or {},
             }
+            if run["status"] == "waiting":
+                out["wait"] = self._wait_info(conn, run)
+            return out
+
+    def _wait_info(self, conn, run: dict[str, Any]) -> dict[str, Any]:
+        """waiting run 的等待說明：等到何時 / 卡在哪一步 / 為什麼等這麼久。
+
+        供看板對長延時掛起的 run 顯示倒數（至 resume_at）並在點開時解釋——這不是當機，
+        是工作排在很久之後（如「明天 13:00」開工），跑完現在段後掛起、由 resume_worker
+        到點喚醒續跑。step_label 由用例 YAML 的 `wait_until` 步驟（anchor/offset）推出。
+        """
+        idx = run.get("resume_step_index")
+        info: dict[str, Any] = {
+            "resume_at": int(run.get("resume_at") or 0),
+            "resume_step_index": idx,
+        }
+        cp = run.get("checkpoint")
+        cp = json.loads(cp) if isinstance(cp, str) else (cp or {})
+        cvars = cp.get("vars") or {}
+        for k in ("job_sn", "job_start_at", "job_end_at"):
+            if cvars.get(k) is not None:
+                info[k] = cvars[k]
+        anchor = None
+        step_label = None
+        yml = conn.execute(text("SELECT yaml FROM qa_cases WHERE id=:i"),
+                           {"i": run.get("case_id")}).scalar()
+        if yml and idx is not None:
+            try:
+                path = (yaml.safe_load(yml) or {}).get("path") or []
+                if 0 <= int(idx) < len(path) and "wait_until" in path[int(idx)]:
+                    wu = path[int(idx)]["wait_until"] or {}
+                    anchor = wu.get("anchor") or ("at" if "at" in wu else None)
+                    off = int(wu.get("offset", 0))
+                    kind = {"job_start_at": "工作表定開工",
+                            "job_end_at": "工作表定結束"}.get(anchor, anchor or "指定時間")
+                    rel = "" if off == 0 else (f"後 {off}s" if off > 0 else f"前 {-off}s")
+                    step_label = f"等待「{kind}」{rel}".strip()
+            except Exception:  # noqa: BLE001 — 解析不了不致命，給通用文案
+                pass
+        info["anchor"] = anchor
+        info["step_label"] = step_label or "等待長延時時間點"
+        return info
 
     def case_seq(self, case_id: str) -> int | None:
         """用例的數字序號（並存於 slug id 之外，僅顯示用）。"""

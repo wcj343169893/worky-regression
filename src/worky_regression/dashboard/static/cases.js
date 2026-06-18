@@ -1,7 +1,7 @@
 "use strict";
 // 測試用例（工作 / 任務）：列用例 + 執行 + AI 用例分解。
 
-import { $, api, apiPost, esc, fmtTs, fmtTsS, resBadge, toast, PAGE, state, urlPager } from "./util.js";
+import { $, api, apiPost, esc, fmtTs, fmtTsS, fmtCountdown, resBadge, toast, PAGE, state, urlPager } from "./util.js";
 import { setupPager, openDrawer, openModal, closeModal } from "./widgets.js";
 
 export const CASES = {
@@ -89,12 +89,37 @@ function caseDetailHtml(d) {
       <h3>${esc(d.id)} <span class="pill">${d.source === "generated" ? "AI 產生" : "內建"}</span>${d.skip ? ` <span class="pill">略過</span>` : ""}</h3>
       <p class="sub2">${esc(d.description || "")}</p></div>
     ${d.skip ? `<div class="skip-banner">⏸ 此用例已標記 <b>略過</b>，執行時不打被測 API：${esc(d.skip_reason || "（未填原因）")}</div>` : ""}
+    ${waitExplainHtml(last)}
     <div class="sec"><h4>任務流（${d.steps.length} 步）</h4>${stepList}</div>
     ${actorsSecHtml(last)}
     <div class="sec"><h4>最近執行結果</h4>
       ${last ? `<div class="sub2" style="margin-bottom:8px">${resBadge(last.status)} ${fmtTs(last.started_at)}${last.run_id ? ` · <code>${esc(last.run_id)}</code>` : ""}</div>${runResultHtml(last)}`
         : `<div class="sub2">（尚無執行記錄）</div>`}</div>
     <div class="sec"><h4>YAML</h4><pre class="yaml">${esc(d.yaml)}</pre></div>`;
+}
+
+// 長延時掛起說明：點開詳情時解釋「為什麼等這麼久、到底卡在哪一步」。
+// 這不是當機——工作排在很久之後（如「明天 13:00」開工），跑完現在段後掛起、釋放帳號，
+// 由 resume_worker 到表定時間自動喚醒、在原 job 上重租同批帳號續跑。
+function waitExplainHtml(last) {
+  if (!last || last.status !== "waiting" || !last.wait) return "";
+  const w = last.wait;
+  const li = (label, val) => val == null || val === "" ? "" : `<li>${label}：${val}</li>`;
+  const stepIdx = w.resume_step_index != null ? `（第 ${w.resume_step_index} 步）` : "";
+  return `<div class="sec wait-explain">
+    <h4>⏳ 為什麼等這麼久</h4>
+    <p class="sub2">此用例是<b>長延時工作</b>：發佈了排在很久之後才開工的工作（如「明天」開工）。
+      已跑完「現在」段（發佈 / 申請 / 錄取 / 上班卡）後<b>掛起</b>，不佔用進程死等——
+      由 <code>resume_worker</code> 到表定時間自動喚醒、在<b>原 job</b> 上重租同批帳號續跑打卡 / 評價。</p>
+    <ul class="wait-facts">
+      ${li("正在等", `<b>${esc(w.step_label || "長延時時間點")}</b> ${stepIdx}`)}
+      ${li("表定開工", w.job_start_at ? fmtTsS(w.job_start_at) : "")}
+      ${li("表定結束", w.job_end_at ? fmtTsS(w.job_end_at) : "")}
+      ${li("預計喚醒", `${fmtTsS(w.resume_at)} · 倒數 <span class="wc-val" data-resume-at="${w.resume_at}">…</span>`)}
+      ${li("原 job", w.job_sn ? `<code>${esc(String(w.job_sn))}</code>（已綁定，喚醒時重用）` : "")}
+    </ul>
+    <p class="sub2">無需手動操作；想立刻重測可改用「執行」發一個新 job。</p>
+  </div>`;
 }
 
 // 參與帳號區塊：列出最近一次執行用到的 actor（角色 / 手機 / id / 型別）。
@@ -370,6 +395,23 @@ const activeStreams = new Set();   // 本頁正在 runCaseStream 的用例 id
 function clearLiveProgress() {
   liveTimers.forEach(clearInterval); liveTimers = [];
 }
+
+// 長延時掛起倒數：單一常駐 ticker，每秒把所有 .wc-val[data-resume-at]（清單列 + 詳情抽屜）
+// 走字到 resume_at。純前端、不打後端；無倒數元素時閒置不清掉，下次出現續用。
+let waitTicker = null;
+function ensureWaitTicker() {
+  if (waitTicker) return;
+  const tick = () => {
+    const els = document.querySelectorAll(".wc-val[data-resume-at]");
+    if (!els.length) return;
+    const now = Math.floor(Date.now() / 1000);
+    els.forEach((el) => {
+      el.textContent = fmtCountdown((Number(el.getAttribute("data-resume-at")) || 0) - now);
+    });
+  };
+  tick();
+  waitTicker = setInterval(tick, 1000);
+}
 function applyLiveProgress(key, items) {
   clearLiveProgress();
   const fmtLeft = (s) => `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
@@ -436,6 +478,13 @@ function tflowHtml(c) {
 // 即可看原因，不必下鑽；略過另在徽章下方顯示截斷的原因，讓「為什麼略過」一眼可見。
 function lrCellHtml(c) {
   const lr = c.last_result;
+  // 長延時掛起：徽章下方掛「⏳ 倒數至喚醒」，由 wait ticker 每秒走字（點「查看」看原因）
+  if (lr && lr.status === "waiting" && lr.wait) {
+    const w = lr.wait;
+    const tip = `${w.step_label || "長延時等待"}（預計 ${fmtTs(w.resume_at)} 喚醒；點「查看」看為什麼）`;
+    return `<span title="${esc(tip)}">${resBadge("waiting")}</span>
+      <div class="sub2 wait-countdown" title="${esc(tip)}">⏳ <span class="wc-val" data-resume-at="${w.resume_at}">…</span></div>`;
+  }
   const isSkip = (lr && lr.status === "skipped") || c.skip;
   const lrTip = (lr && lr.error) || (isSkip ? c.skip_reason : "");
   const skipWhy = isSkip && c.skip_reason ? `<div class="sub2 skip-why">${esc(c.skip_reason)}</div>` : "";
@@ -480,6 +529,7 @@ function renderCaseRows(key, items) {
   tb.querySelectorAll(".sub-btn").forEach((b) => b.onclick = () => drillInto(key, { id: b.dataset.id }));
   tb.querySelectorAll(".tchip.clickable").forEach((ch) =>
     ch.onclick = () => openStepModal(key, ch.dataset.cid, Number(ch.dataset.ti)));
+  ensureWaitTicker();   // 列表若有 waiting 列，啟動倒數走字（idempotent）
 }
 
 // 分解輸入框 #N 用例引用高亮：textarea 文字設透明（caret-color 保留游標），
@@ -509,6 +559,7 @@ async function openCaseDetail(id) {
   openDrawer(`<div class="empty">載入中…</div>`);
   const d = await api("/api/cases/" + encodeURIComponent(id)).catch((e) => (toast(e.message), null));
   $("drawer-body").innerHTML = d ? caseDetailHtml(d) : `<div class="empty">載入失敗</div>`;
+  ensureWaitTicker();   // 詳情若是 waiting，啟動倒數走字（idempotent）
 }
 
 // 執行核心：走 SSE（/api/cases/run-stream），邊跑邊即時更新該列 chip——
@@ -644,6 +695,22 @@ function runCaseStream(id, row, { drawer = true } = {}) {
         updateLastResultCell(liveRow(), e, startedAt);  // 局部更新「最近結果」欄，不整頁重載
         if (drawer) showRunResultDrawer(id, e);   // 開抽屜顯示完整結果
         done({ ok: true, status: e.status, skipped: !!e.skipped });
+      } else if (e.type === "run_suspend") {
+        // 長延時掛起：不是失敗也不是結束——已冷凍成 waiting，交給 resume_worker 到點喚醒。
+        // 關掉 SSE（否則 EventSource 會重連→重跑），把「最近結果」欄改成 等待中 + 倒數。
+        removeWaitChip();
+        es.close();
+        delete stepCache[id];
+        toast(`${id}：長延時掛起，已交給 resume_worker（預計 ${fmtTs(e.resume_at)} 喚醒）`);
+        const r = liveRow();
+        const act = r && r.querySelector("td.act");
+        const cell = act && act.previousElementSibling;
+        if (cell) {
+          cell.innerHTML = `${resBadge("waiting")}
+            <div class="sub2 wait-countdown" title="點「查看」看為什麼等這麼久">⏳ <span class="wc-val" data-resume-at="${e.resume_at}">…</span></div>`;
+          ensureWaitTicker();
+        }
+        done({ ok: true, status: "waiting" });
       } else if (e.type === "error") {
         removeWaitChip();
         es.close();

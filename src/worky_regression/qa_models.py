@@ -76,6 +76,15 @@ class QARun(Base):
     # 本次執行參與的帳號快照（{role: {phone, user_id, user_type, shop_id, display_name}}）；
     # 供詳情頁展示「參與測試的手機號 / id」。帳號由池配發、每次可能不同，故隨 run 落地。
     actors: Mapped[dict | None] = mapped_column(JSON)
+    # ── 長延時掛起/喚醒（Tier 2）─────────────────────────────────────────────
+    # 工作排在很久之後（如「明天 13:00」開工）時，runner 不死等：跑完「現在」段後把這次
+    # 執行冷凍——status='waiting'，resume_at=該醒來的 unix 秒、resume_step_index=要續跑的步序，
+    # checkpoint 存可重建 state（vars + actor 快照 + 系統/檔名）。常駐 resume_worker 輪詢
+    # 到點的 waiting run、重建同批帳號續跑。被喚醒處理中暫態為 'resuming'（worker 死掉時
+    # 啟動收斂回 'waiting' 重試）。一般 run 這三欄為 NULL。
+    resume_at: Mapped[int | None] = mapped_column(BigInteger)
+    resume_step_index: Mapped[int | None] = mapped_column(Integer)
+    checkpoint: Mapped[dict | None] = mapped_column(JSON)
     created_at: Mapped[datetime] = mapped_column(server_default=func.current_timestamp())
 
     __table_args__ = (Index("idx_case_started", "case_id", "started_at"),)

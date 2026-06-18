@@ -95,6 +95,44 @@ def _actor_from_pool(s: Settings, pa: PooledAccount, role: str,
     return actor
 
 
+def actors_from_snapshot(s: Settings, system: str, snapshot: dict[str, dict],
+                         *, owner: str, lease_secs: int = 1800
+                         ) -> tuple[dict[str, Actor], AccountPool]:
+    """依「掛起時落地的帳號快照」重建同一批已登入 Actor（resume_worker 喚醒續跑用）。
+
+    長延時 run 掛起前已釋放租約（不能抱 24h），喚醒時必須**重新拿回同一批帳號**——它們
+    早已綁定該 job_sn（已申請/錄取），不能換人。流程：按快照的 account_id 重上租約（owner
+    為本次喚醒），再走 _actor_from_pool 登入（池 token 快取「有效就用、到期才刷」，吸收
+    24h 後 access token 早已過期的情形）。回傳 (actors, pool)；呼叫端跑完須 pool.release(owner)。
+
+    snapshot 形如 {role: {phone, user_id, user_type, shop_id, ...}}，role 含 employer /
+    labor / labor1 / labor2…；labor 與 labor1 可能是同一人（同 account_id），登入只做一次
+    再共用同一個 Actor（與正常配發 ``"labor": la[0], "labor1": la[0]`` 的別名語義一致）。
+    """
+    ssys = s.for_system(system)
+    pool = AccountPool(ssys)
+    ids = sorted({str(v.get("user_id")) for v in snapshot.values() if v.get("user_id")})
+    if ids:
+        pool.lease_accounts(ids, owner=owner, lease_secs=lease_secs)
+    cache: dict[tuple[int, str], Actor] = {}
+    actors: dict[str, Actor] = {}
+    for key, info in snapshot.items():
+        uid = info.get("user_id")
+        if not uid:
+            continue
+        prole = "employer" if str(key).lower().startswith("employer") else "labor"
+        ck = (int(uid), prole)
+        if ck not in cache:
+            pa = PooledAccount(
+                account_id=int(uid), role=prole,
+                user_type=int(info.get("user_type") or (1 if prole == "employer" else 2)),
+                phone=info.get("phone") or "", username=None,
+                shop_id=info.get("shop_id"), caps=[])
+            cache[ck] = _actor_from_pool(ssys, pa, key, pool)
+        actors[key] = cache[ck]
+    return actors, pool
+
+
 def _login_from_pool(s: Settings, pool: AccountPool, role: str, caps: list[str], n: int,
                      *, owner: str, exclude: list[str] | None = None) -> list[Actor]:
     """配發並登入 n 個 role 帳號；登入失敗者自動排除、改配池中下一個同能力帳號（#2 自動換號）。
