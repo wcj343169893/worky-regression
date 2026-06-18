@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import secrets
+import time
 from typing import Any
 
 import yaml
@@ -183,12 +184,14 @@ class QAStore:
         單帳號 LRU 看不見「配對」維度，小池很快踩回燒過的組合。本方法從今天的
         qa_runs/qa_run_steps 還原三組事實供配發避讓：
 
-        - accepted_pairs：{(employer_id, labor_id)} 今天有 J3 錄取成功的配對。被錄取的
+        - accepted_pairs：{(employer_id, labor_id, work_date)} 今天有 J3 錄取成功的配對，
+          work_date 為該工作的「工作日」(YYYY-MM-DD，無 vars 推不出時為 None)。被錄取的
           labor 從用例 YAML 的 J3 步驟 bind 解出（bind: {labor: laborN}，無 bind 即預設
-          labor），對回 run.actors 取 user_id——錄取即觸發每日一次限制，當日不可再配同對。
-        - occupied：{labor_id: 佔用截止 ts}（30207 該時段已有確認工作——錄取即佔住
-          表定時段直到 end_at，跨商家、run 死掉沒人打卡也一樣；截止由用例 vars 的
-          start 偏移＋工時推算，硬避讓）。
+          labor），對回 run.actors 取 user_id。30229/30213 是「同企業同工作日僅一次」，
+          故配發端比對的是 work_date 而非發佈日——明天類用例不該被今天的近時段配對佔額度。
+        - occupied：{labor_id: [(start_ts, end_ts), ...]}（30207 該時段已有確認工作——錄取
+          即佔住表定時段，跨商家、run 死掉沒人打卡也一樣；配發端以「時段是否重疊」避讓，
+          而非「有未過期佔用就避」。時段由用例 vars 的 start 偏移＋工時推算）。
         - publish：{employer_id: {count, last_at}} 今天 J1 發佈成功統計。
         """
         empty: dict[str, Any] = {"accepted_pairs": set(), "occupied": {}, "publish": {}}
@@ -244,11 +247,19 @@ class QAStore:
                 p["last_at"] = max(p["last_at"], int(r.started_at))
             if "J3" in mk:
                 roles = accept_roles.get(r.case_id) or {"*"}
-                # 佔用截止：發佈(≈started_at) + start 偏移 + 工時 + 10min 緩衝。
-                # 只有近時段用例（帶 job_start_after_minutes）會佔近期時段；
-                # 其他用例的工作排在 +3 天外，與近時段新工作不衝突。
+                # 工作時段 [start, end] 與工作日：發佈(≈started_at) + start 偏移、+ 工時。
+                # 只有近時段用例（帶 job_start_after_minutes）能推算實際時段；其他用例工作
+                # 排在 +3 天外、偏移未知 → 時段/工作日記為 None（配發端對 None 保守避讓）。
+                # 避讓改為「同工作日同商家」(30229/30213) 與「時段重疊」(30207) 的精確判斷，
+                # 而非「今天燒過就一律避」——否則明天類用例會把今天的近時段配對也誤算進額度。
                 sv = slot_vars.get(r.case_id)
-                until = (int(r.started_at) + (sv[0] + sv[1] + 10) * 60) if sv else 0
+                if sv:
+                    wstart = int(r.started_at) + sv[0] * 60
+                    wend = int(r.started_at) + (sv[0] + sv[1]) * 60
+                    wdate = time.strftime("%Y-%m-%d", time.localtime(wstart))
+                else:
+                    wstart = wend = 0
+                    wdate = None
                 for role, info in a.items():
                     if not (role.startswith("labor") and isinstance(info, dict)):
                         continue
@@ -257,9 +268,9 @@ class QAStore:
                     lid = str(info.get("user_id") or "")
                     if not lid:
                         continue
-                    out["accepted_pairs"].add((emp, lid))
-                    if until:
-                        out["occupied"][lid] = max(out["occupied"].get(lid, 0), until)
+                    out["accepted_pairs"].add((emp, lid, wdate))
+                    if wend:
+                        out["occupied"].setdefault(lid, []).append((wstart, wend))
         return out
 
     def clear_runs(self, *, include_cases: bool = True) -> dict[str, int]:

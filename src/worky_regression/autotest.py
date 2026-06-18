@@ -181,6 +181,31 @@ def _job_history(s: Settings) -> dict:
         return {"accepted_pairs": set(), "occupied": {}, "publish": {}}
 
 
+def _job_work_date(window: tuple[int, int]) -> str:
+    """新工作的「工作日」(YYYY-MM-DD)，由時段包絡起點推算（30229/30213 比對基準）。"""
+    return time.strftime("%Y-%m-%d", time.localtime(window[0]))
+
+
+def _burned_labors(hist: dict, emp_id: str, work_date: str) -> list[str]:
+    """該商家在「同一工作日」已 J3 錄取的夥伴——30229/30213 同企業同日僅一次。
+
+    來源配對的 work_date 未知（舊用例無 vars 推不出工作日）時保守視為衝突，
+    避免把無法判定的舊配對誤放（後端 J2 仍是最終裁決，撞了 swapper 會換）。
+    """
+    return [l for (e, l, d) in hist["accepted_pairs"]
+            if e == emp_id and (d is None or d == work_date)]
+
+
+def _busy_labors(hist: dict, window: tuple[int, int]) -> list[str]:
+    """時段與新工作包絡「實際重疊」的夥伴——30207 該時段已有確認工作。
+
+    取代舊的「有未過期佔用就避」：明天 11 點的佔用不該擋掉明天 13 點的新工作。
+    """
+    ns, ne = window
+    return [l for l, wins in hist["occupied"].items()
+            if any(s < ne and ns < e for (s, e) in wins)]
+
+
 def _pick_job_pair(s: Settings, pool: AccountPool, hist: dict, labor_caps: list[str],
                    exclude: dict[str, list[str]],
                    window: tuple[int, int] | None = None) -> tuple[Actor, list[Actor]]:
@@ -221,13 +246,16 @@ def _pick_job_pair(s: Settings, pool: AccountPool, hist: dict, labor_caps: list[
             print(f"  [actors] 商家 #{emp.user_id} 距上次發佈 <600s，可能撞發佈間隔（無其他可用商家）")
             return emp, la
     now2 = int(time.time())
-    burned = sorted(hist["accepted_pairs"])
-    busy = {l: time.strftime("%H:%M", time.localtime(ts))
-            for l, ts in hist["occupied"].items() if ts > now2}
+    work_date = _job_work_date(window) if window else "—"
+    burned = sorted((e, l) for (e, l, d) in hist["accepted_pairs"]
+                    if d is None or d == work_date)
+    busy = {l: "/".join(time.strftime("%m-%d %H:%M", time.localtime(s))
+                        for s, e in wins if e > now2)
+            for l, wins in hist["occupied"].items() if any(e > now2 for s, e in wins)}
     raise PoolShortage(
-        "今日 (商家×夥伴) 配對額度耗盡：同一企業/商家每日僅限工作一次（30229/30213）"
-        f"＋時段佔用（30207）。今日已錄取配對(employer,labor)={burned}；"
-        f"時段佔用中(labor:至)={busy}。"
+        f"工作日 {work_date} 的 (商家×夥伴) 配對額度耗盡：同一企業/商家每日僅限工作一次"
+        "（30229/30213）＋時段佔用（30207）。"
+        f"該工作日已錄取配對(employer,labor)={burned}；時段佔用中(labor:起)={busy}。"
         "請擴池（看板「帳號池」頁註冊+審核新夥伴/商家），或等佔用過期再跑。")
 
 
@@ -290,15 +318,15 @@ def _acquire_clear_labors(s: Settings, pool: AccountPool, n: int, labor_caps: li
 def _labors_for_employer(s: Settings, pool: AccountPool, emp: Actor, hist: dict,
                          labor_caps: list[str], ex_lab: list[str],
                          window: tuple[int, int] | None = None) -> list[Actor] | None:
-    """為指定商家配 2 個夥伴：硬排「今日已錄取配對」與「時段佔用中」，配到後再
+    """為指定商家配 2 個夥伴：硬排「同工作日已錄取配對」與「時段重疊佔用」，配到後再
     逐一 preflight 時段衝突（API 實查，補史料盲區）；不足回 None。
 
-    佔用（30207）是跨商家硬約束（被錄取的工作佔住表定時段直到 end_at），放寬必撞，
-    不做軟回退。新工作 start ≈ now+13min，故佔用截止 > now+600s 即視為衝突。
+    佔用（30207）是跨商家硬約束（被錄取的工作佔住表定時段），放寬必撞，不做軟回退——
+    但只避「時段實際重疊」者：明天 11 點的佔用不擋明天 13 點的新工作。
     """
-    now = int(time.time())
-    burned = [l for (e, l) in hist["accepted_pairs"] if e == str(emp.user_id)]
-    busy = [l for (l, ts) in hist["occupied"].items() if ts > now + 600]
+    window = window or _slot_window(None)
+    burned = _burned_labors(hist, str(emp.user_id), _job_work_date(window))
+    busy = _busy_labors(hist, window)
     try:
         return _acquire_clear_labors(s, pool, 2, labor_caps, ex_lab + burned + busy, window)
     except PoolShortage:
@@ -408,9 +436,8 @@ def _actors_for_unlocked(system: str, s: Settings,
         # 用例有引用（required）時是硬需求，配不到立即失敗；否則選配、池不足略過。
         try:
             used = [str(a.user_id) for a in la]
-            burned3 = [l for (e, l) in hist["accepted_pairs"] if e == str(emp.user_id)]
-            now3 = int(time.time())
-            busy3 = [l for (l, ts) in hist["occupied"].items() if ts > now3 + 600]
+            burned3 = _burned_labors(hist, str(emp.user_id), _job_work_date(window))
+            busy3 = _busy_labors(hist, window)
             actors["labor3"] = _acquire_clear_labors(
                 s, pool, 1, labor_caps,
                 (exclude.get("labor") or []) + used + burned3 + busy3, window)[0]
@@ -484,12 +511,10 @@ def job_actor_swapper(s: Settings):
         pool = AccountPool(s)
         hist = _job_history(s)
         emp = state.actors.get("employer")
-        burned = [l for (e, l) in hist["accepted_pairs"]
-                  if emp is not None and e == str(emp.user_id)]
-        now = int(time.time())
-        busy = [l for (l, ts) in hist["occupied"].items() if ts > now + 600]
-        used = [str(getattr(a, "user_id", "")) for a in state.actors.values()]
         window = _slot_window(getattr(state, "vars", None))   # 依用例 vars 算實際時段
+        burned = _burned_labors(hist, str(emp.user_id), _job_work_date(window)) if emp else []
+        busy = _busy_labors(hist, window)
+        used = [str(getattr(a, "user_id", "")) for a in state.actors.values()]
         try:
             return _acquire_clear_labors(s, pool, 1, JOB_LABOR_CAPS,
                                          used + burned + busy, window)[0]
