@@ -51,12 +51,34 @@ def _case_files() -> list[tuple[Path, str]]:
     return files
 
 
-def _load_yaml(path: Path) -> dict | None:
+# YAML 讀取/解析快取：依 (path, mtime) 命中，避免清單每次重讀重解析全部用例檔
+# （90 檔約 150ms），並讓 _case_record 不必為了 yaml 欄位二次讀檔。檔案一改 mtime
+# 變動即失效重載，不會讀到舊內容。
+_yaml_cache: dict[str, tuple[float, str, dict | None]] = {}
+
+
+def _read_yaml(path: Path) -> tuple[float, str, dict | None]:
+    """回傳 (mtime, 原始文字, spec)；spec 為 None 表壞檔或非用例（無 path 欄）。"""
     try:
-        spec = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        mtime = path.stat().st_mtime
+    except OSError:
+        mtime = 0.0
+    hit = _yaml_cache.get(str(path))
+    if hit and hit[0] == mtime:
+        return hit
+    try:
+        raw = path.read_text(encoding="utf-8")
+        parsed = yaml.safe_load(raw) or {}
+        spec = parsed if isinstance(parsed, dict) and "path" in parsed else None
     except Exception:  # noqa: BLE001 — 壞檔略過
-        return None
-    return spec if isinstance(spec, dict) and "path" in spec else None
+        raw, spec = "", None
+    entry = (mtime, raw, spec)
+    _yaml_cache[str(path)] = entry
+    return entry
+
+
+def _load_yaml(path: Path) -> dict | None:
+    return _read_yaml(path)[2]
 
 
 def _case_id(spec: dict, path: Path) -> str:
@@ -66,10 +88,8 @@ def _case_id(spec: dict, path: Path) -> str:
 
 def _case_record(path: Path, source: str, spec: dict) -> dict:
     """組 qa_cases upsert / 清單共用的用例基本資料。"""
-    try:
-        created = int(path.stat().st_mtime)
-    except OSError:
-        created = 0
+    # mtime 與原始文字共用 _read_yaml 快取，免為了 created_at / yaml 欄位再讀檔兩次
+    mtime, raw, _ = _read_yaml(path)
     # 父用例 id 來自 spec 的 parent 欄；無則頂層（None）
     parent = spec.get("parent")
     return {
@@ -79,8 +99,8 @@ def _case_record(path: Path, source: str, spec: dict) -> dict:
         "source": source,
         "description": str(spec.get("description", "")).strip(),
         "step_count": len(spec.get("path", [])),
-        "yaml": path.read_text(encoding="utf-8"),
-        "created_at": created,
+        "yaml": raw,
+        "created_at": int(mtime),
         "parent_id": str(parent) if parent else None,
     }
 
@@ -152,10 +172,14 @@ class CaseStore:
                    reverse=True)
         total = len(items)
         page = items[offset:offset + limit] if limit else items
-        # 每頁項目的執行彙總從 DB 取（只查當頁，避免大量查詢；seq 已於排序時查齊）
+        # 每頁項目的執行彙總從 DB 取（只查當頁）。批次版收斂 N+1：整頁一次撈齊
+        # 最近 run 彙總與執行次數，避免每列各開連線、各打數條查詢（清單變慢的主因）。
+        page_ids = [it["id"] for it in page]
+        summaries = self.qa.latest_summaries(page_ids)
+        run_counts = self.qa.run_counts(page_ids)
         for it in page:
-            it["last_result"] = self.qa.latest_summary(it["id"])
-            it["run_count"] = self.qa.run_count(it["id"])
+            it["last_result"] = summaries.get(it["id"])
+            it["run_count"] = run_counts.get(it["id"], 0)
             it["child_count"] = child_counts.get(it["id"], 0)
         return {"items": page, "total": total}
 

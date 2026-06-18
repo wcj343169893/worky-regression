@@ -563,6 +563,68 @@ class QAStore:
                     "cur_tindex": tdone}
         return {**base, "kind": "other"}
 
+    def run_counts(self, case_ids: list[str]) -> dict[str, int]:
+        """批次取多支用例的執行次數（{id: count}），避免清單 N+1。"""
+        ids = [i for i in case_ids if i]
+        if not ids:
+            return {}
+        with self._engine.connect() as conn:
+            rows = conn.execute(text(
+                "SELECT case_id, COUNT(*) AS n FROM qa_runs "
+                "WHERE case_id IN :ids GROUP BY case_id"
+            ).bindparams(bindparam("ids", expanding=True)), {"ids": ids}).all()
+        return {str(r[0]): int(r[1]) for r in rows}
+
+    def latest_summaries(self, case_ids: list[str]) -> dict[str, dict]:
+        """批次版 latest_summary（{case_id: summary}），把清單頁的 N+1 收斂成 ~3 條查詢。
+
+        每支用例取最近一次 run（started_at desc, run_id desc），再一次性帶出所有
+        run 的 transition 步驟狀態與首個失敗 error；執行中的 run 才逐一補 live 推算
+        （執行中數量少，逐筆無妨）。輸出與 latest_summary 逐筆版完全一致。
+        """
+        ids = [i for i in case_ids if i]
+        if not ids:
+            return {}
+        with self._engine.connect() as conn:
+            runs = conn.execute(text("""
+                SELECT t.* FROM (
+                  SELECT q.*, ROW_NUMBER() OVER (
+                           PARTITION BY case_id ORDER BY started_at DESC, run_id DESC) AS rn
+                  FROM qa_runs q WHERE case_id IN :ids
+                ) t WHERE t.rn = 1
+            """).bindparams(bindparam("ids", expanding=True)), {"ids": ids}).all()
+            if not runs:
+                return {}
+            runs = [self._row(r) for r in runs]
+            run_ids = [r["run_id"] for r in runs]
+            # transition 步驟狀態：一次撈齊所有 run，Python 端按 run_id 分組（已按 step_index 排序）
+            tss: dict[str, list[str]] = {}
+            for rid, st in conn.execute(text(
+                "SELECT run_id, status FROM qa_run_steps WHERE run_id IN :rids "
+                "AND kind='transition' ORDER BY run_id, step_index"
+            ).bindparams(bindparam("rids", expanding=True)), {"rids": run_ids}).all():
+                tss.setdefault(rid, []).append(st)
+            # 首個失敗步驟的 error（每 run 取 step_index 最小者，setdefault 只記第一筆）
+            errs: dict[str, str] = {}
+            for rid, err in conn.execute(text(
+                "SELECT run_id, error FROM qa_run_steps WHERE run_id IN :rids "
+                "AND status='failed' AND error IS NOT NULL ORDER BY run_id, step_index"
+            ).bindparams(bindparam("rids", expanding=True)), {"rids": run_ids}).all():
+                errs.setdefault(rid, err)
+            out: dict[str, dict] = {}
+            for run in runs:
+                rid = run["run_id"]
+                o = {
+                    "run_id": rid, "status": run["status"], "started_at": run["started_at"],
+                    "passed": run["passed"], "total": run["total"], "failed_at": run["failed_at"],
+                    "transition_status": tss.get(rid, []),
+                    "error": errs.get(rid),
+                }
+                if run["status"] == "running":
+                    o["live"] = self._live_progress(conn, run, run["case_id"])
+                out[run["case_id"]] = o
+        return out
+
     def history(self, case_id: str, limit: int = 10) -> list[dict]:
         with self._engine.connect() as conn:
             rows = conn.execute(text("""
