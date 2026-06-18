@@ -35,6 +35,13 @@
   happy path 用 `db_exec` 把 `pay_status` 改 `102` 繞過。
 - receiver `T6→T7` < 1s 會回 `9002`，happy path 間插 `- sleep: 2`。
 - `memcached flush_all` 清不掉 PHP `static`，runner 預設只在 `db_exec`（`flush_cache: true`）才 flush。
+- **真機軌（B）**：執行走 maestro **CLI**（`device_runner.py`），**勿同時用 Maestro MCP 與 CLI 打同一台機**
+  （兩個 session 搶單台機會互擾）；MCP 只用於互動式編 flow。被測 App 是 Compose、
+  文字不暴露無障礙樹，故啟動走 `launch`(adb)、驗證走 `assert_ai`(截圖→qwen-vl-max)，**別用 maestro 文字斷言**。
+- **MIUI 真機一直彈「繼續安裝」**：真因是 maestro 預設每跑必重裝 driver（`reinstallDriver=true`）×
+  MIUI「通過 USB 安裝」沒開（非 MCP/CLI 版本互踩——已實機推翻）。`device_runner.py` 已解：開跑前
+  `_ensure_driver_installed`（缺才裝、首裝自動點掉 MIUI 框）+ 每步 `maestro test --no-reinstall-driver`
+  讓兩包常駐複用。`WORKY_MAESTRO_AUTO_CONFIRM=0` 可關自動點選。背景見 README「真機軌（B）」。
 
 ## 不要做的事
 

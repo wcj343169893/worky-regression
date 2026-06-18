@@ -1,0 +1,46 @@
+id: device-labor-apply-job
+kind: maestro
+description: 真機——打工端應徵一筆推薦工作（點職缺 → 申請這份工作 → 確認 → 申請成功）
+# auto: false → device_worker 背景自動輪詢時跳過此用例（會真的應徵職缺，不該每小時重跑）；
+# 看板手動「執行」/ CLI --case 仍可跑。讀寫類（會改後端狀態）的真機用例都應標 auto: false。
+auto: false
+device:
+  app_id: dev.tw.com.worky.labor.and
+# 定位策略：只有「首頁職缺列表卡片」是 Compose 且文字不暴露無障礙樹 → 用座標點
+# （device 1080x2400，百分比較耐解析度變動）；工作詳情頁、原生彈窗（確認 / 申請成功）文字
+# 都有暴露 → 一律用文字 tapOn / assertVisible（比座標耐畫面變動）。
+# 座標要點：首頁約 40% 高處是「輪播廣告」（點了進外部死連結 Not Found，非職缺）；真正的
+# 第一筆職缺卡在約 55% 高處，務必點這裡。assert_ai 把關確保進到工作詳情而非廣告。
+path:
+  - launch:
+      name: adb 啟動打工端 App
+      wait: 6
+  - maestro:
+      name: 開啟第一筆工作詳情
+      flow: |
+        - tapOn:
+            point: "28%,55%"
+        - waitForAnimationToEnd:
+            timeout: 8000
+  - assert_ai:
+      name: 進入工作詳情頁
+      prompt: >
+        這是一個工作詳情頁嗎？應看到工作內容、薪資（如 250/hr）、商家名稱，以及底部
+        「申請這份工作」按鈕。若畫面是輪播廣告 / 外部網頁 / 「Not Found」則回不通過。
+  - maestro:
+      name: 點「申請這份工作」
+      flow: |
+        - tapOn: "申請這份工作"
+        - waitForAnimationToEnd:
+            timeout: 5000
+  - maestro:
+      name: 確認申請（原生彈窗）
+      flow: |
+        - assertVisible: ".*確定要申請.*"
+        - tapOn: "確認"
+        - waitForAnimationToEnd:
+            timeout: 5000
+  - maestro:
+      name: 驗證「申請成功」
+      flow: |
+        - assertVisible: "申請成功"

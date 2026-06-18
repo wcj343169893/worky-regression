@@ -37,6 +37,19 @@ class Settings:
     sdk_version: str
     device_name: str
 
+    # 真機軌（Maestro）：driver 為 maestro CLI binary（背景 worker / 看板 thread 取不到
+    # MCP 工具，故用 CLI subprocess 當執行通道）；device_id 為 adb 序號（空 → DeviceRunner
+    # 以 adb devices 自動挑唯一在線裝置）。詳見 device_runner.py。
+    maestro_bin: str
+    maestro_device_id: str
+
+    # 真機 UI 視覺斷言（assert_ai 步）：被測 App 是 Compose、文字不暴露給無障礙樹，
+    # 文字斷言不可行，改用視覺大模型對截圖做自然語言斷言。預設接阿里雲 qwen-vl-max
+    # （DashScope OpenAI 相容端點）；key 由 WORKY_VISION_API_KEY 或 DASHSCOPE_API_KEY 提供。
+    vision_api_key: str
+    vision_base_url: str
+    vision_model: str
+
     # 後台管理員（backend.*.worky.com.tw）預設 URL；帳密不放 .env，改由看板 UI 編輯
     # 並持久化到 qa_settings（見 qa_models.QASetting）。此處只給 base 的 .env 預設值。
     backend_base: str
@@ -85,6 +98,15 @@ class Settings:
             platform=os.environ.get("WORKY_PLATFORM", "WebPC"),
             sdk_version=os.environ.get("WORKY_SDK_VERSION", "1.0.0"),
             device_name=os.environ.get("WORKY_DEVICE_NAME", "regression-runner"),
+            maestro_bin=os.environ.get(
+                "WORKY_MAESTRO_BIN", str(Path.home() / ".maestro" / "bin" / "maestro")),
+            maestro_device_id=os.environ.get("WORKY_MAESTRO_DEVICE_ID", ""),
+            vision_api_key=os.environ.get("WORKY_VISION_API_KEY",
+                                          os.environ.get("DASHSCOPE_API_KEY", "")),
+            vision_base_url=os.environ.get(
+                "WORKY_VISION_BASE_URL",
+                "https://dashscope.aliyuncs.com/compatible-mode/v1").rstrip("/"),
+            vision_model=os.environ.get("WORKY_VISION_MODEL", "qwen-vl-max"),
             deepseek_api_key=os.environ.get("DEEPSEEK_API_KEY", ""),
             deepseek_base_url=os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com"),
             deepseek_model=os.environ.get("DEEPSEEK_MODEL", "deepseek-chat"),

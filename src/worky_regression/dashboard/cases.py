@@ -22,7 +22,13 @@ GENERATED_DIR = CASES_DIR / "generated"
 
 
 def _detect_system(spec: dict) -> str:
-    """以第一個 transition 前綴判系統：J* → job，T* → contract，A* → activity。"""
+    """以第一個 transition 前綴判系統：J* → job，T* → contract，A* → activity。
+
+    真機軌（B）用例不走 transition，而是 kind=maestro / 帶 device 區塊的 Maestro flow，
+    一律歸 "app"（DeviceRunner 執行；不連被測 DB、不配帳號池）。
+    """
+    if spec.get("kind") == "maestro" or spec.get("device"):
+        return "app"
     for st in spec.get("path", []):
         t = str(st.get("transition", ""))
         if t[:1] == "J":
@@ -176,6 +182,10 @@ class CaseStore:
             if "db_exec" in st:
                 steps.append({"index": i, "kind": "db_exec", "name": "db_exec",
                               "sql": st["db_exec"], "flush_cache": st.get("flush_cache", False)})
+            elif "maestro" in st:
+                m = st["maestro"] or {}
+                steps.append({"index": i, "kind": "maestro",
+                              "name": m.get("name", f"step{i}"), "flow": m.get("flow", "")})
             else:
                 steps.append({"index": i, "kind": "transition", "name": st.get("transition", "?"),
                               "save": st.get("save"), "expect": st.get("expect")})
@@ -254,7 +264,8 @@ class CaseStore:
 
     # ── 執行 / 分解（會真的打被測 API）────────────────────────────────────────
     def _run_spec(self, spec: dict, *, source: str = "builtin", file: str = "",
-                  actors: dict | None = None, on_event=None) -> dict:
+                  actors: dict | None = None, on_event=None,
+                  device_lock_wait: float = 0.0) -> dict:
         from uuid import uuid4
 
         from ..autotest import _actors_for, actor_swapper_for, required_actors
@@ -276,6 +287,15 @@ class CaseStore:
         if spec.get("skip"):
             return RecordingRunner(None, qa_store=self.qa, system=system).run(
                 spec, actors={}, on_event=on_event).to_dict()
+        # 真機軌（B）：UI 層執行，不連被測 DB、不配帳號池；走 DeviceRunner（maestro CLI），
+        # 但落庫與 SSE 事件協定與 API 軌一致，看板沿用。
+        if system == "app":
+            from ..device_runner import DeviceRunner
+            # device_lock_wait：看板 inline 執行預設 0（裝置忙就快速失敗）；device_worker
+            # 背景排隊時傳大值，等到輪到它再跑（單裝置序列化）。
+            return DeviceRunner(self.settings, qa_store=self.qa, system=system,
+                                lock_wait_sec=device_lock_wait).run(
+                spec, on_event=on_event).to_dict()
         db = DBVerifier(self.settings.for_system(system))   # contract/job 分庫
         # on_event（可選）：透傳給 RecordingRunner 做逐步事件回呼（看板 SSE 即時刷新用）
         # actor_swapper：步驟撞 30229/30213（夥伴×商家×日配對燒掉）時自動從池換夥伴重試
@@ -297,12 +317,13 @@ class CaseStore:
             # release 作用域須與上租約一致（contract 帳號掛 contract 庫的 db_name 下）
             AccountPool(self.settings.for_system(system)).release(lease_owner)
 
-    def run_case(self, case_id: str) -> dict:
+    def run_case(self, case_id: str, *, device_lock_wait: float = 0.0) -> dict:
         found = self._find(case_id)
         if found is None:
             raise ValueError(f"找不到用例 {case_id}")
         path, source, spec = found
-        return self._run_spec(spec, source=source, file=path.name)
+        return self._run_spec(spec, source=source, file=path.name,
+                              device_lock_wait=device_lock_wait)
 
     def clear_all(self, include_cases: bool = True) -> dict:
         """清空所有測試用例執行數據（「重新測試」用）；不動帳號池 / 後台設定 / 頁面標記。

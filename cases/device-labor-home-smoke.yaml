@@ -1,0 +1,21 @@
+id: device-labor-home-smoke
+kind: maestro
+description: 真機冒煙——打工端 App 啟動並進入「找工作」首頁（adb 啟動 + qwen-vl-max 視覺斷言）
+device:
+  app_id: dev.tw.com.worky.labor.and   # 打工端；商家端為 dev.tw.com.worky.employer.and
+  # device_id 留空 → 用 WORKY_MAESTRO_DEVICE_ID / adb 唯一在線裝置（環境相關，不寫死在用例）
+# 為何不用 maestro launchApp / assertVisible：本 App 為 Jetpack Compose，文字不暴露給
+# 無障礙樹（maestro 讀不到「找工作」等字），且 maestro 的 launchApp 會跳回桌面（疑似反
+# instrumentation）。故啟動走 adb、驗證走截圖 + qwen-vl-max 視覺斷言。
+path:
+  - launch:
+      name: adb 啟動打工端 App
+      wait: 6
+  - assert_ai:
+      name: 首頁為打工端「找工作」頁
+      prompt: >
+        這是打工求職 App 的首頁嗎？應同時看到：頂部有「找工作 / 找品牌」分頁、
+        中間有工作職缺卡片（含時薪/總額）、底部導覽列有「找工作」「個人」等項目。
+  - assert_ai:
+      name: 底部導覽存在
+      prompt: 畫面底部是否有一排導覽列（含「班表」「找工作」「找任務」「訊息」「個人」等項目）？

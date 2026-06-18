@@ -83,14 +83,20 @@ python -m worky_regression.dashboard --port 9000 --host 0.0.0.0
   （邊緣代理用 LAN IP 直連，綁 127.0.0.1 會連不到）。
 - `~/.config/systemd/user/worky-markup-worker.service` — 標記 worker；
   `Environment=PATH` 帶 nvm 的 node（`claude` CLI 依賴，systemd 預設 PATH 沒有）。
+- `~/.config/systemd/user/worky-device-worker.service` — 真機軌（B）worker；
+  `Environment=PATH` 帶 `~/.maestro/bin`、`JAVA_HOME` 指 java-17（maestro CLI 依賴）。
+  **常駐每 1h 跑一輪 system=app 用例**（會驅動真機 + 花視覺 API；調 unit 內 `--interval` 改頻率，
+  或 `systemctl --user stop` 暫停）。
 
 ```bash
-systemctl --user status  worky-dashboard worky-markup-worker   # 看狀態
+systemctl --user status  worky-dashboard worky-markup-worker worky-device-worker   # 看狀態
 systemctl --user restart worky-dashboard                       # 重啟看板
-systemctl --user restart worky-markup-worker                   # 重啟 worker
+systemctl --user restart worky-markup-worker                   # 重啟標記 worker
+systemctl --user restart worky-device-worker                   # 重啟真機 worker
+systemctl --user stop    worky-device-worker                   # 暫停真機自動跑（不想它定時驅動手機時）
 ```
 
-日誌仍寫到 `logs/dashboard.log` / `logs/markup_worker.log`。
+日誌寫到 `logs/dashboard.log` / `logs/markup_worker.log` / `logs/device_worker.log`。
 
 > **不要再用 nohup 手動起**：會與 systemd 實例搶埠 / 單例鎖
 > （worker 有單例鎖，舊 nohup 進程不死、新實例起不來）。
@@ -444,10 +450,31 @@ python scripts/account_pool_worker.py
 nohup python -u scripts/account_pool_worker.py > logs/account_pool_worker.log 2>&1 &
 ```
 
+### 真機軌 worker（device_worker）
+
+序列化跑 `system=app`（真機軌 B）的 Maestro 用例——單裝置一次只能被一個 maestro session 驅動，
+故不能並行。兩道序列化保險：**單例鎖**（同時只一個 device_worker）＋ **跨進程裝置鎖**
+（看板 inline 執行與 worker 共機也不撞；worker 排隊等、看板取不到快速失敗回「裝置忙碌中」）。
+結果照常落 worky_qa_dashboard，看板「📱 真機」tab / 歷史沿用。
+
+```bash
+python scripts/device_worker.py --list           # 列出 system=app 用例
+python scripts/device_worker.py --once           # 整套序列化跑一輪後退出
+python scripts/device_worker.py --case device-labor-home-smoke   # 只跑指定用例（可多個）
+python scripts/device_worker.py                  # 常駐：每 --interval 秒（預設 1800）跑一輪
+
+# 背景常駐
+nohup python -u scripts/device_worker.py > logs/device_worker.log 2>&1 &
+```
+
+> 前置：maestro CLI（`WORKY_MAESTRO_BIN`）、目標裝置在線（`WORKY_MAESTRO_DEVICE_ID` 或 adb 唯一裝置）、
+> 視覺斷言 key（`WORKY_VISION_API_KEY`）。**勿同時用 Maestro MCP 與本 worker 打同一台機**（兩 session 互擾）。
+> driver APK 由框架開跑前自動 provision 並常駐複用（`--no-reinstall-driver`）；MIUI 首裝確認框會被自動點掉，見下方陷阱節。
+
 ### 查看 / 停止背景 worker
 
 ```bash
-pgrep -af "markup_worker|account_pool_worker"   # 看哪支在跑（PID）
+pgrep -af "markup_worker|account_pool_worker|device_worker"   # 看哪支在跑（PID）
 tail -f logs/markup_worker.log                  # 跟 log
 kill <PID>                                       # 停止
 ```
@@ -470,9 +497,68 @@ kill <PID>                                       # 停止
 
 ---
 
+## 真機軌（B）：Maestro UI 測試
+
+API 軌（上述）打後端狀態機；**真機軌**驅動實體 App **UI**，補 API 補不到的渲染 / 推播到端 /
+打卡等。與 API 軌共用同一套用例管理（`qa_cases` / `qa_runs` / 看板「📱 真機」tab）與 SSE 事件協定，
+但走獨立執行器 `device_runner.py`（不連被測 DB、不配帳號池）。
+
+```yaml
+# cases/device-*.yaml（kind: maestro → system=app）
+id: device-labor-home-smoke
+kind: maestro
+device: { app_id: dev.tw.com.worky.labor.and }   # device_id 留空 → 自動挑 adb 唯一裝置
+path:
+  - launch:    { name: 啟動 App, wait: 6 }                       # adb 啟動
+  - assert_ai: { name: 首頁正確, prompt: "這是打工求職 App 首頁嗎？…" }  # 截圖 → qwen-vl-max 判定
+```
+
+三種步驟：`launch`（adb 啟動）、`maestro`（跑一段 Maestro flow，做點擊/滑動）、
+`assert_ai`（adb 截圖 → 視覺大模型自然語言斷言）。看板「📱 真機」tab 篩 `system=app`，
+「執行」按鈕直接驅動真機（與 API 軌同一個按鈕 / SSE / 歷史）。
+
+**定位策略**：只有「首頁 Compose 列表卡片」文字不暴露無障礙樹 → 用座標點（百分比）；
+**工作詳情、原生彈窗的文字都有暴露** → 一律 `tapOn: "文字"` / `assertVisible: "文字"`（比座標耐畫面變動）。
+座標點擊前務必避開輪播廣告（首頁約 40% 高處，點了會進外部死連結 Not Found）。
+
+**`auto: false`**：會改後端狀態的讀寫類用例（如 `device-labor-apply-job` 應徵職缺）標 `auto: false`，
+device_worker 背景輪詢時跳過（避免每小時重複應徵）；看板手動「執行」/ `--case` 仍可跑。
+
+範例用例：`cases/device-labor-home-smoke.yaml`（唯讀冒煙，可自動輪詢）、
+`cases/device-labor-apply-job.yaml`（應徵一筆工作，`auto: false` 僅手動）。
+
+### 執行通道與已知陷阱（被測 App / 裝置側，框架不修）
+
+- **執行走 maestro CLI 而非 MCP**：背景 worker / 看板 thread 取不到 MCP 工具，
+  `maestro test` subprocess（`WORKY_MAESTRO_BIN`，預設 `~/.maestro/bin/maestro`）才是執行通道；
+  Maestro MCP 留給互動式編寫 / 除錯 flow。**勿同時用 MCP 與 CLI 打同一台機**（兩個 session 搶單台機互擾）。
+- **MIUI 一直彈「繼續安裝」driver——真因與解法**（2026-06-18 實機查清）：
+  - 真因 = maestro **預設每跑（甚至每步）都 uninstall+reinstall** driver（`AndroidDriver.reinstallDriver=true`）
+    × MIUI V12「**通過 USB 安裝**」開關沒開（adb 設不了，鎖在小米帳號後），每次安裝都被導進
+    `com.miui.permcenter.install.AdbInstallActivity` 等人工點。**不是** MCP/CLI 版本互踩（MCP 與 CLI
+    共用 `~/.maestro/lib/*` 同版本，已實機推翻舊說法）。
+  - 框架已內建解法：開跑前 `DeviceRunner._ensure_driver_installed` 確保兩支 driver APK 已裝（缺才裝，
+    從 `maestro-client.jar` 掏 `maestro-app.apk` / `maestro-server.apk` 以 `adb install`；首裝那次的 MIUI
+    確認框由 `_adb_install_with_confirm` 自動 `uiautomator dump`→點「繼續安裝」帶過），之後每步
+    `maestro test --no-reinstall-driver` 讓 driver **常駐複用**（已裝即跳過安裝）→ 不再彈框、每步省一次卸裝重裝。
+  - 旋鈕：`WORKY_MAESTRO_AUTO_CONFIRM=0` 關閉自動點選；或手機端開「通過 USB 安裝」一勞永逸
+    （要登小米帳號 + 插 SIM，重開機/閒置會自動關，較不適合無人值守）。maestro **升級後** driver 變舊，
+    需手動 `adb uninstall dev.mobile.maestro dev.mobile.maestro.test` 讓框架重新 provision。
+- **App 是 Jetpack Compose、文字不暴露無障礙樹**：`uiautomator dump` 整屏只見廣告彈窗一個文字節點，
+  maestro 的 `assertVisible: 文字` / `tapOn: 文字` 對主畫面不可行 → 故驗證改 `assert_ai`（視覺斷言）。
+- **maestro `launchApp` 會跳回桌面**（疑似反 instrumentation）：`adb` 的 launcher intent 能穩定拉前景，
+  故 `launch` 步走 adb；之後 maestro 用 instrumentation 截圖 / 操作不會被踢走。
+- 上述 App 側特性建議回報主倉（Compose 加 `Modifier.semantics` / `testTagsAsResourceId` 後文字斷言才可用）。
+
+`assert_ai` 視覺模型預設阿里雲 DashScope **qwen-vl-max**（OpenAI 相容；`WORKY_VISION_API_KEY` /
+`WORKY_VISION_BASE_URL` / `WORKY_VISION_MODEL`）。單次斷言約 50~75s（整屏圖延遲），真機 smoke 可接受。
+
+---
+
 ## 未來工作
 
 - [ ] PHP 端修掉 `static $task = []`，本框架就能跑通全部 happy path
 - [ ] 補完 6 條 path，覆蓋 10 個 PushNotification 事件
 - [ ] 補 push 內容（title / content）的字面斷言
 - [ ] CI 整合（用 docker-compose 起獨立 worky 實例）
+- [ ] 真機軌（B）：AI 自動產生 Maestro flow（看板「📱 真機」tab 接 MCP inspect_screen 起草）
