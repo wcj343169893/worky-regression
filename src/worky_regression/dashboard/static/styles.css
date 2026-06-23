@@ -220,7 +220,7 @@ textarea:focus{outline:none;border-color:var(--accent)}
   font-family:ui-monospace,Menlo,Consolas,monospace;white-space:pre;overflow:auto}
 .dc-confirm .dc-yaml:focus{outline:none;border-color:var(--accent)}
 .dc-confirm-actions{display:flex;justify-content:flex-end;gap:10px;margin-top:16px}
-/* 子用例勾選區：每條一行可勾選，skip 者附原因（覆蓋缺口可見） */
+/* 子用例勾選區：多級樹（領域分組 → 子用例），skip / 尚未建模者附原因（覆蓋缺口可見） */
 .dc-children{display:flex;flex-direction:column;gap:6px}
 .dc-child{display:flex;align-items:flex-start;gap:8px;padding:8px 10px;border-radius:8px;
   border:1px solid var(--line);background:var(--panel2);cursor:pointer}
@@ -228,6 +228,18 @@ textarea:focus{outline:none;border-color:var(--accent)}
 .dc-child-body{flex:1;min-width:0}
 .dc-child-body code{font-size:12px}
 .dc-child-skip{color:#ffb454;margin-top:3px}
+/* 多級樹：第一層領域分組（商家端/打工夥伴/承攬制/共通/系統）可整組勾選 */
+.dc-tree{display:flex;flex-direction:column;gap:10px}
+.dc-group{border:1px solid var(--line);border-radius:8px;overflow:hidden;background:var(--panel)}
+.dc-group-head{display:flex;align-items:center;gap:8px;padding:8px 10px;cursor:pointer;
+  background:var(--panel2);border-bottom:1px solid var(--line);font-weight:600}
+.dc-group-title{flex:1}
+.dc-group-body{display:flex;flex-direction:column;gap:6px;padding:8px 10px 10px 22px}
+/* 錯誤碼徽章：碼 + 常數名，醒目對齊 ApiExceptionCode 目錄 */
+.codechip{display:inline-block;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;
+  font-size:11px;padding:1px 6px;border-radius:5px;margin-right:6px;
+  color:var(--accent);border:1px solid var(--line);background:var(--panel2)}
+.dc-child .pill{margin-left:4px}
 /* 時間 / 打卡碼 / db_exec 相關片段：醒目突顯，方便核對「1 小時後」這類時間語意 */
 .time-hints{display:flex;flex-direction:column;gap:5px}
 .time-hints .thint{padding:6px 9px;border-radius:8px;border:1px solid rgba(255,180,84,.4);

@@ -1108,26 +1108,71 @@ function showDecomposeResult(d, plan, run) {
 // 子用例區塊：列出 preview 分析出的子用例（分支 / 邊界 / 負向），可逐條勾選一併建立。
 // 非 skip 者預設勾選；skip 者顯示其 skip_reason 並預設不勾（作為可見的覆蓋缺口，仍可手動勾）。
 // children 為空時回空字串（彈窗不顯示此區塊，行為與 #1 完全一致，不退化）。
+// children 為扁平陣列（data-i 為其原始索引，commit 收集邏輯不變）；分組由前端依 group_key 收攏。
 function childrenSectionHtml(pv) {
   const children = pv.children || [];
   if (!children.length) return "";
   // 被截斷時明示「已分析 N 條，顯示前 M 條」，呼應「不要靜默截斷」原則
   const trunc = pv.children_truncated
     ? `<span class="sub2">（已分析 ${pv.children_analyzed} 條，顯示前 ${children.length} 條）</span>` : "";
-  const rows = children.map((c, i) => {
-    const checked = c.skip ? "" : "checked";
+  // 依 group_key 收攏，保留每條原始扁平索引（data-i）；分組顯示序用後端給的 group_order
+  const order = pv.group_order || ["employer", "labor", "contract", "common", "system"];
+  const labels = pv.group_labels || {};
+  const buckets = {};
+  children.forEach((c, i) => {
+    const g = c.group_key || "common";
+    (buckets[g] = buckets[g] || []).push({ c, i });
+  });
+  const keys = [...order.filter((k) => buckets[k]),
+               ...Object.keys(buckets).filter((k) => !order.includes(k))];
+  const childRow = ({ c, i }) => {
+    const checked = c.recommended ? "checked" : "";
+    const chip = c.code
+      ? `<span class="codechip" title="${esc(c.code_name || "")}">${esc(String(c.code))}${c.code_name ? " " + esc(c.code_name) : ""}</span>` : "";
     const reason = c.skip
-      ? `<div class="sub2 dc-child-skip">⚠ 暫無法自動化：${esc(c.skip_reason || "")}（仍可勾選一併建立，作為可見的覆蓋缺口）</div>` : "";
+      ? `<div class="sub2 dc-child-skip">⚠ ${esc(c.skip_reason || "暫無法自動化")}（仍可勾選一併建立，作為可見的覆蓋缺口）</div>` : "";
     return `<label class="dc-child">
-      <input type="checkbox" class="dc-child-ck" data-i="${i}" ${checked} />
+      <input type="checkbox" class="dc-child-ck" data-i="${i}" data-g="${esc(c.group_key || "common")}" ${checked} />
       <span class="dc-child-body">
-        <code>${esc(c.id || "")}</code>${c.skip ? ` <span class="pill">skip</span>` : ""}
+        ${chip}<code>${esc(c.id || "")}</code>${c.skip ? ` <span class="pill">${c.recommended ? "skip" : "尚未建模"}</span>` : ""}
         <div class="sub2">${esc(c.description || "")}</div>${reason}
       </span></label>`;
+  };
+  const groups = keys.map((k) => {
+    const items = buckets[k];
+    const label = labels[k] || (items[0] && items[0].c.group_label) || k;
+    return `<div class="dc-group">
+      <label class="dc-group-head">
+        <input type="checkbox" class="dc-group-ck" data-g="${esc(k)}" />
+        <span class="dc-group-title">${esc(label)} <span class="sub2">(${items.length})</span></span>
+      </label>
+      <div class="dc-group-body">${items.map(childRow).join("")}</div>
+    </div>`;
   }).join("");
   return `<div class="sec"><h4>子用例（將一併建立）${trunc}</h4>
-    <p class="sub2">AI 分析主流程中有分支的步驟，衍生出以下負向 / 邊界子用例（掛在主用例底下，預設不執行）。</p>
-    <div class="dc-children">${rows}</div></div>`;
+    <p class="sub2">AI 對照 <code>ApiExceptionCode</code> 錯誤碼目錄分解出負向 / 邊界子用例，依領域分組（掛在主用例底下，預設不執行）。
+    <b>推薦</b>（已建模、可跑）預設勾選；<b>尚未建模</b>者預設不勾，作為可見的覆蓋缺口。</p>
+    <div class="dc-tree">${groups}</div></div>`;
+}
+
+// 子用例樹的整組勾選聯動：群組 checkbox 切換整組；子項變更回算群組的全選 / 半選態。
+function setupChildTree() {
+  const childCks = (g) => [...document.querySelectorAll(`.dc-child-ck[data-g="${g}"]`)];
+  const refreshGroup = (g) => {
+    const gc = document.querySelector(`.dc-group-ck[data-g="${g}"]`);
+    if (!gc) return;
+    const kids = childCks(g), on = kids.filter((k) => k.checked).length;
+    gc.checked = on === kids.length;
+    gc.indeterminate = on > 0 && on < kids.length;
+  };
+  document.querySelectorAll(".dc-group-ck").forEach((gc) => {
+    const g = gc.dataset.g;
+    refreshGroup(g);
+    gc.onchange = () => { childCks(g).forEach((k) => { k.checked = gc.checked; }); };
+  });
+  document.querySelectorAll(".dc-child-ck").forEach((k) => {
+    k.addEventListener("change", () => refreshGroup(k.dataset.g));
+  });
 }
 
 // 確認彈窗：展示 preview 出的關鍵參數 + 時間提示 + 可編輯 spec YAML + 子用例勾選，
@@ -1155,6 +1200,7 @@ function openConfirmModal(key, pv, run) {
   // YAML 編輯後即時刷新時間提示，協助使用者邊改邊核對時間參數
   const ta = $("dc-yaml");
   if (ta) ta.oninput = () => { const h = $("dc-hints"); if (h) h.innerHTML = timeHintsHtml(ta.value); };
+  setupChildTree();   // 子用例樹整組勾選聯動（群組全選 / 半選態）
   $("dc-cancel").onclick = closeModal;  // 取消：不送任何東西、不留記錄
   const children = pv.children || [];
   const ok = $("dc-ok");

@@ -374,6 +374,88 @@ def analyze_failure(context: dict[str, Any], settings: Settings | None = None) -
     }
 
 
+# ── AI 子用例補強：對照完整錯誤碼目錄，補出 endpoints.yaml 尚未建模的負向情境 ────────
+_CODE_GAP_SYSTEM_PROMPT = """你是 Worky 回歸測試的「負向覆蓋補強器」。給你一條用例的任務流\
+（每步含端點、操作角色、已建模的負向錯誤碼），以及該流程相關的「完整錯誤碼目錄」。\
+請針對每一步，從目錄中挑出「該端點實務上可能回、但尚未被建模」的負向錯誤碼，補成子用例情境。
+
+規則：
+1. 只能用目錄裡出現過的 code，絕不可自創。
+2. 不要重複該步「已建模」清單裡的 code。
+3. 只挑與該步端點/角色「真的可能觸發」的 code（例：發佈工作不會回打工夥伴 profile 類錯誤）。
+4. 每步最多挑 6 個，挑最有測試價值的（業務規則、邊界、權限、狀態機）。寧缺勿濫。
+5. when 用繁體中文一句話描述「什麼情況會觸發這個錯誤」。
+
+只輸出 JSON：
+{"suggestions":[{"transition":"<步驟名>","code":<int>,"when":"<觸發情境>"}]}
+不要任何解釋或 markdown 圍欄。"""
+
+
+def suggest_code_gaps(steps_meta: list[dict[str, Any]],
+                      settings: Settings | None = None) -> dict[str, list[dict[str, Any]]]:
+    """對照完整錯誤碼目錄，回每步「尚未建模但可能觸發」的負向碼。
+
+    steps_meta：[{transition, system, actor, summary, endpoint, modeled_codes:[int]}]。
+    回 {transition -> [{code:int, when:str}]}；無 DEEPSEEK_API_KEY 或任何失敗都回 {}
+    （優雅降級：子用例就只剩已建模 branches，分解主流程完全不受影響）。
+    """
+    from .api_error_codes import catalog_for_actors, load_catalog
+
+    s = settings or Settings.from_env()
+    if not s.deepseek_api_key or not steps_meta:
+        return {}
+    try:
+        from openai import OpenAI
+
+        catalog = load_catalog()
+        if not catalog:
+            return {}
+        actors = {str(m.get("actor") or "") for m in steps_meta}
+        subset = catalog_for_actors(actors)
+        menu = "\n".join(
+            f"{c['code']} {c['name']}" + (f" — {c['comment']}" if c["comment"] else "")
+            for c in subset)
+        flow = [{
+            "transition": m["transition"], "system": m.get("system"),
+            "actor": m.get("actor"), "summary": m.get("summary"),
+            "endpoint": m.get("endpoint"), "modeled_codes": sorted(m.get("modeled_codes") or []),
+        } for m in steps_meta]
+        client = OpenAI(api_key=s.deepseek_api_key, base_url=s.deepseek_base_url)
+        resp = client.chat.completions.create(
+            model=s.deepseek_model,
+            messages=[
+                {"role": "system", "content": _CODE_GAP_SYSTEM_PROMPT},
+                {"role": "user", "content":
+                    "# 任務流步驟\n" + json.dumps(flow, ensure_ascii=False, indent=2)
+                    + "\n\n# 相關錯誤碼目錄\n" + menu
+                    + "\n\n只輸出符合格式的 JSON。"},
+            ],
+            response_format={"type": "json_object"},
+            temperature=0,
+            stream=False,
+        )
+        data = json.loads(resp.choices[0].message.content or "{}")
+    except Exception:  # noqa: BLE001 — 補強是加分項，任何失敗都不該拖垮分解
+        return {}
+
+    valid_codes = set(load_catalog())
+    by_txn: dict[str, list[dict[str, Any]]] = {}
+    modeled_by_txn = {m["transition"]: set(m.get("modeled_codes") or []) for m in steps_meta}
+    seen: set[tuple[str, int]] = set()
+    for item in (data.get("suggestions") or []):
+        txn = str(item.get("transition") or "")
+        code = item.get("code")
+        if txn not in modeled_by_txn or not isinstance(code, int):
+            continue
+        if code not in valid_codes or code in modeled_by_txn[txn]:
+            continue
+        if (txn, code) in seen:
+            continue
+        seen.add((txn, code))
+        by_txn.setdefault(txn, []).append({"code": code, "when": str(item.get("when") or "").strip()})
+    return by_txn
+
+
 def _expect_from_unit(name: str) -> dict[str, Any]:
     """從 spec 的 push / verify_api 自動推導一個 transition 步驟的 expect。
 

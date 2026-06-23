@@ -527,27 +527,64 @@ class CaseStore:
         from ..planner import suggest_tab as _suggest_tab
         return _suggest_tab(description, self.settings)
 
-    # 子用例自動分析上限：避免單一主用例衍生過多子用例淹沒看板（被截斷時會明示截斷數）
-    _MAX_CHILDREN = 12
+    # 子用例自動分析上限：避免單一主用例衍生過多子用例淹沒看板（被截斷時會明示截斷數）。
+    # 已多級分組 + 含目錄擴充，上限放寬；每步 LLM 補強另有上限見 _MAX_GAP_PER_STEP。
+    _MAX_CHILDREN = 24
+    _MAX_GAP_PER_STEP = 6
+
+    def _action_code(self, child: dict) -> int | None:
+        """從子用例 spec 取「負向動作」的錯誤碼（path 末段帶 expect.code 的步驟）。無則 None。"""
+        for st in reversed(child.get("path", [])):
+            code = (st.get("expect") or {}).get("code")
+            if isinstance(code, int):
+                return code
+        return None
+
+    def _annotate_child(self, child: dict, actor: str | None, recommended: bool) -> dict:
+        """把一條子用例 spec 包成前端用的卡片：附錯誤碼/碼名/領域分組/是否推薦勾選 + spec_yaml。"""
+        from ..api_error_codes import describe, group_for
+
+        code = self._action_code(child)
+        info = describe(code) if code is not None else {"name": "", "label": ""}
+        gkey, glabel = group_for(code, actor)
+        return {
+            "id": child.get("id", ""),
+            "description": str(child.get("description", "")).strip(),
+            "skip": bool(child.get("skip")),
+            "skip_reason": child.get("skip_reason", ""),
+            "code": code,
+            "code_name": info["name"],
+            "code_label": info["label"],
+            "group_key": gkey,
+            "group_label": glabel,
+            "recommended": recommended,
+            "spec_yaml": yaml.safe_dump(child, allow_unicode=True, sort_keys=False),
+        }
 
     def _derive_children(self, main_spec: dict) -> dict:
-        """從主 spec 確定性地推導子用例（分支 / 邊界 / 負向情境）。
+        """從主 spec 推導子用例（分支 / 邊界 / 負向），結合完整錯誤碼目錄分多級。
 
-        策略：
-          - 掃主 spec path 內所有 transition 步驟，挑出「endpoints.yaml 有定義 branches」的
-            target（用 unit_spec(name).get("branches") 判斷；無 branch 者沒有可衍生的負向情境）。
-          - 對每個 target 呼叫 case_gen.generate(target, "L1")，**只取 L1 negative**——
-            丟掉 `gen-{target}-happy`（主用例本身即 happy 流，留著只會重複）。
-          - 依 id 去重（同一 target 不會掃兩次，但仍保險去重）。
-          - 對總數做合理上限（_MAX_CHILDREN）；被截斷時不靜默丟棄，回 truncated 計數讓前端標示。
-          - 此處**不**綁 parent / 不改 id：最終 id 與 parent 在 commit 時才綁（主 id 可能因防撞而變）。
+        兩個來源：
+          - **已建模 branches**（endpoints.yaml）：對每個有 branches 的 target 呼叫
+            case_gen.generate(target, "L1") 取 negative（丟 happy）。可跑者標 recommended=True
+            （前端預設勾選）；因時間鎖/缺帳號等 skip 者 recommended=False（覆蓋缺口，預設不勾）。
+          - **目錄擴充**（planner.suggest_code_gaps，需 DEEPSEEK_API_KEY）：對照 ApiExceptionCode
+            完整目錄，補出「該步可能觸發但 endpoints.yaml 尚未建模」的負向碼，合成 skip 佔位子用例
+            （recommended=False；標「尚未建模」覆蓋缺口）。無 key / 失敗則靜默跳過，不影響主分解。
 
-        回傳 {children: [...spec dict], analyzed: 分析總數, truncated: 被截掉的數量}。
+        每條子用例經 _annotate_child 附錯誤碼/碼名/領域分組（商家端/打工夥伴/承攬制/共通/系統）。
+        回 {children:[...annotated], analyzed, truncated}；children 仍為**扁平**陣列（保 commit 相容），
+        分組第一層由前端依 group_key 自行收攏。
         """
-        from ..case_gen import generate
+        from ..case_gen import _branch_case, generate
+        from ..planner import suggest_code_gaps
         from ..registry import unit_spec
 
+        # 1) 掃出有 branches 的 target，連帶記下其 actor / 已建模碼（供分組與 LLM 補強）
         targets: list[str] = []
+        actor_of: dict[str, str | None] = {}
+        modeled_codes: dict[str, set[int]] = {}
+        steps_meta: list[dict] = []
         seen_targets: set[str] = set()
         for st in main_spec.get("path", []):
             name = st.get("transition")
@@ -555,22 +592,55 @@ class CaseStore:
                 continue
             seen_targets.add(name)
             try:
-                has_branches = bool(unit_spec(name).get("branches"))
-            except Exception:  # noqa: BLE001 — 找不到單元規格者視為無 branch
-                has_branches = False
-            if has_branches:
-                targets.append(name)
+                u = unit_spec(name)
+            except Exception:  # noqa: BLE001 — 找不到單元規格者跳過
+                continue
+            branches = u.get("branches") or []
+            if not branches:
+                continue
+            targets.append(name)
+            actor_of[name] = u.get("actor")
+            codes = {(b.get("expect_fail") or {}).get("code")
+                     for b in branches if isinstance((b.get("expect_fail") or {}).get("code"), int)}
+            modeled_codes[name] = codes
+            steps_meta.append({"transition": name, "system": u.get("system"),
+                               "actor": u.get("actor"), "summary": u.get("summary"),
+                               "endpoint": u.get("endpoint"), "modeled_codes": sorted(codes)})
 
         children: list[dict] = []
         seen_ids: set[str] = set()
+
+        # 2) 已建模 branches → negative 子用例（依 branch 順序對齊，取 expect_fail 當主碼）
         for target in targets:
-            for c in generate(target, "L1"):
-                cid = c.get("id", "")
-                # 丟掉 happy（主用例就是 happy 流）；依 id 去重
-                if cid.endswith("-happy") or cid in seen_ids:
+            negs = [c for c in generate(target, "L1") if not c.get("id", "").endswith("-happy")]
+            branches = unit_spec(target).get("branches") or []
+            for br, child in zip(branches, negs):
+                cid = child.get("id", "")
+                if cid in seen_ids:
                     continue
                 seen_ids.add(cid)
-                children.append(c)
+                children.append(self._annotate_child(
+                    child, actor_of.get(target), recommended=not child.get("skip")))
+
+        # 3) 目錄擴充：LLM 對照完整錯誤碼目錄補「尚未建模」的負向碼（失敗回 {}，不影響上面）
+        gaps = suggest_code_gaps(steps_meta, self.settings)
+        for target, items in gaps.items():
+            base = len(unit_spec(target).get("branches") or [])
+            for i, it in enumerate(items[:self._MAX_GAP_PER_STEP]):
+                when = it.get("when") or "（AI 補出的負向情境）"
+                fake_br = {
+                    "when": when,
+                    "expect_fail": {"code": it["code"]},
+                    # arrange.note 會讓 _branch_case 標 skip：尚未建模 → 作可見覆蓋缺口
+                    "arrange": {"note": f"AI 對照錯誤碼目錄補出（endpoints.yaml 尚未建模 {it['code']}）"},
+                }
+                child = _branch_case(target, fake_br, base + i)
+                cid = child.get("id", "")
+                if cid in seen_ids:
+                    continue
+                seen_ids.add(cid)
+                children.append(self._annotate_child(
+                    child, actor_of.get(target), recommended=False))
 
         analyzed = len(children)
         truncated = max(0, analyzed - self._MAX_CHILDREN)
@@ -631,19 +701,16 @@ class CaseStore:
         spec = build_path(plan)
         spec["id"] = self._unique_case_id(str(spec.get("id") or "ai-case"))  # 預先算好防撞號
         spec_yaml = yaml.safe_dump(spec, allow_unicode=True, sort_keys=False)
-        # 一併分析可能的子用例（分支 / 邊界 / 負向）——同樣只算不落地，供前端彈窗勾選
+        # 一併分析可能的子用例（分支 / 邊界 / 負向）——同樣只算不落地，供前端彈窗勾選。
+        # _derive_children 已把每條附上錯誤碼 / 領域分組 / recommended，children 維持扁平。
+        from ..api_error_codes import GROUP_LABELS, GROUP_ORDER
         derived = self._derive_children(spec)
-        children = [{
-            "id": c.get("id", ""),
-            "description": str(c.get("description", "")).strip(),
-            "skip": bool(c.get("skip")),
-            "skip_reason": c.get("skip_reason", ""),
-            "spec_yaml": yaml.safe_dump(c, allow_unicode=True, sort_keys=False),
-        } for c in derived["children"]]
         return {"plan": plan.raw, "spec": spec, "spec_yaml": spec_yaml,
                 "proposed_id": spec["id"], "system": plan.system,
                 "refs": refs,
-                "children": children,
+                "children": derived["children"],
+                "group_order": GROUP_ORDER,
+                "group_labels": GROUP_LABELS,
                 "children_analyzed": derived["analyzed"],
                 "children_truncated": derived["truncated"]}
 
