@@ -792,6 +792,11 @@ class QAStore:
                             "job_end_at": "工作表定結束"}.get(anchor, anchor or "指定時間")
                     rel = "" if off == 0 else (f"後 {off}s" if off > 0 else f"前 {-off}s")
                     step_label = f"等待「{kind}」{rel}".strip()
+                # next_tindex = 喚醒後即將執行的下一顆 transition chip 序號（= 等待步驟之前
+                # 的 transition 數）。前端據此讓該 chip 在掛起期間持續閃爍，免得看板像當機。
+                if 0 <= int(idx) <= len(path):
+                    info["next_tindex"] = sum(
+                        1 for s in path[:int(idx)] if isinstance(s, dict) and "transition" in s)
             except Exception:  # noqa: BLE001 — 解析不了不致命，給通用文案
                 pass
         info["anchor"] = anchor

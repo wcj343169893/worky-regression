@@ -453,6 +453,25 @@ function applyLiveProgress(key, items) {
   }
 }
 
+// 長延時掛起(waiting)：run 已冷凍、無活躍 SSE，故 applyLiveProgress（只認 running）不會點亮
+// 任何 chip，flow 欄看起來像當機。這裡讓「喚醒後即將執行的下一顆 chip」持續閃爍（沿用
+// tchip-running 的呼吸動畫），並標上「等待中」——精確倒數仍在「最近結果」欄。純前端、靜態
+// 裝飾：renderCaseRows 重建列時呼叫一次即可，wait ticker 只走字不重建，故裝飾不會被洗掉。
+function markWaitingChips(items) {
+  for (const c of items) {
+    const lr = c.last_result, w = lr && lr.wait;
+    if (!lr || lr.status !== "waiting" || !w || w.next_tindex == null) continue;
+    const row = document.querySelector(`tr[data-id="${CSS.escape(c.id)}"]`);
+    const chip = row && row.querySelector(`.tchip[data-ti="${w.next_tindex}"]`);
+    if (!chip || chip.classList.contains("tchip-waiting")) continue;
+    chip.dataset.orig = chip.textContent;
+    chip.dataset.origTitle = chip.title;
+    chip.title = `${w.step_label || "長延時等待"}（喚醒後從此步續跑；倒數見「最近結果」欄）`;
+    chip.classList.add("tchip-running", "tchip-waiting");
+    chip.textContent = `${chip.dataset.orig} 等待中`;
+  }
+}
+
 // 任務流橫向滑動：把正在執行的 chip 滾到 .tflow 可視區中央（不影響整頁捲動）。
 // .tflow 已設 position:relative，故 chip.offsetLeft 相對 .tflow 內容左緣。
 function centerChip(c) {
@@ -529,6 +548,7 @@ function renderCaseRows(key, items) {
   tb.querySelectorAll(".sub-btn").forEach((b) => b.onclick = () => drillInto(key, { id: b.dataset.id }));
   tb.querySelectorAll(".tchip.clickable").forEach((ch) =>
     ch.onclick = () => openStepModal(key, ch.dataset.cid, Number(ch.dataset.ti)));
+  markWaitingChips(items);   // 掛起(waiting)列：讓下一顆即將執行的 chip 持續閃爍（非當機）
   ensureWaitTicker();   // 列表若有 waiting 列，啟動倒數走字（idempotent）
 }
 
