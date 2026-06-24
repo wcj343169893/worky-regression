@@ -540,6 +540,35 @@ class CaseStore:
                 return code
         return None
 
+    def _guard_deficiency(self, child: dict, pool) -> None:
+        """若子用例綁了「缺能力夥伴」但池中**配不到**對應帳號，就把它標 skip（覆蓋缺口可見）。
+
+        case_gen 樂觀地把 caps_lacking 映到 deficiency actor（labor_lacking_*），但不知道池裡有沒有。
+        v31x 池常缺「具 profile_complete 但未認證」「部分填寫」這類精準缺能力帳號，落地成「假可跑」會在
+        批量執行時 PoolShortage（沒啟動）或配到不精準帳號而 expect 不符（失敗）。這裡在落地前先擋下：
+        provision 對應帳號後此檢查自然放行、子用例恢復可跑（不必改 endpoints.yaml）。
+        """
+        from ..autotest import LABOR_DEFICIENCY_ACTORS
+
+        if child.get("skip"):
+            return
+        for st in child.get("path", []):
+            actor = (st.get("bind") or {}).get("labor")
+            spec = LABOR_DEFICIENCY_ACTORS.get(actor)
+            if not spec:
+                continue
+            lack, base = spec
+            try:
+                ok = pool.count_lacking("labor", lack, base) >= 1
+            except Exception:  # noqa: BLE001 — 池查詢失敗就別擋（保守不誤標 skip）
+                ok = True
+            if not ok:
+                child["skip"] = True
+                child["skip_reason"] = (
+                    f"帳號池無『具 {base} 但缺 {lack}』的帳號，無法精準重現此負向情境"
+                    f"（provision 一個對應缺能力 labor 帳號後即可恢復可跑）")
+                return
+
     def _annotate_child(self, child: dict, actor: str | None, recommended: bool) -> dict:
         """把一條子用例 spec 包成前端用的卡片：附錯誤碼/碼名/領域分組/是否推薦勾選 + spec_yaml。"""
         from ..api_error_codes import describe, group_for
@@ -610,6 +639,13 @@ class CaseStore:
         children: list[dict] = []
         seen_ids: set[str] = set()
 
+        # 缺能力夥伴可用性檢查用的池（只讀 count_lacking）；建一次重用
+        from ..qa_accounts import AccountPool
+        try:
+            pool = AccountPool(self.settings)
+        except Exception:  # noqa: BLE001 — 池不可用就不做缺能力守衛（保守不誤標）
+            pool = None
+
         # 2) 已建模 branches → negative 子用例（依 branch 順序對齊，取 expect_fail 當主碼）
         for target in targets:
             negs = [c for c in generate(target, "L1") if not c.get("id", "").endswith("-happy")]
@@ -619,6 +655,8 @@ class CaseStore:
                 if cid in seen_ids:
                     continue
                 seen_ids.add(cid)
+                if pool is not None:
+                    self._guard_deficiency(child, pool)   # 配不到缺能力帳號 → 標 skip
                 children.append(self._annotate_child(
                     child, actor_of.get(target), recommended=not child.get("skip")))
 

@@ -30,6 +30,7 @@ GENERATED = Path(__file__).resolve().parents[2] / "cases" / "generated"
 _DEFICIENCY_ACTOR = {
     "verified": "labor_lacking_verified",
     "profile_complete": "labor_lacking_profile_complete",
+    "profile_started": "labor_lacking_profile_started",
 }
 
 
@@ -103,7 +104,13 @@ def _negative_action(target: str, br: dict[str, Any]) -> dict[str, Any]:
         expect["code"] = ef["code"]
     if ef.get("message_contains"):
         expect["message_contains"] = ef["message_contains"]
-    return {"transition": target, "expect": expect}
+    action: dict[str, Any] = {"transition": target, "expect": expect}
+    # arrange.request：直接「構建對應的缺失/非法資料」覆寫該步 request 觸發業務分支
+    # （時薪過低、工時不符、店鋪不存在等都靠這個變成可跑，不再標 skip）。runner 會淺層覆蓋 body。
+    req = (br.get("arrange") or {}).get("request")
+    if req:
+        action["request"] = dict(req)
+    return action
 
 
 def _branch_case(target: str, br: dict[str, Any], idx: int) -> dict[str, Any]:

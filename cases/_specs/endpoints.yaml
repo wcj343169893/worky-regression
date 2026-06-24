@@ -514,19 +514,20 @@ task_units:
         arrange: {note: "employer 用「有 verified_shop 但無 shop_approved」的帳號"}
       - when: 時薪低於下限（230）
         expect_fail: {code: 20011}                  # HOURLY_WAGE_TOO_LOW
-        arrange: {note: "request.hourly_wage 設 < 230"}
+        arrange: {request: {hourly_wage: 100}}      # 構建非法資料：時薪 < 230（其餘維持合法值）
       - when: 時薪高於上限
         expect_fail: {code: 20012}                  # HOURLY_WAGE_TOO_HIGH
-        arrange: {note: "request.hourly_wage 設超過上限"}
+        arrange: {request: {hourly_wage: 100000}}   # 構建非法資料：時薪遠超上限
       - when: work_minutes != (end-start)-rest
         expect_fail: {code: 20030}                  # JOB_WORK_HOURS_NOT_IDENTICAL
-        arrange: {note: "request.work_minutes 與時段不符"}
+        # 構建非法資料：work_minutes 固定 999，必與時段算出的工時不符（且 <720 不先撞 20032 上限）
+        arrange: {request: {work_minutes: 999}}
       - when: 工時低於最短限制
         expect_fail: {code: 20040}                  # JOB_MIN_WORK_MINUTES
-        arrange: {note: "時段差距小於最短工時"}
+        arrange: {note: "需同時改 start/end 時段且 work_minutes 對齊極短工時；單欄無法精準構建（會先撞 20030）"}
       - when: 店鋪不存在 / 非本商家
         expect_fail: {code: 30205}                  # SHOP_NOT_FOUND
-        arrange: {note: "request.shop_id 給不存在或他人店鋪"}
+        arrange: {request: {shop_id: 999999999}}    # 構建非法資料：不存在的店鋪 id
     side_effects:
       - table: s_jobs
         key: "job_sn='{{state.job_sn}}'"
@@ -560,15 +561,20 @@ task_units:
       - need: 夥伴該時段無已確認工作（s_labor_jobs status=1, end_at>now）
         satisfy: {note: "靠帳號池 LRU 輪換 + runner 未來時段輪轉避開（#4 不再用 db_exec 清殘留）"}
     branches:
-      - when: 夥伴尚未填寫個人資訊（id_number 空）
-        expect_fail: {code: 30211}                  # LABOR_PROFILE_NOT_FILLED
-        arrange: {note: "需 id_number 空的帳號；測試池帳號皆已實名，無法重現"}
-      - when: 夥伴 profile 未完成
+      - when: 夥伴 profile 未完成（已開始填但 is_profile_complete=0）
         expect_fail: {code: 30215}                  # LABOR_PROFILE_INCOMPLETE
+        # 構建對應缺失資料：配「已填個資但未完成」的部分填寫帳號（profile_started 且缺 profile_complete）。
+        # deficiency actor base 含 profile_started → 不會誤配到完全空白帳號(那會回 30211)。
         arrange: {caps_lacking: [profile_complete]}
+      - when: 夥伴尚未填寫任何個資（id_number 空）
+        expect_fail: {code: 30211}                  # LABOR_PROFILE_NOT_FILLED
+        # 構建對應缺失資料：配完全空白帳號（缺 profile_started）；註冊即入池、未補任何個資者即是。
+        arrange: {caps_lacking: [profile_started]}
       - when: 夥伴身分審核中
         expect_fail: {code: 30216}                  # LABOR_PROFILE_VALIDATING
-        arrange: {caps_lacking: [verified]}         # 池中 labor_lacking_verified=276(valid_status=2 待認證)
+        # 需「profile 完整但後台未審核(valid_status=2 待認證)」帳號。可 provision 但 v31x 池現無
+        # （原 276 在 v31x 已 verified）→ _derive_children 的缺能力守衛會即時標 skip；補帳號後自動恢復可跑。
+        arrange: {caps_lacking: [verified]}
       - when: 夥伴認證未通過
         expect_fail: {code: 30217}                  # LABOR_PROFILE_VALIDATE_FAIL
         arrange: {note: "配 valid_status=3(認證失敗) 的帳號"}

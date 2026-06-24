@@ -487,11 +487,7 @@ def _actors_for_unlocked(system: str, s: Settings,
                     f"建議：register/provision 補合格 labor 入池，或晚點再跑（佔用釋放）。") from e
         # 負向用例用的「缺能力」夥伴（deficiency actor）：用例有引用時硬要，否則盡力配發。
         # 帳號須「只缺目標能力、其餘前置滿足」才能可靠觸發對應守衛失敗（後端驗證有序）。
-        deficiency = {
-            "labor_lacking_verified": ("verified", ["profile_complete", "active", "clean"]),
-            "labor_lacking_profile_complete": ("profile_complete", ["active"]),
-        }
-        for name, (lack, base) in deficiency.items():
+        for name, (lack, base) in LABOR_DEFICIENCY_ACTORS.items():
             try:
                 pa = pool.acquire_lacking("labor", lack, base, owner="job-actors", lease=False)[0]
                 actors[name] = _actor_from_pool(s, pa, "labor", pool)
@@ -530,6 +526,18 @@ def _actors_for_unlocked(system: str, s: Settings,
                                 exclude=(exclude.get("receiver") or []) + [str(publisher.user_id)])[0]
     return _check({"publisher": publisher, "receiver": receiver})
 
+
+# 負向用例的「缺能力」夥伴（deficiency actor）→ (要缺的能力, 其餘須具備的前置能力)。
+# 單一真實來源：_actors_for 配發時用它、case_gen/_derive_children 判「池中是否真有此缺能力帳號」也用它。
+# 帳號須「只缺目標能力、其餘前置滿足」才能可靠觸發對應守衛失敗（後端驗證有序）。
+LABOR_DEFICIENCY_ACTORS = {
+    "labor_lacking_verified": ("verified", ["profile_complete", "active", "clean"]),
+    # 缺 profile_complete 但 base 要求 profile_started：精準配「部分填寫」帳號(→30215)，
+    # 不會誤配到完全空白帳號(那會回 30211)。空白帳號的負向情境另用 profile_started 缺能力表達。
+    "labor_lacking_profile_complete": ("profile_complete", ["profile_started", "active"]),
+    # 完全空白帳號（缺 profile_started）：申請工作回 30211（尚未填寫任何個資）。
+    "labor_lacking_profile_started": ("profile_started", ["active"]),
+}
 
 _SWAPPABLE_LABOR = re.compile(r"labor\d*$")   # labor / labor1..3；labor_lacking_* 是刻意缺能力，不可換
 

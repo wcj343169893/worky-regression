@@ -317,7 +317,11 @@ class PathRunner:
 
         actor = state.actors[transition.actor_role]
 
-        body = state.resolve(transition.body_template)
+        # 步驟級 request 覆寫：負向用例用它「構建對應的缺失/非法資料」直接觸發業務分支失敗
+        # （如時薪過低 20011：request:{hourly_wage:100}）。淺層覆蓋單元 body_template 後再 resolve，
+        # 故覆寫值可為字面量，也可帶 {{state.x}} 模板。空 / 無此鍵時行為與原本完全一致。
+        override = step.get("request") or {}
+        body = state.resolve({**transition.body_template, **override})
 
         # 營運活動單元走獨立的 Activity API base（/activity，非主 API /v1）
         base = (actor.client.settings.activity_api_base

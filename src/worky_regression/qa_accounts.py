@@ -157,6 +157,28 @@ class AccountPool:
             username=r.username, shop_id=r.shop_id, caps=_caps(r), note=r.note,
         ) for r in chosen]
 
+    def count_lacking(self, role: str, lacking: str, base_caps: list[str]) -> int:
+        """只讀計數：池中「具 base_caps 但缺 lacking」且當前可配（available / lease 過期）的帳號數。
+
+        給產生器/分解器在「落地前」判斷某缺能力夥伴是否真配得到——配不到就把該負向子用例標 skip，
+        避免產出假可跑（執行期才 PoolShortage「沒啟動」/ 配到不精準帳號而 expect 不符）。不上鎖、不改狀態。
+        """
+        now = int(time.time())
+        base = set(base_caps)
+        with self._qa_engine.connect() as conn:
+            rows = conn.execute(text("""
+                SELECT caps FROM qa_accounts
+                WHERE db_name=:db AND role=:role AND state<>'disabled'
+                  AND (state='available' OR lease_expires_at < :now)
+            """), {"db": self.db, "role": role, "now": now}).all()
+        n = 0
+        for r in rows:
+            c = r.caps
+            caps = set(json.loads(c) if isinstance(c, str) else (c or []))
+            if base <= caps and lacking not in caps:
+                n += 1
+        return n
+
     def acquire_lacking(self, role: str, lacking: str, base_caps: list[str], n: int = 1, *,
                         owner: str, lease: bool = False) -> list[PooledAccount]:
         """配「具備 base_caps 但**缺** lacking 能力」的帳號（負向用例用）。
@@ -566,6 +588,8 @@ class AccountPool:
                 caps.append("profile_complete")
             if prof.get("valid_status") == 1:
                 caps.append("verified")
+            if prof.get("id_number") not in (None, ""):   # 已填個資(部分填寫即有) → profile_started
+                caps.append("profile_started")
             if not prof.get("penalty_points"):   # 0 / None → 無違規點數
                 caps.append("clean")
         return caps
@@ -746,7 +770,8 @@ class AccountPool:
         """探測 labor 工作庫能力 → (caps, note)；帳號不存在回 None。"""
         now = int(time.time())
         r = wc.execute(text(
-            "SELECT valid_status, is_profile_complete FROM s_labors WHERE id=:i"), {"i": uid}).first()
+            "SELECT valid_status, is_profile_complete, id_number FROM s_labors WHERE id=:i"),
+            {"i": uid}).first()
         if not r:
             return None
         published = wc.execute(text(
@@ -762,6 +787,10 @@ class AccountPool:
         caps = []
         if r.valid_status == 1: caps.append("verified")     # 後台審核通過 → valid_status=1
         if r.is_profile_complete == 1: caps.append("profile_complete")
+        # profile_started＝已填過個資(id_number 非空)但未必完整。用來精準配「部分填寫」負向帳號：
+        # 申請工作時「有資料但不完整」回 30215，「完全空白」回 30211——兩者都缺 profile_complete，
+        # 靠此能力區分，30215 用例才不會誤配到空白帳號。
+        if r.id_number not in (None, ""): caps.append("profile_started")
         if published: caps.append("audit_role")
         if not suspended: caps.append("active")
         # clean = 無違規點數歷史。有違規的帳號(殘留停權/扣點)在 apply 會以泛用 10001 失敗，
