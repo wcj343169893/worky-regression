@@ -521,6 +521,8 @@ function renderCaseRows(key, items) {
   tb.innerHTML = items.map((c) => {
     const tflow = tflowHtml(c);
     const lrHtml = lrCellHtml(c);
+    // 回放只在有「真的跑過（通過/失敗）」的最近結果時才出現——skip/waiting/未跑無步驟結果可演
+    const canReplay = c.last_result && (c.last_result.status === "passed" || c.last_result.status === "failed");
     return `<tr data-id="${esc(c.id)}">
       <td class="ck-col"><input type="checkbox" class="row-ck" data-id="${esc(c.id)}" /></td>
       <td class="desc-col"><div class="cid">${c.seq != null ? `<span class="seq">#${c.seq}</span>` : ""}<code>${esc(c.id)}</code></div><div class="sub2">${esc((c.description || "").slice(0, 90))}</div></td>
@@ -532,6 +534,7 @@ function renderCaseRows(key, items) {
       <td class="act">
         <button class="btn view-btn" data-id="${esc(c.id)}">查看</button>
         <button class="btn run-btn" data-id="${esc(c.id)}">執行</button>
+        ${canReplay ? `<button class="btn replay-btn" data-id="${esc(c.id)}" title="把最近一次執行的逐步結果在任務流上重播一遍（不重打 API）">▷ 回放</button>` : ""}
         <button class="btn copy-btn" data-id="${esc(c.id)}">複製</button>
         <button class="btn republish-btn" data-id="${esc(c.id)}">重新發佈</button>
         ${c.child_count > 0 ? `<button class="btn sub-btn" data-id="${esc(c.id)}">子任務(${c.child_count})</button>` : ""}
@@ -542,6 +545,7 @@ function renderCaseRows(key, items) {
   updateBatchState();   // 重載清單後同步「批量執行」按鈕與全選框狀態（勾選隨列表重建歸零）
   tb.querySelectorAll(".view-btn").forEach((b) => b.onclick = () => openCaseDetail(b.dataset.id));
   tb.querySelectorAll(".run-btn").forEach((b) => b.onclick = () => runCase(key, b));
+  tb.querySelectorAll(".replay-btn").forEach((b) => b.onclick = () => replayCase(key, b));
   tb.querySelectorAll(".copy-btn").forEach((b) => b.onclick = () => copyCase(key, b));
   tb.querySelectorAll(".republish-btn").forEach((b) => b.onclick = () => republishCase(key, b));
   // 子任務：下鑽到該用例的子清單（遞迴天然成立——子層列同樣會帶 child_count）
@@ -753,6 +757,13 @@ async function runCase(key, btn) {
   toast(`執行中：${id}（登入 + 呼叫被測 API，請稍候）`);
   await runCaseStream(id, row);
   btn.disabled = false; btn.textContent = old;
+}
+
+// 「回放」按鈕：另開分析頁（/static/trace.html），逐步檢視最近一次執行的請求參數與返回值。
+// 不重打被測 API——資料來自執行期落庫的 observations（request/response），供分析失敗原因 / 比對參數。
+function replayCase(key, btn) {
+  const id = btn.dataset.id;
+  window.open(`/static/trace.html?id=${encodeURIComponent(id)}`, "_blank", "noopener");
 }
 
 // ── 勾選 + 批量執行（主用例與子任務層通用）──────────────────────────────────

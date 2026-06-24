@@ -375,6 +375,8 @@ class PathRunner:
                 )
             return {
                 "transition": transition.name, "endpoint": transition.endpoint,
+                "method": transition.method, "actor": actor_name,
+                "request": body, "response": payload,   # 供「回放/分析」頁逐步檢視請求參數與返回值
                 "http": resp.status_code, "code": payload.get("code"),
                 "message": payload.get("message"), "saved": {},
                 "checks": [{"kind": "expect_fail", "code": payload.get("code")}],
@@ -394,6 +396,10 @@ class PathRunner:
         obs: dict[str, Any] = {
             "transition": transition.name,
             "endpoint": transition.endpoint,
+            "method": transition.method,
+            "actor": actor_name,
+            "request": body,            # 實際送出的請求參數（含覆寫 + 解析後的值）
+            "response": payload,        # 完整返回值（success/code/message/data）
             "http": resp.status_code,
             "code": payload.get("code"),
             "saved": {},

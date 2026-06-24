@@ -1,0 +1,178 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>用例回放 / 分析</title>
+  <link rel="stylesheet" href="/static/styles.css" />
+  <style>
+    /* 回放/分析頁：可整頁捲動（與看板 SPA 的 overflow:hidden 不同），逐步檢視請求/返回 */
+    html, body { overflow: auto; height: auto; }
+    /* 沿用看板頂部菜單並固定在頂部；body 下推 60px（topbar 高）避免被蓋住 */
+    body { padding-top: 60px; }
+    .topbar { position: fixed; top: 0; left: 0; right: 0; z-index: 20; }
+    .topbar-actions .btn { text-decoration: none; }
+    .trace-wrap { max-width: 1680px; margin: 0 auto; padding: 18px 18px 60px; }
+    .trace-head { background: var(--bg); border-bottom: 1px solid var(--line);
+      padding: 4px 0 12px; margin-bottom: 14px; }
+    .trace-head h1 { font-size: 17px; margin: 0 0 6px; display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+    .trace-head .meta { color: var(--muted); font-size: 12px; display: flex; gap: 14px; flex-wrap: wrap; }
+    .trace-head code { color: var(--accent); }
+    .tstep { border: 1px solid var(--line); border-radius: 10px; background: var(--panel);
+      margin: 12px 0; overflow: hidden; }
+    .tstep.failed { border-color: var(--danger); }
+    .tstep-h { display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+      padding: 10px 14px; background: var(--panel2); border-bottom: 1px solid var(--line); }
+    .tstep-h .idx { width: 22px; height: 22px; border-radius: 50%; background: var(--bg2);
+      color: var(--muted); display: inline-flex; align-items: center; justify-content: center;
+      font-size: 12px; flex: none; }
+    .tstep-h .nm { font-weight: 700; }
+    .tstep-h .ep { color: var(--muted); font-size: 12px; font-family: ui-monospace, Menlo, monospace; }
+    .tstep-h .sp { margin-left: auto; color: var(--muted); font-size: 12px; }
+    .verb { font-family: ui-monospace, Menlo, monospace; font-size: 11px; padding: 1px 6px;
+      border-radius: 5px; border: 1px solid var(--line); color: var(--cyan); }
+    .badge { font-size: 11px; padding: 2px 8px; border-radius: 6px; border: 1px solid var(--line); }
+    .b-pass { color: var(--ok); border-color: var(--ok); } .b-fail { color: var(--danger); border-color: var(--danger); }
+    .b-skip { color: var(--muted); } .b-other { color: var(--warn); border-color: var(--warn); }
+    /* request / response /（有則）observations 同一行並排：欄數由 .cols-N 決定 */
+    .tstep-body { display: grid; gap: 0; }
+    .tstep-body.cols-1 { grid-template-columns: 1fr; }
+    .tstep-body.cols-2 { grid-template-columns: 1fr 1fr; }
+    .tstep-body.cols-3 { grid-template-columns: 1fr 1fr 1fr; }
+    .pane { padding: 10px 14px; min-width: 0; }
+    .pane + .pane { border-left: 1px solid var(--line); }
+    .pane h4 { margin: 0 0 6px; font-size: 12px; color: var(--muted); font-weight: 600;
+      text-transform: uppercase; letter-spacing: .04em; }
+    pre.json { margin: 0; background: var(--bg2); border: 1px solid var(--line); border-radius: 8px;
+      padding: 10px; font-size: 12px; line-height: 1.5; overflow-x: auto; white-space: pre;
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace; max-height: 420px; overflow-y: auto; }
+    .none { color: var(--muted); font-size: 12px; font-style: italic; }
+    .tstep-err { padding: 10px 14px; color: var(--danger); font-size: 13px;
+      border-top: 1px solid var(--line); background: rgba(255,107,107,.06); white-space: pre-wrap; }
+    .actor-tag { color: var(--accent2); font-size: 12px; }
+    .empty-page { text-align: center; color: var(--muted); padding: 80px 0; }
+    @media (max-width: 980px) { .tstep-body { grid-template-columns: 1fr !important; }
+      .pane + .pane { border-left: 0; border-top: 1px solid var(--line); } }
+  </style>
+</head>
+<body>
+  <div class="aurora"></div>
+  <header class="topbar">
+    <div class="brand">
+      <div class="logo">W</div>
+      <div class="brand-text">
+        <h1>Worky 後台</h1>
+        <p class="sub" id="db-sub">—</p>
+      </div>
+    </div>
+    <nav class="nav" id="nav"></nav>
+    <div class="topbar-actions">
+      <span class="clock" id="clock">--:--:--</span>
+      <a class="btn ghost" href="/#cases" title="回到測試用例清單">← 測試用例</a>
+    </div>
+  </header>
+
+  <div class="trace-wrap">
+    <div class="trace-head" id="head"><div class="meta">載入中…</div></div>
+    <div id="steps"></div>
+  </div>
+  <script>
+    const $ = (id) => document.getElementById(id);
+    const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) =>
+      ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+    const fmtTs = (t) => t ? new Date(t * 1000).toLocaleString("zh-Hant", { hour12: false }) : "—";
+    const pretty = (v) => { try { return JSON.stringify(v, null, 2); } catch { return String(v); } };
+    const badge = (st) => st === "passed" ? `<span class="badge b-pass">通過</span>`
+      : st === "failed" ? `<span class="badge b-fail">失敗</span>`
+      : st === "skipped" ? `<span class="badge b-skip">略過</span>`
+      : `<span class="badge b-other">${esc(st || "?")}</span>`;
+
+    // request/response 任一存在才當「API 步驟」用雙欄呈現；否則（db_exec/assert/wait）用觀測補充
+    function paneHtml(title, val) {
+      if (val === undefined || val === null)
+        return `<div class="pane"><h4>${title}</h4><div class="none">此次執行未記錄（重新執行以擷取）</div></div>`;
+      return `<div class="pane"><h4>${title}</h4><pre class="json">${esc(pretty(val))}</pre></div>`;
+    }
+
+    function stepHtml(s) {
+      const isApi = s.request !== undefined || s.response !== undefined;
+      const hasObs = s.observations && Object.keys(s.observations).length;
+      // request / response /（有則）observations 並排同一行；非 API 步驟只放 observations
+      let panes, cols;
+      if (isApi) {
+        panes = [paneHtml("請求參數 request", s.request), paneHtml("返回值 response", s.response)];
+        if (hasObs) panes.push(paneHtml("觀測 observations", s.observations));
+      } else if (hasObs) {
+        panes = [paneHtml("觀測 observations", s.observations)];
+      } else {
+        panes = [`<div class="pane"><div class="none">（此步無請求/返回；無額外觀測）</div></div>`];
+      }
+      cols = Math.min(panes.length, 3);
+      const body = `<div class="tstep-body cols-${cols}">${panes.join("")}</div>`;
+      const verb = s.method ? `<span class="verb">${esc(s.method)}</span>` : "";
+      const ep = s.endpoint ? `<span class="ep">${esc(s.endpoint)}</span>` : "";
+      const actor = s.actor ? `<span class="actor-tag">@${esc(s.actor)}</span>` : "";
+      const sp = (s.elapsed_ms != null ? `${s.elapsed_ms}ms` : "") +
+        (s.started_at ? ` · ${fmtTs(s.started_at)}` : "");
+      return `<div class="tstep ${s.status === "failed" ? "failed" : ""}">
+        <div class="tstep-h">
+          <span class="idx">${(s.index ?? 0) + 1}</span>
+          <span class="nm">${esc(s.name || s.kind)}</span>
+          ${verb}${ep}${actor}${badge(s.status)}
+          <span class="sp">${esc(sp)}</span>
+        </div>
+        ${body}
+        ${s.error ? `<div class="tstep-err">⚠ ${esc(s.error)}</div>` : ""}
+      </div>`;
+    }
+
+    // 頂部菜單：與看板 app.js 的 NAV 一致；此頁非 SPA，點選導回看板對應雜湊路由（#key）。
+    const NAV = [
+      { key: "jobs", label: "工作看板" }, { key: "tasks", label: "任務看板" },
+      { key: "cases", label: "測試用例" }, { key: "accounts", label: "帳號池" },
+      { key: "markups", label: "標記" }, { key: "settings", label: "系統設置" },
+    ];
+    function initChrome() {
+      $("nav").innerHTML = NAV.map((n) =>
+        `<button data-k="${n.key}"${n.key === "cases" ? ' class="active"' : ""}>${n.label}</button>`).join("");
+      $("nav").querySelectorAll("button").forEach((b) =>
+        b.onclick = () => { location.href = "/#" + b.dataset.k; });
+      const pad = (n) => String(n).padStart(2, "0");
+      const tick = () => { const d = new Date(); $("clock").textContent = `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`; };
+      tick(); setInterval(tick, 1000);
+      fetch("/api/settings").then((r) => r.json())
+        .then((d) => $("db-sub").textContent = d.api_base || d.platform || "—").catch(() => {});
+    }
+
+    async function load() {
+      const id = new URLSearchParams(location.search).get("id");
+      if (!id) { $("head").innerHTML = `<div class="empty-page">缺少用例 id</div>`; return; }
+      document.title = `回放 / 分析 · ${id}`;
+      let d;
+      try {
+        const r = await fetch(`/api/cases/${encodeURIComponent(id)}/trace`);
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        d = await r.json();
+      } catch (e) {
+        $("head").innerHTML = `<div class="empty-page">載入失敗：${esc(e.message)}</div>`;
+        return;
+      }
+      $("head").innerHTML = `
+        <h1>回放 / 分析 <code>${esc(d.id)}</code> ${d.status ? badge(d.status) : ""}</h1>
+        <div class="meta">
+          <span>${esc(d.description || "")}</span>
+          <span>系統：${esc(d.system || "—")}</span>
+          <span>run：<code>${esc(d.run_id || "—")}</code></span>
+          <span>執行於 ${fmtTs(d.started_at)}</span>
+          <span>${(d.steps || []).length} 步</span>
+        </div>`;
+      const steps = d.steps || [];
+      $("steps").innerHTML = steps.length
+        ? steps.map(stepHtml).join("")
+        : `<div class="empty-page">此用例尚無執行記錄可分析</div>`;
+    }
+    initChrome();
+    load();
+  </script>
+</body>
+</html>

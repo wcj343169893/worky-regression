@@ -286,6 +286,65 @@ class CaseStore:
             "steps": steps,
         }
 
+    def run_trace(self, case_id: str) -> dict | None:
+        """回放/分析頁資料：最近一次執行的**所有步驟**逐筆請求參數 + 返回值（不重打 API）。
+
+        與 case_steps 不同：這裡回**完整步序**（含 db_exec / wait / assert，不只 transition），
+        每步附 observations 裡記錄的 request / response（執行期由 runner 落庫；舊 run 可能沒有，
+        前端顯示「此次執行未記錄」）。method/endpoint/actor 優先取 observations，缺則以 unit_spec 補。
+        """
+        from ..registry import unit_spec
+
+        found = self._find(case_id)
+        if found is None:
+            return None
+        _, _, spec = found
+        last = self.qa.latest_full(case_id)
+        if not last:
+            return {"id": case_id, "system": _detect_system(spec),
+                    "description": str(spec.get("description", "")).strip(),
+                    "run_id": None, "steps": []}
+        run_t0 = last.get("started_at")
+        acc = 0
+        steps = []
+        for s in last.get("steps", []):
+            obs = s.get("observations") or {}
+            name = s.get("name") or ""
+            meta = {}
+            if s.get("kind") == "transition":
+                try:
+                    meta = unit_spec(name.split(" ")[0]) or {}
+                except Exception:  # noqa: BLE001
+                    meta = {}
+            started = (run_t0 + acc / 1000.0) if (run_t0 and s.get("status") != "skipped") else None
+            acc += int(s.get("elapsed_ms") or 0)
+            steps.append({
+                "index": s.get("index"),
+                "kind": s.get("kind"),
+                "name": name,
+                "short": name.split("_")[0] if s.get("kind") == "transition" else name,
+                "status": s.get("status"),
+                "elapsed_ms": s.get("elapsed_ms"),
+                "started_at": started,
+                "error": s.get("error"),
+                "actor": obs.get("actor") or meta.get("actor"),
+                "method": obs.get("method") or meta.get("method"),
+                "endpoint": obs.get("endpoint") or meta.get("endpoint"),
+                "request": obs.get("request"),
+                "response": obs.get("response"),
+                "saved": obs.get("saved") or {},
+                # request/response 以外的觀測（db_exec/assert/wait 的結果、checks 等）留作補充
+                "observations": {k: v for k, v in obs.items()
+                                 if k not in ("request", "response", "actor", "method", "endpoint")},
+            })
+        return {
+            "id": case_id, "system": _detect_system(spec),
+            "description": str(spec.get("description", "")).strip(),
+            "run_id": last.get("run_id"), "status": last.get("status"),
+            "started_at": run_t0, "failed_at": last.get("failed_at"),
+            "steps": steps,
+        }
+
     # ── 執行 / 分解（會真的打被測 API）────────────────────────────────────────
     def _run_spec(self, spec: dict, *, source: str = "builtin", file: str = "",
                   actors: dict | None = None, on_event=None,

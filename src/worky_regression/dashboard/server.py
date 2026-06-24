@@ -229,6 +229,13 @@ class Handler(BaseHTTPRequestHandler):
                     self._send_json({"error": f"case {cid} not found"}, 404)
                 else:
                     self._send_json(data)
+            elif path.startswith("/api/cases/") and path.endswith("/trace"):
+                cid = path[len("/api/cases/"):-len("/trace")]
+                data = _cases().run_trace(cid)
+                if data is None:
+                    self._send_json({"error": f"case {cid} not found"}, 404)
+                else:
+                    self._send_json(data)
             elif path.startswith("/api/cases/"):
                 cid = path[len("/api/cases/"):]
                 detail = _cases().case_detail(cid)
